@@ -2,7 +2,7 @@
 
 ### A 3D Workspace for Biological Magnetic-Field Visualization
 
-![Field Workbench](fieldworkbench/assets/splash.png)
+![Field Workbench](FWB.png)
 
 ## Table of Contents
 
