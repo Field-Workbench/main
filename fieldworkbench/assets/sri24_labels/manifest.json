@@ -1,0 +1,130 @@
+{
+  "schema": "fieldworkbench.sri24-label-assets",
+  "schema_version": 1,
+  "atlas_release": "SRI24 v2.0",
+  "coordinate_frame": "SRI24 RAS millimetres",
+  "grid_shape": [
+    240,
+    240,
+    155
+  ],
+  "voxel_to_ras_mm_affine": [
+    [
+      -1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "source": {
+    "archive": "sri24_labels_nifti.zip",
+    "archive_sha256": "ed47fde305baefb687a38e0daa8527896480e4e0159a0a0f56c8cbe09fc97e1f",
+    "download_url": "https://www.nitrc.org/frs/download.php/4508/sri24_labels_nifti.zip",
+    "project_url": "https://www.nitrc.org/projects/sri24/",
+    "license": "CC BY-SA 3.0",
+    "citation_doi": "10.1002/hbm.20906"
+  },
+  "packaging": {
+    "field_workbench_version": "0.13.0.226",
+    "transformation": "The three .nii files were gzip-compressed with gzip -n -9. Decompression reproduces the original archive bytes exactly; label tables and LICENSE are unmodified."
+  },
+  "assets": {
+    "LICENSE": {
+      "sha256": "35b6ea8bfe7c3d060001a55ed51ca826f6d9320194e2b93b0505069919472b90"
+    },
+    "LPBA40-labels.txt": {
+      "sha256": "4928dd7b3a583fadd8c0d69f2ef4541120fe913f45edb320d609f4254b8ea64a"
+    },
+    "SRI24-tzo116plus.txt": {
+      "sha256": "a6b61737d0a51ecf6f64eb893bf1c87b1edf8f19e3bf8a4fbe8eda9c10b09e7e"
+    },
+    "lpba40.nii.gz": {
+      "sha256": "24342699723298b06b0ceeecab067d61c36a161e2cd1a295e25880ce5a73958c",
+      "uncompressed_sha256": "090e0c25b190f3bd5a9dc97f4b62fa3128769ca33021bb8556f051d99e9e4fd9",
+      "dtype": "uint8",
+      "unique_label_count": 57,
+      "nonzero_voxel_count": 1100018,
+      "label_table": "LPBA40-labels.txt"
+    },
+    "suptent.nii.gz": {
+      "sha256": "67e4ebe8d9be616f030cd0caa9112797ad4e1eac2f7d3e4e57adc819393b6759",
+      "uncompressed_sha256": "2970f1b1c6f8b356ca0bc7018142f1df7c175537b5dddedfda74d821dac313fc",
+      "dtype": "uint8",
+      "unique_values": [
+        0,
+        1,
+        2
+      ],
+      "nonzero_voxel_count": 1280292
+    },
+    "tzo116plus.nii.gz": {
+      "sha256": "49e9b0a8d54b800ca616165f6b3aafff6eaf9a9dbc1cdfeb7d0f5e10c187c742",
+      "uncompressed_sha256": "abbcb5ae3b2b470a1069fda3c7193256e1c3baf0a2e32772247b14917b14940b",
+      "dtype": "int16",
+      "unique_label_count": 424,
+      "nonzero_voxel_count": 1053275,
+      "label_table": "SRI24-tzo116plus.txt",
+      "table_duplicate_ids": [],
+      "table_ids_absent_from_volume": [
+        201,
+        203,
+        205,
+        219,
+        221,
+        227,
+        413
+      ],
+      "volume_ids_absent_from_table": [
+        422,
+        424,
+        426,
+        428,
+        430,
+        432,
+        434,
+        476,
+        478
+      ],
+      "mapping_policy": "Preserve the official table and supplement the nine spatially encoded ventricular labels deterministically in code."
+    },
+    "lpba40_meshes.npz": {
+      "sha256": "4be823ae98b2d9d5fcc25618df67b32dce79ffacce9086706c8a7dd8ee44aaec",
+      "kind": "derived_visual_mesh_cache",
+      "mesh_version": 1,
+      "source_stride": 2,
+      "source_shape": [
+        120,
+        120,
+        78
+      ],
+      "coordinate_frame": "field_workbench_canonical_head_mm",
+      "label_count": 56,
+      "vertex_count": 102724,
+      "triangle_count": 206080,
+      "source_volume": "lpba40.nii.gz",
+      "source_volume_sha256": "24342699723298b06b0ceeecab067d61c36a161e2cd1a295e25880ce5a73958c",
+      "source_label_table": "LPBA40-labels.txt",
+      "source_label_table_sha256": "4928dd7b3a583fadd8c0d69f2ef4541120fe913f45edb320d609f4254b8ea64a",
+      "generator": "VTK SurfaceNets3D 9.6.2",
+      "smoothing": true
+    }
+  }
+}
