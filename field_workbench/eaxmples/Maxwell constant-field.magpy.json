@@ -1,0 +1,470 @@
+{
+  "version": 1,
+  "generator": "magpylib-studio 0.1.2",
+  "objects": [
+    {
+      "id": "group",
+      "type": "Collection",
+      "style": {
+        "label": "Maxwell Coil"
+      },
+      "children": [
+        {
+          "id": "coil",
+          "type": "current.Circle",
+          "params": {
+            "diameter": 0.2,
+            "current": 16.979200000000002
+          },
+          "style": {
+            "label": "Central Ring"
+          }
+        },
+        {
+          "id": "coil_2",
+          "type": "current.Circle",
+          "params": {
+            "diameter": 0.15118600000000001,
+            "current": 12.999700000000002
+          },
+          "style": {
+            "label": "Maxwell outer +X"
+          }
+        },
+        {
+          "id": "coil_3",
+          "type": "current.Circle",
+          "params": {
+            "diameter": 0.15118600000000001,
+            "current": 12.999700000000002
+          },
+          "style": {
+            "label": "Maxwell outer -X"
+          }
+        }
+      ]
+    }
+  ],
+  "events": [
+    {
+      "id": "e1",
+      "op": "create",
+      "target": "coil",
+      "type": "current.Circle",
+      "params": {
+        "diameter": 0.2,
+        "current": 16.979200000000002
+      },
+      "style": {
+        "label": "Central Ring"
+      }
+    },
+    {
+      "id": "e2",
+      "target": "coil",
+      "op": "position",
+      "value": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e3",
+      "target": "coil",
+      "op": "orientation",
+      "rotvec": [
+        0.0,
+        90.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e4",
+      "op": "create",
+      "target": "coil_2",
+      "type": "current.Circle",
+      "params": {
+        "diameter": 0.15118600000000001,
+        "current": 12.999700000000002
+      },
+      "style": {
+        "label": "Maxwell outer +X"
+      }
+    },
+    {
+      "id": "e5",
+      "target": "coil_2",
+      "op": "position",
+      "value": [
+        0.065465,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e6",
+      "target": "coil_2",
+      "op": "orientation",
+      "rotvec": [
+        0.0,
+        90.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e7",
+      "op": "create",
+      "target": "coil_3",
+      "type": "current.Circle",
+      "params": {
+        "diameter": 0.15118600000000001,
+        "current": 12.999700000000002
+      },
+      "style": {
+        "label": "Maxwell outer -X"
+      }
+    },
+    {
+      "id": "e8",
+      "target": "coil_3",
+      "op": "position",
+      "value": [
+        -0.065465,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e9",
+      "target": "coil_3",
+      "op": "orientation",
+      "rotvec": [
+        0.0,
+        90.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e10",
+      "op": "create",
+      "target": "group",
+      "type": "Collection",
+      "style": {
+        "label": "Maxwell Coil"
+      }
+    },
+    {
+      "id": "e11",
+      "target": "group",
+      "op": "position",
+      "value": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e12",
+      "target": "group",
+      "op": "orientation",
+      "rotvec": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e13",
+      "op": "reparent",
+      "target": "coil_3",
+      "parent": "group"
+    },
+    {
+      "id": "e14",
+      "target": "coil_3",
+      "op": "position",
+      "value": [
+        -0.065465,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e15",
+      "target": "coil_3",
+      "op": "orientation",
+      "rotvec": [
+        0.0,
+        90.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e16",
+      "op": "reparent",
+      "target": "coil_2",
+      "parent": "group"
+    },
+    {
+      "id": "e17",
+      "target": "coil_2",
+      "op": "position",
+      "value": [
+        0.065465,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e18",
+      "target": "coil_2",
+      "op": "orientation",
+      "rotvec": [
+        0.0,
+        90.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e19",
+      "op": "reparent",
+      "target": "coil",
+      "parent": "group"
+    },
+    {
+      "id": "e20",
+      "target": "coil",
+      "op": "position",
+      "value": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e21",
+      "target": "coil",
+      "op": "orientation",
+      "rotvec": [
+        0.0,
+        90.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e22",
+      "target": "coil_2",
+      "op": "position",
+      "value": [
+        0.065465,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e23",
+      "target": "coil_2",
+      "op": "orientation",
+      "rotvec": [
+        0.0,
+        90.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e24",
+      "target": "coil_3",
+      "op": "position",
+      "value": [
+        -0.065465,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e25",
+      "target": "coil_3",
+      "op": "orientation",
+      "rotvec": [
+        0.0,
+        90.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e26",
+      "target": "coil",
+      "op": "position",
+      "value": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e27",
+      "target": "coil",
+      "op": "orientation",
+      "rotvec": [
+        0.0,
+        90.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e28",
+      "target": "coil_2",
+      "op": "position",
+      "value": [
+        0.065465,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e29",
+      "target": "coil_2",
+      "op": "orientation",
+      "rotvec": [
+        0.0,
+        90.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e30",
+      "target": "coil_3",
+      "op": "position",
+      "value": [
+        -0.065465,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "e31",
+      "target": "coil_3",
+      "op": "orientation",
+      "rotvec": [
+        0.0,
+        90.0,
+        0.0
+      ]
+    }
+  ],
+  "field_workbench": {
+    "version": 19,
+    "meshes": [
+      {
+        "id": "guide_sphere",
+        "type": "workbench.Mesh",
+        "label": "Guide sphere 1",
+        "parent": "group",
+        "visible": true,
+        "role": "measurement",
+        "colour": "#7c3aed",
+        "opacity": 0.28,
+        "position": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "euler": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "mesh": {
+          "kind": "sphere",
+          "diameter": 0.04
+        },
+        "drc_enabled": false,
+        "measurement": {
+          "sampling_mode": "generated",
+          "quality": "standard",
+          "defined_points_mm": [],
+          "target_uT": 200.0,
+          "tolerance_pct": 5.0
+        }
+      }
+    ],
+    "coil_specs": {
+      "coil": {
+        "enabled": true,
+        "turns": 64,
+        "drive_current_a": 0.26530000000000004,
+        "field_scale_factor": 1.0,
+        "awg": 30,
+        "resistance_20_ohm_per_km": 338.5499,
+        "lead_length_m": 0.2,
+        "enamel_radial_mm": 0.025,
+        "packing_factor": 0.75,
+        "temperature_c": 20.0,
+        "additional_mass_g": 0.0,
+        "current_mode": "rms_dc",
+        "physical_geometry_enabled": true,
+        "winding_radial_build_mode": "auto",
+        "winding_radial_build_mm": 0.311,
+        "winding_axial_width_mm": 20.0,
+        "bobbin_wall_thickness_mm": 1.0,
+        "flange_height_mm": 1.0,
+        "flange_thickness_mm": 1.0,
+        "coil_shape": "generic",
+        "racetrack_end_diameter_mm": 100.0,
+        "racetrack_straight_length_mm": 100.0,
+        "racetrack_arc_segments": 32
+      },
+      "coil_2": {
+        "enabled": true,
+        "turns": 49,
+        "drive_current_a": 0.26530000000000004,
+        "field_scale_factor": 1.0,
+        "awg": 30,
+        "resistance_20_ohm_per_km": 338.5499,
+        "lead_length_m": 0.2,
+        "enamel_radial_mm": 0.025,
+        "packing_factor": 0.75,
+        "temperature_c": 20.0,
+        "additional_mass_g": 0.0,
+        "current_mode": "rms_dc",
+        "physical_geometry_enabled": true,
+        "winding_radial_build_mode": "auto",
+        "winding_radial_build_mm": 0.476,
+        "winding_axial_width_mm": 10.0,
+        "bobbin_wall_thickness_mm": 1.0,
+        "flange_height_mm": 1.0,
+        "flange_thickness_mm": 1.0,
+        "coil_shape": "generic",
+        "racetrack_end_diameter_mm": 100.0,
+        "racetrack_straight_length_mm": 100.0,
+        "racetrack_arc_segments": 32
+      },
+      "coil_3": {
+        "enabled": true,
+        "turns": 49,
+        "drive_current_a": 0.26530000000000004,
+        "field_scale_factor": 1.0,
+        "awg": 30,
+        "resistance_20_ohm_per_km": 338.5499,
+        "lead_length_m": 0.2,
+        "enamel_radial_mm": 0.025,
+        "packing_factor": 0.75,
+        "temperature_c": 20.0,
+        "additional_mass_g": 0.0,
+        "current_mode": "rms_dc",
+        "physical_geometry_enabled": true,
+        "winding_radial_build_mode": "auto",
+        "winding_radial_build_mm": 0.476,
+        "winding_axial_width_mm": 10.0,
+        "bobbin_wall_thickness_mm": 1.0,
+        "flange_height_mm": 1.0,
+        "flange_thickness_mm": 1.0,
+        "coil_shape": "generic",
+        "racetrack_end_diameter_mm": 100.0,
+        "racetrack_straight_length_mm": 100.0,
+        "racetrack_arc_segments": 32
+      }
+    }
+  }
+}
