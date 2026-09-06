@@ -26,7 +26,7 @@ Field Workbench is under active development. Any and all participation is welcom
 
 ### Windows
 
-1. Download and extract the [windows zip file]().
+1. Download and extract the [windows zip file](https://github.com/Field-Workbench/main/releases/download/v0.13.0.355/FieldWorkbench.v0.13.0.355.-.Windows.zip).
 2. Extract the field_workbench folder.
 3. Click the fieldworkbench exe.
 4. You may need to allow the program to run if it is blocked (click more info--> allow this program).
