@@ -20,7 +20,7 @@ Model export provides a path to several popular electromagnetic modeling softwar
 
 ## 2. Contribute and Collaborate
 
-Field Workbench is under active development. Any and all participation is welcome. This can include, but is not limited to, workflow testing, model validation, technical review, object or feature requests etc. Start a discussion on where you'd like to see Field Workbench go! Details below.
+Field Workbench is under active development. Any and all participation is welcome. This can include, but is not limited to, workflow testing, model validation, technical review, object or feature requests etc. Start a discussion on where you'd like to see Field Workbench go!
 
 ## 3. Getting Started
 
@@ -54,21 +54,6 @@ python app.py
 Feature highlights: https://youtu.be/Dzqq4sYlIf8
 Maxwell Coil demo: https://youtu.be/poaRiSmKelA
 
-### Testing and Validation
-
-*[How to share bug reports, reproducible scenes, measurements, and comparisons
-with other models or experimental results.]*
-T.B.D.
-
-### Feature Requests and Research Workflows
-
-*[How to suggest tools or describe research needs that FWB could support.]*
-T.B.D.
-
-### Development Directions
-
-*[How to suggest future development directions/priorities.]*
-T.B.D.
 
 ---
 
