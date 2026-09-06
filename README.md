@@ -56,23 +56,9 @@ python app.py
 ## 4. Tutorials and Demonstrations
 
 Feature highlights: https://youtu.be/Dzqq4sYlIf8
+
 Maxwell Coil demo: https://youtu.be/poaRiSmKelA
 
-### Testing and Validation
-
-*[How to share bug reports, reproducible scenes, measurements, and comparisons
-with other models or experimental results.]*
-T.B.D.
-
-### Feature Requests and Research Workflows
-
-*[How to suggest tools or describe research needs that FWB could support.]*
-T.B.D.
-
-### Development Directions
-
-*[How to suggest future development directions/priorities.]*
-T.B.D.
 
 ---
 
