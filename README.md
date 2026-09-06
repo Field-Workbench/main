@@ -38,14 +38,14 @@ Tested in debian bookworm x64 only.
 2. Install the base dependencies from requirements.txt.
 It is recommended to use a virtual environment. Example:
 
-[code]
+```
 unzip FieldWorkbench_x.x.x.x.zip
 cd field_workbench
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-[\code]
+```
 
 3. To launch, enter the virtual environment and start app.py:
 source .venv/bin/activate
