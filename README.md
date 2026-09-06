@@ -48,8 +48,10 @@ python -m pip install -r requirements.txt
 ```
 
 3. To launch, enter the virtual environment and start app.py:
+```
 source .venv/bin/activate
 python app.py
+```
 
 ## 4. Tutorials and Demonstrations
 
