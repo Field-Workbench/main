@@ -1,0 +1,4 @@
+# Developer-only dependency for tools/build_lpba40_mesh_cache.py.
+# VTK is intentionally absent from the normal application runtime.
+numpy>=1.23
+vtk==9.6.2

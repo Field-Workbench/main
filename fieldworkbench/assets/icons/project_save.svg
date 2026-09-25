@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="32mm"
+   height="32mm"
+   viewBox="0 0 32 32"
+   version="1.1"
+   id="svg82934"
+   inkscape:version="1.2.2 (b0a8486541, 2022-12-01)"
+   sodipodi:docname="save-icon_sm.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns:xlink="http://www.w3.org/1999/xlink"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview82936"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:document-units="mm"
+     showgrid="false"
+     inkscape:zoom="2.0838024"
+     inkscape:cx="64.785414"
+     inkscape:cy="67.664765"
+     inkscape:window-width="1920"
+     inkscape:window-height="1007"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="layer1" />
+  <defs
+     id="defs82931">
+    <linearGradient
+       inkscape:collect="always"
+       id="linearGradient29041">
+      <stop
+         style="stop-color:#000000;stop-opacity:1;"
+         offset="0"
+         id="stop29037" />
+      <stop
+         style="stop-color:#000000;stop-opacity:0;"
+         offset="1"
+         id="stop29039" />
+    </linearGradient>
+    <linearGradient
+       inkscape:collect="always"
+       id="linearGradient29029">
+      <stop
+         style="stop-color:#75ff00;stop-opacity:0.59314114;"
+         offset="0"
+         id="stop29027" />
+      <stop
+         style="stop-color:#75ff00;stop-opacity:1;"
+         offset="0.87865442"
+         id="stop29025" />
+    </linearGradient>
+    <linearGradient
+       inkscape:collect="always"
+       xlink:href="#linearGradient29029"
+       id="linearGradient29033"
+       x1="2.4798582"
+       y1="16.130436"
+       x2="29.574558"
+       y2="16.130436"
+       gradientUnits="userSpaceOnUse" />
+    <linearGradient
+       inkscape:collect="always"
+       xlink:href="#linearGradient29041"
+       id="linearGradient29043"
+       x1="17.274934"
+       y1="7.2073706"
+       x2="21.801797"
+       y2="7.2073706"
+       gradientUnits="userSpaceOnUse"
+       gradientTransform="matrix(0.97910205,0,0,1.0148089,0.36793143,-0.17350436)" />
+  </defs>
+  <g
+     inkscape:groupmode="layer"
+     id="layer5"
+     inkscape:label="Layer 2">
+    <path
+       style="fill:#000000;fill-opacity:1;stroke:#000000;stroke-width:0.75;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:7;stroke-dasharray:none;opacity:1"
+       d="M 2.8598366,2.4529866 H 22.26567 l 6.933889,6.9338872 V 29.807884 H 2.8548581 V 2.5800796"
+       id="path70964-1"
+       sodipodi:nodetypes="cccccc" />
+  </g>
+  <g
+     inkscape:label="Layer 1"
+     inkscape:groupmode="layer"
+     id="layer1">
+    <path
+       style="fill:url(#linearGradient29033);stroke:#000000;stroke-width:0.75;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:7;stroke-dasharray:none;fill-opacity:1"
+       d="M 2.8598366,2.4529866 H 22.26567 l 6.933889,6.9338872 V 29.807884 H 2.8548581 V 2.5800796"
+       id="path70964"
+       sodipodi:nodetypes="cccccc" />
+    <path
+       style="fill:none;stroke:#000000;stroke-width:0.936081;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:7"
+       d="M 9.9577222,2.7398223 V 11.727807 H 21.25192 V 2.8238904"
+       id="path70966" />
+    <path
+       style="fill:url(#linearGradient29043);fill-opacity:1;stroke:#000000;stroke-width:0.779826;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:7"
+       d="m 17.664847,11.802168 h 3.666277 V 2.4790296 h -3.498417 z"
+       id="path70970" />
+    <path
+       style="fill:none;fill-opacity:1;stroke:#000000;stroke-width:0.781047;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:7"
+       d="m 9.119366,29.614768 v -8.850566 h 14.126108 v 8.932786"
+       id="path70972" />
+  </g>
+</svg>

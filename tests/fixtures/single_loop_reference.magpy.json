@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "objects": [
+    {
+      "id": "reference_loop",
+      "type": "current.Circle",
+      "params": {
+        "diameter": 0.1,
+        "current": 2.0,
+        "position": [0.0, 0.0, 0.0]
+      },
+      "style": {
+        "label": "Reference single loop"
+      }
+    }
+  ],
+  "field_workbench": {
+    "version": 6,
+    "coil_specs": {
+      "reference_loop": {
+        "turns": 25,
+        "drive_current_a": 0.08,
+        "field_scale_factor": 1.0,
+        "current_mode": "rms_dc"
+      }
+    }
+  }
+}

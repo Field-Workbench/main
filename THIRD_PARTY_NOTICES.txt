@@ -1,0 +1,191 @@
+FIELD WORKBENCH - THIRD-PARTY SOFTWARE AND CONTENT NOTICE
+==========================================================
+
+This source archive does not vendor the Python/Qt packages listed below. They
+are installed separately from requirements.txt. Each remains under its own
+license; none is relicensed as Field Workbench code.
+
+Direct runtime dependencies
+---------------------------
+
+  Magpylib Studio 0.1.2   BSD-3-Clause
+  Magpylib 5.2.3          BSD-2-Clause
+  PySide6 / Qt 6.11.1     LGPL-3.0 and/or GPL-3.0 community terms
+  Plotly 6.9.0            MIT
+  pyGeoMag 1.1.0          MIT
+
+Their transitive dependencies include NumPy and SciPy and may include other
+packages selected by the pinned releases. The Windows onedir distribution also
+contains the Python runtime, Qt libraries, Qt WebEngine/Chromium, and native
+libraries used by those packages.
+
+
+Bundled third-party content
+---------------------------
+
+  Generic bust (`fieldworkbench/assets/generic_bust_v1.stl` and `generic_bust_v1.regions.json`)
+
+  Derived from the Blender Human Base Meshes v1.4.1 asset bundle, specifically
+  the `Body Female - Realistic` base mesh, by Blender Studio and community
+  contributors. The Human Base Meshes bundle is distributed under CC0 1.0
+  Universal (public-domain dedication). Attribution is not required by CC0,
+  but this notice is retained to document the asset's source and provenance.
+
+  Field Workbench derivation: the source body was cropped to a head/neck/upper-
+  torso bust, cut surfaces were closed, facial/eye volumes were consolidated,
+  the result was voxel-remeshed and decimated, and the final mesh was checked
+  as watertight/manifold for engineering visualization, exclusion, and
+  measurement use. Named scalp/face/ear/neck-shoulder surface regions were then
+  authored on the same fixed topology in Blender and exported as the companion
+  `generic_bust_v1.regions.json` face-index map. The mesh is not a patient-
+  specific anatomical model or a clinical anatomical atlas.
+
+  Source: https://www.blender.org/download/demo-files/
+  Bundle archive: https://download.blender.org/demo/asset-bundles/human-base-meshes/
+  License: CC0 1.0 Universal
+
+  SRI24 brain and anatomical labels
+
+  Bundled paths:
+    `fieldworkbench/assets/sri24_brain_gmwm_v1.stl`
+    `fieldworkbench/assets/sri24_labels/`
+
+  Derived from the SRI24 v2.0 multichannel atlas of normal adult human brain
+  anatomy by Torsten Rohlfing, Natalie M. Zahr, Edith V. Sullivan, and Adolf
+  Pfefferbaum. SRI24 is an MRI population atlas generated from 24 normal
+  control subjects and distributed by the SRI24 project under Creative Commons
+  Attribution-ShareAlike 3.0 (CC BY-SA 3.0). This derived brain mesh is
+  distributed under the same CC BY-SA 3.0 terms; it is third-party content and
+  is not relicensed under Field Workbench's GPL license.
+
+  Field Workbench derivation: the SRI24 v2.0 tissue segmentation was loaded in
+  3D Slicer; gray-matter and white-matter labels were unioned while CSF was
+  excluded; a closed surface was exported in SRI24 RAS millimetre coordinates;
+  the mesh was remeshed/cleaned and decimated in Blender; disconnected remnants
+  were removed; and the final single connected surface was verified as
+  watertight/manifold. Field Workbench preserves that atlas-space source asset
+  and applies a documented rigid NAS/LPA/RPA transform when the built-in brain
+  is inserted.
+
+  The official SRI24 v2.0 NIfTI label archive is also bundled for offline
+  anatomical-region analysis. It contains the AAL-derived `tzo116plus` and
+  LPBA40 parcellations, their upstream label-name/colour tables, the supplied
+  supratentorial support mask, and the atlas license. The three original `.nii`
+  files were losslessly gzip-compressed with deterministic gzip headers;
+  decompression reproduces the source bytes exactly. No voxel values, affines,
+  or label tables were altered. File hashes and validation expectations are
+  recorded in `fieldworkbench/assets/sri24_labels/manifest.json`.
+
+  The upstream `SRI24-tzo116plus.txt` table omits definitions for nine
+  spatially encoded ventricular values that occur in `tzo116plus.nii`. Field
+  Workbench preserves that official table unchanged and supplies deterministic
+  names/colours for those nine values at load time using the adjacent upstream
+  encoding sequence. The affected IDs and policy are disclosed in the asset
+  manifest; the LPBA40 volume and table have complete one-to-one coverage.
+
+  The bundled lpba40_meshes.npz display cache is derived from the unchanged
+  LPBA40 label volume at a two-voxel visual stride in Field Workbench canonical
+  head coordinates. It contains 56 region shells generated with VTK
+  SurfaceNets3D 9.6.2. VTK (BSD-3-Clause) is a developer-only regeneration
+  dependency listed in requirements-mesh-build.txt; it is not imported by the
+  application or distributed in normal Field Workbench binary releases.
+
+  Original label archive: `sri24_labels_nifti.zip`
+  Original archive SHA-256:
+    ed47fde305baefb687a38e0daa8527896480e4e0159a0a0f56c8cbe09fc97e1f
+  Archive download:
+    https://www.nitrc.org/frs/download.php/4508/sri24_labels_nifti.zip
+
+  The reduced documentation images
+  fieldworkbench/assets/help/sri24_fiducials_1.jpg through
+  sri24_fiducials_4.jpg are Field Workbench registration screenshots produced
+  in 3D Slicer from SRI24 spgr_unstrip.nii. They document the NAS/LPA/RPA
+  fiducial placements and are distributed under the same CC BY-SA 3.0 terms.
+
+  Requested citation:
+    T. Rohlfing, N. M. Zahr, E. V. Sullivan, and A. Pfefferbaum,
+    "The SRI24 multichannel atlas of normal adult human brain structure,"
+    Human Brain Mapping 31(5):798-819, 2010. DOI: 10.1002/hbm.20906
+
+  Source: https://www.nitrc.org/projects/sri24/
+  License: Creative Commons Attribution-ShareAlike 3.0
+  License URI: https://creativecommons.org/licenses/by-sa/3.0/
+
+
+Bundled Windows video encoder
+-----------------------------
+
+  FFmpeg n8.1.2 / x264 / zlib
+
+  The source archive and Windows binary distribution include a small static
+  ffmpeg.exe used only
+  to convert Field Workbench's numbered PNG export frames to H.264/yuv420p MP4.
+  Linux distributions do not bundle this executable and continue to use the
+  system FFmpeg installation.
+
+  The bundled executable was built from unmodified FFmpeg tag n8.1.2 with
+  --enable-gpl, --enable-version3, --enable-libx264, and --enable-zlib. It
+  reports x264 core 165 r3222 b35605a and zlib 1.3.2. The exact configure
+  command, executable SHA-256, source locations, and license texts are kept in
+  third_party/ffmpeg in the source release and copied to
+  licenses/FFmpeg-n8.1.2-x264 in the Windows binary release.
+
+  FFmpeg: https://ffmpeg.org/
+  FFmpeg source tag: https://github.com/FFmpeg/FFmpeg/tree/n8.1.2
+  x264: https://www.videolan.org/developers/x264.html
+  x264 source: https://code.videolan.org/videolan/x264
+  zlib: https://zlib.net/
+
+  This is third-party software and is not relicensed as Field Workbench code.
+
+
+Network-fetched research data
+-----------------------------
+
+  UPENN-GBM tumor segmentations
+
+  Field Workbench can, at the user's request, download one de-identified,
+  atlas-normalized NIfTI tumor segmentation from the UPENN-GBM collection and
+  convert selected label regions into scene meshes. These case files are not
+  bundled with the application or source archive. The built-in catalogue covers
+  the 147 original expert/curated segmentation assets exposed by the per-file
+  data-nih/tcia redistribution.
+
+  Collection citation:
+    S. Bakas et al., "The University of Pennsylvania glioblastoma (UPenn-GBM)
+    cohort: advanced MRI, clinical, genomics, & radiomics," Scientific Data 9,
+    453 (2022). DOI: 10.1038/s41597-022-01560-7
+
+  Collection DOI: https://doi.org/10.7937/TCIA.709X-DN49
+  Collection page: https://www.cancerimagingarchive.net/collection/upenn-gbm/
+  Per-file redistribution: https://github.com/data-nih/tcia/releases/tag/upenn-gbm
+  Collection license: Creative Commons Attribution 4.0 (CC BY 4.0)
+  License URI: https://creativecommons.org/licenses/by/4.0/
+
+  The imported geometry remains research data under the collection's terms. It
+  is atlas-normalized generic-head geometry, not patient-specific scalp anatomy,
+  and is not intended for diagnosis or treatment planning.
+
+Binary-release notice generation
+--------------------------------
+
+build_windows.bat runs tools/collect_release_licenses.py after PyInstaller. The
+collector reads PyInstaller's actual Analysis table, maps bundled Python modules
+back to the installed distributions in the exact release virtual environment,
+and copies only their license/notice/SBOM material into the onedir release. It
+then writes the exact distribution and Qt-module inventory below this template
+in the binary copy of THIRD_PARTY_NOTICES.txt.
+
+Qt WebEngine uses Chromium and has additional third-party terms. Keep the
+generated licenses/ directory, Qt WebEngine resources, and this notice beside
+FieldWorkbench.exe. Relevant official licensing information:
+
+  https://doc.qt.io/qtforpython-6/licenses.html
+  https://doc.qt.io/qt-6/licenses-used-in-qt.html
+  https://doc.qt.io/qt-6/qtwebengine-licensing.html
+
+PyInstaller is used to create the release but is not imported by or shipped as
+an application runtime package. Its bootloader has an exception permitting the
+generated bundle to use the application's chosen license.
+
+--- GENERATED BINARY INVENTORY FOLLOWS ---

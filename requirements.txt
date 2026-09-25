@@ -1,0 +1,5 @@
+magpylib-studio==0.1.2
+magpylib==5.2.3
+PySide6==6.11.1
+plotly==6.9.0
+pygeomag==1.1.0

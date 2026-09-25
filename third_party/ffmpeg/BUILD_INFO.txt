@@ -1,0 +1,84 @@
+FIELD WORKBENCH BUNDLED WINDOWS VIDEO ENCODER
+=============================================
+
+Purpose
+-------
+This is the small, static FFmpeg executable bundled only with the Windows build
+of Field Workbench for one task: numbered PNG frames -> H.264/yuv420p MP4.
+Linux builds continue to use the system ffmpeg executable and do not bundle this
+Windows binary.
+
+Bundled executable
+------------------
+FFmpeg: n8.1.2
+Compiler: GCC 16.2.0 (Rev3, MSYS2 project)
+Embedded x264: core 165 r3222 b35605a
+Embedded zlib: 1.3.2
+ffmpeg.exe SHA-256:
+  9e6f299118efd596309c5e1bcd5f4cb9410f825e1efd4ee36dc4279390ae7f47
+ffmpeg.exe size: 4,056,576 bytes
+
+FFmpeg configure command
+------------------------
+./configure \
+  --prefix="$HOME/fwb-ffmpeg/dist" \
+  --disable-everything \
+  --disable-autodetect \
+  --disable-debug \
+  --disable-doc \
+  --disable-network \
+  --disable-ffplay \
+  --disable-ffprobe \
+  --enable-small \
+  --enable-gpl \
+  --enable-version3 \
+  --enable-libx264 \
+  --enable-zlib \
+  --pkg-config-flags="--static" \
+  --extra-ldflags="-static" \
+  --enable-protocol=file \
+  --enable-demuxer=image2 \
+  --enable-decoder=png \
+  --enable-encoder=libx264 \
+  --enable-muxer=mp4 \
+  --enable-filter=scale \
+  --enable-filter=format \
+  --enable-swscale
+
+Source and license information
+------------------------------
+FFmpeg source used for this build:
+  project: https://ffmpeg.org/
+  repository: https://github.com/FFmpeg/FFmpeg
+  exact tag: n8.1.2
+  source archive: https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n8.1.2.tar.gz
+
+This FFmpeg build was configured with --enable-gpl and --enable-version3 and
+linked statically with libx264. See GPL-3.0.txt and FFmpeg's LICENSE.md at the
+n8.1.2 tag for the applicable FFmpeg licensing terms.
+
+x264 source linked into the executable:
+  project: https://www.videolan.org/developers/x264.html
+  repository: https://code.videolan.org/videolan/x264
+  revision reported by the binary: r3222 b35605a
+  MSYS2 package used by the build: mingw-w64-x86_64-libx264
+  package/source metadata: https://packages.msys2.org/packages/mingw-w64-x86_64-libx264
+
+x264 is GNU GPL software. See GPL-2.0.txt and the x264 COPYING file in the
+corresponding upstream source revision.
+
+zlib source linked into the executable:
+  project/source: https://zlib.net/
+  version reported by the binary: 1.3.2
+  license: zlib License; see ZLIB_LICENSE.txt
+
+No Field Workbench-specific patches were applied to FFmpeg, x264, or zlib for
+this binary. Field Workbench invokes ffmpeg.exe as a separate process.
+
+Redistributors
+--------------
+Keep this directory's license/build information with binary distributions that
+include the bundled ffmpeg.exe. GPL redistribution also requires making the
+corresponding source code available under the applicable license terms. The
+source references and exact build configuration above identify the unmodified
+upstream sources used to reproduce this executable.

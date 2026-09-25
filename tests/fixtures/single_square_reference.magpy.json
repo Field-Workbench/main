@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "objects": [
+    {
+      "id": "reference_square",
+      "type": "current.Polyline",
+      "params": {
+        "vertices": [
+          [-0.05, -0.05, 0.0],
+          [0.05, -0.05, 0.0],
+          [0.05, 0.05, 0.0],
+          [-0.05, 0.05, 0.0],
+          [-0.05, -0.05, 0.0]
+        ],
+        "current": 2.0,
+        "position": [0.0, 0.0, 0.0]
+      },
+      "style": {
+        "label": "Reference square coil"
+      }
+    }
+  ],
+  "field_workbench": {
+    "version": 19,
+    "coil_specs": {
+      "reference_square": {
+        "turns": 25,
+        "drive_current_a": 0.08,
+        "field_scale_factor": 1.0,
+        "current_mode": "rms_dc"
+      }
+    }
+  }
+}
