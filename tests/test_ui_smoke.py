@@ -81,6 +81,7 @@ from fieldworkbench.dialogs import (
     SensorPathProgressDialog,
     SensorPlotDialog,
     SnapshotComparisonDialog,
+    ExposureAnalysisCacheManagerDialog,
     SnapshotManagerDialog,
     UpennGbmImportDialog,
     _BackgroundFieldRenderMixin,
@@ -4575,6 +4576,103 @@ class UiSmokeTests(unittest.TestCase):
         window.plot.cleanup()
         window.deleteLater()
 
+    def test_exposure_analysis_cache_manager_selectively_removes_derived_results(self):
+        window = self.make_window()
+        payload = {
+            "times_b64": "AAAA",
+            "currents_b64": "BBBB",
+            "shape": [2, 1],
+            "drive_ids": ["coil_a"],
+            "regions": {
+                "whole": {
+                    "name": "Whole brain",
+                    "constant": 0.0,
+                    "linear": [0.0],
+                    "quadratic": [[1.0]],
+                },
+            },
+            "exposure_analysis_context": {
+                "exposure_id": "missing_exp",
+                "exposure_name": "SAM360",
+                "target_id": "missing_brain",
+                "target_name": "SRI24 brain",
+                "target_kind": "brain_lpba40",
+                "atlas": "LPBA40",
+                "sample_count": 100,
+                "physical_duration_s": 10.0,
+                "dependency_signature": "cache-manager-test",
+            },
+        }
+        summary_key = ("summary", "__all_regions__")
+        weighted_key = ("weighted", "__all_regions__", "icnirp2010_public", None)
+        cache = {
+            summary_key: {"regions": {"whole": {"duration_s": 10.0}}},
+            ("__cache_meta__",) + summary_key: {
+                "cached_at": "2026-09-25T20:00:00Z",
+                "processing_time_s": 1.2,
+            },
+            weighted_key: {"regions": {"whole": {"profile_label": "ICNIRP public"}}},
+            ("__cache_meta__",) + weighted_key: {
+                "cached_at": "2026-09-25T20:01:00Z",
+                "processing_time_s": 65.0,
+            },
+        }
+        analysis_id = window.adapter.save_exposure_analysis_resource(
+            payload, name="SAM360 cache", analysis_cache=cache
+        )
+        preparation_blob = window.adapter.exposure_analyses[0]["payload_b64"]
+        changed = []
+        dialog = ExposureAnalysisCacheManagerDialog(
+            window.adapter, analysis_id, window, on_changed=lambda: changed.append(True)
+        )
+        self.assertEqual(dialog.cache_tree.topLevelItemCount(), 2)
+        self.assertIn("Preparation is kept", dialog.preparation_label.text())
+        parents = {
+            dialog.cache_tree.topLevelItem(index).text(0):
+            dialog.cache_tree.topLevelItem(index)
+            for index in range(dialog.cache_tree.topLevelItemCount())
+        }
+        self.assertIn("Exposure Summary", parents)
+        self.assertIn("Frequency weighted", parents)
+        self.assertEqual(parents["Exposure Summary"].childCount(), 1)
+        self.assertIn("ICNIRP 2010", parents["Frequency weighted"].child(0).text(1))
+        self.assertFalse(dialog.remove_selected_button.isEnabled())
+        parents["Frequency weighted"].setCheckState(0, Qt.CheckState.Checked)
+        self.application.processEvents()
+        self.assertEqual(
+            parents["Frequency weighted"].child(0).checkState(0),
+            Qt.CheckState.Checked,
+        )
+        self.assertTrue(dialog.remove_selected_button.isEnabled())
+        dialog.clear_selection()
+        self.assertFalse(dialog.remove_selected_button.isEnabled())
+
+        first = parents["Exposure Summary"].child(0)
+        first_key = first.data(0, Qt.ItemDataRole.UserRole)
+        first.setCheckState(0, Qt.CheckState.Checked)
+        self.application.processEvents()
+        self.assertTrue(dialog.remove_selected_button.isEnabled())
+        before_cache_bytes = int(dialog._record["cache_compressed_bytes"])
+        with mock.patch.object(
+            QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes
+        ):
+            dialog.remove_selected()
+        self.assertEqual(changed, [True])
+        after_cache_bytes = int(dialog._record["cache_compressed_bytes"])
+        self.assertLess(after_cache_bytes, before_cache_bytes)
+        self.assertFalse(dialog.reclaimed_label.isHidden())
+        self.assertIn("Last removal reclaimed", dialog.reclaimed_label.text())
+        self.assertIn("derived cache", dialog.reclaimed_label.text())
+        self.assertEqual(
+            dialog._last_reclaimed_storage, (before_cache_bytes, after_cache_bytes)
+        )
+        self.assertEqual(dialog.cache_tree.topLevelItemCount(), 1)
+        self.assertEqual(dialog.cache_tree.topLevelItem(0).text(0), "Frequency weighted")
+        remaining = window.adapter.exposure_analysis(analysis_id)["analysis_cache"]
+        self.assertNotIn(first_key, remaining)
+        self.assertNotIn(("__cache_meta__",) + first_key, remaining)
+        self.assertEqual(window.adapter.exposure_analyses[0]["payload_b64"], preparation_blob)
+
     def test_snapshot_manager_lists_a_saved_result(self):
         window = self.make_window()
         box_id = window.adapter.add_template("guide_box")
@@ -4639,6 +4737,8 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(analysis_item.text(4), "3 tools • 4 configs")
         self.assertIn("Summary", dialog.exposure_analysis_details.text())
         self.assertIn("50,400 LPBA40 samples", dialog.exposure_analysis_details.text())
+        self.assertEqual(dialog.exposure_analysis_manage_cache_button.text(), "Manage cache…")
+        self.assertTrue(dialog.exposure_analysis_manage_cache_button.isEnabled())
         self.assertEqual(dialog.exposure_analysis_delete_button.text(), "Delete cache")
         self.assertEqual(dialog.tree.topLevelItem(0).text(0), "Test result")
         self.assertEqual(dialog.tree.topLevelItem(0).text(2), "Current scene")

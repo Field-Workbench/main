@@ -2144,7 +2144,13 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('self._show_managed_window(dialog)', saved_results)
         self.assertIn('"Cached work"', saved_results)
         self.assertIn('savedExposureAnalysisDetailsGroup', saved_results)
+        self.assertIn('class ExposureAnalysisCacheManagerDialog(QDialog):', saved_results)
+        self.assertIn('Manage cache…', saved_results)
+        self.assertIn('Remove all derived results', saved_results)
+        self.assertIn('Last removal reclaimed', saved_results)
+        self.assertIn('individual rows do not have independent reclaimable sizes', saved_results)
         self.assertIn('Delete cache', saved_results)
+        self.assertIn('def delete_exposure_analysis_cached_results(', adapter)
         self.assertIn('def _exposure_analysis_cache_summary(', adapter)
         self.assertIn('"cached_tool_counts"', adapter)
         self.assertIn('EXPOSURE_ANALYSIS_FORMAT_VERSION = 3', adapter)
@@ -2332,6 +2338,38 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("Exposure analysis home", help_topics)
         self.assertIn("literature or reference framework", help_topics)
         self.assertIn("← Analysis home", help_topics)
+
+
+    def test_frequency_weighted_reference_queue_and_cached_browsing_are_present(self) -> None:
+        source = (PROJECT_ROOT / "fieldworkbench" / "exposure_actions.py").read_text(encoding="utf-8")
+        help_topics = (PROJECT_ROOT / "fieldworkbench" / "help_topics.py").read_text(encoding="utf-8")
+
+        self.assertIn('self._weighted_pending_requests = []', source)
+        self.assertIn('QPushButton("Calculate all uncached references", self)', source)
+        self.assertIn('def calculate_all_uncached_profiles(self, *_args):', source)
+        self.assertIn('def _analysis_job_released(self):', source)
+        self.assertIn('def _analysis_cancel_requested(self):', source)
+        self.assertIn('view.setText("Queue")', source)
+        self.assertIn('view.setText("Open")', source)
+        self.assertIn('tree.setEnabled(not busy or isinstance(page, FrequencyWeightedPage))', source)
+        self.assertIn('self._advance_analysis_job_queue', source)
+        self.assertIn('Calculate all uncached references', help_topics)
+        self.assertIn('Cached results remain fully browsable', help_topics)
+
+
+    def test_frequency_weighted_persistent_cache_is_compact(self) -> None:
+        source = (PROJECT_ROOT / "fieldworkbench" / "exposure_actions.py").read_text(encoding="utf-8")
+        help_topics = (PROJECT_ROOT / "fieldworkbench" / "help_topics.py").read_text(encoding="utf-8")
+
+        self.assertIn('def _compact_frequency_weighted_result(result):', source)
+        self.assertIn('"weighted_spatial_rms_uT",', source)
+        self.assertIn('"spectral_top_rows"', source)
+        self.assertIn('dtype=np.float32', source)
+        self.assertIn('str(request_key[0]) == "weighted"', source)
+        self.assertIn('data.get("spectral_top_rows", ())', source)
+        self.assertNotIn('ratio = np.asarray(data["spectral_ratio_by_bin"]', source)
+        self.assertIn('compact derived cache', help_topics)
+        self.assertIn('30 strongest spectral rows', help_topics)
 
 
     def test_frequency_weighted_results_use_right_side_viewer_splitter(self) -> None:

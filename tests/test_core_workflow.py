@@ -207,6 +207,116 @@ class CoreWorkflowTests(unittest.TestCase):
         self.adapter.undo()
         self.assertEqual(len(self.adapter.list_exposure_analyses(live_status=False)), 1)
 
+    def test_exposure_analysis_selective_cache_delete_preserves_preparation_and_is_undoable(self):
+        payload = {
+            "times_b64": "AAAA",
+            "currents_b64": "BBBB",
+            "shape": [2, 1],
+            "drive_ids": ["coil_a"],
+            "regions": {
+                "whole": {
+                    "name": "Whole brain",
+                    "constant": 0.0,
+                    "linear": [0.0],
+                    "quadratic": [[1.0]],
+                },
+            },
+            "exposure_analysis_context": {
+                "exposure_id": "missing_exp",
+                "exposure_name": "SAM360",
+                "target_id": "missing_brain",
+                "target_name": "SRI24 brain",
+                "target_kind": "brain_lpba40",
+                "atlas": "LPBA40",
+                "sample_count": 200,
+                "physical_duration_s": 20.0,
+                "dependency_signature": "selective-delete-test",
+            },
+        }
+        summary_key = ("summary", "__all_regions__")
+        spectrum_key = ("spectrum", "__all_regions__", 65536, "hann", True)
+        weighted_key = ("weighted", "__all_regions__", "icnirp2010_public", None)
+        cache = {
+            summary_key: {"regions": {"whole": {"peak_uT": 1.0}}},
+            ("__cache_meta__",) + summary_key: {"processing_time_s": 0.5},
+            spectrum_key: {
+                "regions": {"whole": {"frequency_hz": np.arange(4096, dtype=float)}}
+            },
+            ("__cache_meta__",) + spectrum_key: {"processing_time_s": 12.0},
+            weighted_key: {
+                "regions": {"whole": {"weighted_index": np.linspace(0.0, 1.0, 4096)}}
+            },
+            ("__cache_meta__",) + weighted_key: {"processing_time_s": 18.0},
+            ("__cache_meta__", "orphan", "row"): {"processing_time_s": 99.0},
+        }
+        analysis_id = self.adapter.save_exposure_analysis_resource(
+            payload, name="Selective cache", analysis_cache=cache
+        )
+        record_before = copy.deepcopy(self.adapter.exposure_analyses[0])
+        history_before = self.adapter.history()["undo"]
+
+        removed = self.adapter.delete_exposure_analysis_cached_results(
+            analysis_id, [spectrum_key]
+        )
+        self.assertEqual(removed, 1)
+        self.assertEqual(self.adapter.history()["undo"], history_before + 1)
+        record_after = self.adapter.exposure_analyses[0]
+        self.assertEqual(record_after["payload_b64"], record_before["payload_b64"])
+        self.assertEqual(record_after["preparation_sha256"], record_before["preparation_sha256"])
+        self.assertLess(record_after["cache_compressed_bytes"], record_before["cache_compressed_bytes"])
+        restored = self.adapter.exposure_analysis(analysis_id)
+        self.assertNotIn(spectrum_key, restored["analysis_cache"])
+        self.assertNotIn(("__cache_meta__",) + spectrum_key, restored["analysis_cache"])
+        self.assertNotIn(("__cache_meta__", "orphan", "row"), restored["analysis_cache"])
+        self.assertIn(summary_key, restored["analysis_cache"])
+        self.assertIn(weighted_key, restored["analysis_cache"])
+        catalog = self.adapter.list_exposure_analyses(live_status=False)[0]
+        self.assertEqual(catalog["cached_result_count"], 2)
+        self.assertEqual(catalog["cached_tool_counts"], {"summary": 1, "weighted": 1})
+        self.assertEqual(
+            catalog["compressed_bytes"],
+            catalog["preparation_compressed_bytes"] + catalog["cache_compressed_bytes"],
+        )
+
+        # Asking to remove an absent/duplicate key is a no-op and must not add
+        # another Undo step or perturb storage accounting.
+        history_after_delete = self.adapter.history()["undo"]
+        bytes_after_delete = catalog["cache_compressed_bytes"]
+        self.assertEqual(
+            self.adapter.delete_exposure_analysis_cached_results(
+                analysis_id, [spectrum_key, ("missing", "__all_regions__")]
+            ),
+            0,
+        )
+        self.assertEqual(self.adapter.history()["undo"], history_after_delete)
+        self.assertEqual(
+            self.adapter.list_exposure_analyses(live_status=False)[0]["cache_compressed_bytes"],
+            bytes_after_delete,
+        )
+
+        self.adapter.undo()
+        undone = self.adapter.exposure_analysis(analysis_id)
+        self.assertIn(spectrum_key, undone["analysis_cache"])
+        self.assertIn(("__cache_meta__",) + spectrum_key, undone["analysis_cache"])
+        self.assertEqual(
+            self.adapter.exposure_analyses[0]["preparation_sha256"],
+            record_before["preparation_sha256"],
+        )
+
+        # Removing all derived results is still a parent-preserving, undoable action.
+        self.adapter.redo()
+        removed = self.adapter.delete_exposure_analysis_cached_results(analysis_id, None)
+        self.assertEqual(removed, 2)
+        cleared = self.adapter.exposure_analysis(analysis_id)
+        self.assertEqual(cleared["analysis_cache"], {})
+        cleared_catalog = self.adapter.list_exposure_analyses(live_status=False)[0]
+        self.assertEqual(cleared_catalog["cached_result_count"], 0)
+        self.assertEqual(cleared_catalog["cached_tool_counts"], {})
+        self.assertEqual(
+            self.adapter.exposure_analyses[0]["payload_b64"],
+            record_before["payload_b64"],
+        )
+
     def test_legacy_exposure_analysis_cache_is_dropped_without_losing_scene(self):
         payload = {
             "times_b64": "AAAA",

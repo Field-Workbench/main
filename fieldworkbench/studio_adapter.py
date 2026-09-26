@@ -2616,6 +2616,67 @@ class StudioAdapter:
         record["updated_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         return target
 
+    def delete_exposure_analysis_cached_results(
+        self, analysis_id: str, result_keys: Iterable[tuple[Any, ...]] | None = None,
+    ) -> int:
+        """Remove selected derived configurations while preserving preparation data.
+
+        ``None`` removes every derived result from the parent Exposure Analysis.
+        Cache metadata rows paired with deleted results are removed automatically,
+        and orphaned metadata is cleaned up before the compact cache blob is written.
+        This is an explicit Saved Results management action, so it participates in
+        normal project Undo history unlike automatic derived-cache writes.
+        """
+        target = str(analysis_id or "")
+        record = next(
+            (item for item in self.exposure_analyses if str(item.get("id", "")) == target),
+            None,
+        )
+        if record is None:
+            raise StudioOperationError("The selected exposure analysis no longer exists.")
+
+        _payload, analysis_cache = self._decode_exposure_analysis_payload(record)
+        result_cache_keys = {
+            key for key in analysis_cache
+            if isinstance(key, tuple) and key and str(key[0]) != "__cache_meta__"
+        }
+        if result_keys is None:
+            requested = set(result_cache_keys)
+        else:
+            requested = set()
+            for value in result_keys:
+                try:
+                    key = tuple(value)
+                    hash(key)
+                except (TypeError, ValueError):
+                    continue
+                if key and str(key[0]) != "__cache_meta__":
+                    requested.add(key)
+
+        removed = requested & result_cache_keys
+        if not removed:
+            return 0
+
+        before = self.document()
+        for key in removed:
+            analysis_cache.pop(key, None)
+            analysis_cache.pop(("__cache_meta__",) + key, None)
+
+        # Old or interrupted saves may contain metadata without a result row.
+        # Never keep those bookkeeping records once the derived cache is managed.
+        for key in list(analysis_cache):
+            if (
+                isinstance(key, tuple)
+                and key
+                and str(key[0]) == "__cache_meta__"
+                and tuple(key[1:]) not in analysis_cache
+            ):
+                analysis_cache.pop(key, None)
+
+        self.update_exposure_analysis_cache(target, analysis_cache)
+        self._commit(before)
+        return len(removed)
+
     def list_exposure_analyses(self, *, live_status: bool = True) -> list[dict[str, Any]]:
         rows = []
         status_cache: dict[tuple[str, str, str], str] = {}

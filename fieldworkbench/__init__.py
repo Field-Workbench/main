@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 __all__ = ["StudioAdapter"]
-__version__ = "0.14.0.249"
+__version__ = "0.14.0.253"
 
 
 def __getattr__(name: str) -> Any:

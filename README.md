@@ -22,15 +22,16 @@ The modeling layer is built around Magpylib / Magpylib Studio and includes tools
 
 ## 2. Suite applications
 
-The Project Manager organizes the workflow; the suite applications can be used to perform various functions and manage saved data.
+Each open project has one shared project context. The Project Manager owns project lifetime and save state; the suite applications can be opened and used independently for that project:
 
 - **Model Editor** — build and inspect field sources, sensors, geometry, measurement volumes, coil construction, design-rule checks, and optimization.
 - **Map Creator** — create Static or Scripted 2D, 3D, and Brain visualizations, including saved-exposure playback.
 - **Saved Results** — reopen and manage cached Static/Scripted maps, Exposure Analysis resources, and quantitative Measurement-volume snapshots.
-- **Exposure Editor** — use waveforms and coil routing to define an exposure protocol.
+- **Exposure Editor** — author physical-duration source/routing protocols and launch full-exposure analysis.
 - **Waveform Editor** — create, import, edit, and export reusable Current/Voltage waveforms and encoded waveform formats.
-- **Dataset Manager** — attach measured datasets to a model and use them for coil calibration/composite fits.
+- **Dataset Manager** — manage measured datasets, calibration/composite fits, and coil-correction links.
 
+Built-in **Help Topics** documents the current workflows, analysis definitions, limitations, and research/reference basis.
 
 ## 3. Contribute and Collaborate
 

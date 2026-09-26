@@ -393,44 +393,75 @@ class ExposurePanelTests(unittest.TestCase):
         self.assertEqual(dialog.profile_table.item(row, 1).text(), "Not calculated")
         self.assertTrue(open_button.isEnabled())
 
-        # Open performs the first calculation and immediately opens the saved result.
+        # An uncached row calculates first; the same action becomes Open once the
+        # completed all-region configuration is cached.
+        self.assertEqual(open_button.text(), "Calculate")
         open_button.click()
-        self.assertTrue(dialog.result_window.isVisible())
+        self.assertFalse(dialog.result_window.isVisible())
         request_key = dialog._request_key(profile)
         cached = dialog.analysis_cache[("weighted", "__all_regions__", profile, request_key[3])]["regions"]["a"]
-        self.assertIs(dialog._analysis, cached)
+        self.assertEqual(cached["weighted_cache_format"], "compact-v1")
+        self.assertEqual(np.asarray(cached["weighted_index"]).dtype, np.dtype(np.float32))
+        self.assertLessEqual(len(cached["spectral_top_rows"]), 30)
+        for bulky_key in (
+            "weighted_spatial_rms_uT", "frequency_hz", "bin_rms_uT",
+            "reference_rms_by_bin_uT", "spectral_ratio_by_bin",
+        ):
+            self.assertNotIn(bulky_key, cached)
+        self.assertIn(("spectrum", "__all_regions__", request_key[3], "rectangular", True), dialog.analysis_cache)
         self.assertIn("Ready", dialog.profile_table.item(row, 1).text())
-        dialog.result_window.close()
-        self.assertFalse(dialog.result_window.isVisible())
+        self.assertEqual(open_button.text(), "Open")
         with patch("fieldworkbench.exposure_actions.analyse_regions_frequency_weighted") as calculate:
             open_button.click()
             calculate.assert_not_called()
         self.assertTrue(dialog.result_window.isVisible())
+        self.assertIs(dialog._analysis, cached)
 
-        # A different sampling key does not pretend to be cached, but Open remains available.
+        # The compact weighted result is independently viewable after its shared
+        # rectangular Spectrum/FFT cache is removed through Manage cache.
+        dialog.result_window.close()
+        spectrum_key = ("spectrum", "__all_regions__", request_key[3], "rectangular", True)
+        dialog.analysis_cache.pop(spectrum_key, None)
+        dialog.analysis_cache.pop(("__cache_meta__",) + spectrum_key, None)
+        with patch("fieldworkbench.exposure_actions.analyse_regions_frequency_weighted") as calculate:
+            open_button.click()
+            calculate.assert_not_called()
+        self.assertTrue(dialog.result_window.isVisible())
+        self.assertGreater(dialog.table.rowCount(), 0)
+        self.assertIs(dialog._analysis, cached)
+
+        # A different sampling key does not pretend to be cached and exposes Calculate.
         dialog.result_window.close()
         with patch("fieldworkbench.exposure_actions.analyse_regions_frequency_weighted") as calculate:
             dialog.custom_mode.setChecked(True)
             self.assertEqual(dialog.profile_table.item(row, 1).text(), "Not calculated")
+            self.assertEqual(open_button.text(), "Calculate")
             self.assertTrue(open_button.isEnabled())
             calculate.assert_not_called()
 
-        # Long first-open work reports Running and disables profile actions until completion/failure.
+        # Cached Auto results remain openable while another reference is running.
+        dialog.auto_mode.setChecked(True)
         other = list(dialog._profile_actions)[1]
+        other_row, other_open = dialog._profile_actions[other]
         dialog.payload["analysis_trace_reduced"] = True
         dialog.payload["authoritative_analysis"] = {}
         with patch("fieldworkbench.exposure_actions._start_analysis_job") as start:
-            dialog.view_profile(other)
+            other_open.click()
             start.assert_called_once()
-        other_row, other_open = dialog._profile_actions[other]
-        self.assertEqual(dialog.profile_table.item(other_row, 1).text(), "Running…")
-        self.assertFalse(other_open.isEnabled())
+            self.assertEqual(dialog.profile_table.item(other_row, 1).text(), "Running…")
+            self.assertFalse(other_open.isEnabled())
+            self.assertEqual(open_button.text(), "Open")
+            self.assertTrue(open_button.isEnabled())
+            open_button.click()
+            self.assertTrue(dialog.result_window.isVisible())
+            self.assertEqual(dialog._analysis_progress_state, "running")
+            self.assertTrue(dialog._analysis_busy)
         dialog._analysis_failed("test background failure")
         self.assertTrue(other_open.isEnabled())
+        self.assertEqual(other_open.text(), "Calculate")
         self.assertIn("test background failure", dialog.error_label.text())
 
-        # Restore the cached Auto result and verify the result browser layout.
-        dialog.auto_mode.setChecked(True)
+        # Verify the cached Auto result browser layout.
         dialog.view_profile(profile)
         self.assertGreaterEqual(dialog.profile.count(), 5)
         self.assertIn("ICNIRP 2010", dialog.profile.currentText())
@@ -443,6 +474,74 @@ class ExposurePanelTests(unittest.TestCase):
         self.assertIs(dialog.summary.parentWidget(), dialog.result_text_panel)
         self.assertIs(dialog.table.parentWidget(), dialog.result_text_panel)
         self.assertIs(dialog.plot.parentWidget(), dialog.result_plot_panel)
+        dialog.close()
+        dialog.deleteLater()
+        self.app.processEvents()
+
+    def test_frequency_weighted_reference_queue_deduplicates_and_advances(self):
+        times = np.linspace(0.0, 1.0, 101, dtype=np.float64)
+        currents = np.sin(2.0 * np.pi * 10.0 * times)[:, None]
+        payload = {
+            "times_b64": encode(times, np.float64),
+            "currents_b64": encode(currents, np.float64),
+            "shape": list(currents.shape),
+            "drive_ids": ["coil"],
+            "analysis_trace_reduced": True,
+            "authoritative_analysis": {},
+            "regions": {
+                "a": {
+                    "name": "A", "constant": 0.0, "linear": [0.0],
+                    "quadratic": [[1e-12]],
+                }
+            },
+        }
+        dialog = FrequencyWeightedPage(payload, "a")
+        # Mimic ownership by the target workspace so follow-up submission waits
+        # for the shared worker-release callback instead of a direct-page timer.
+        dialog._analysis_job_finished_callback = lambda _page: None
+        profiles = list(dialog._profile_actions)
+        first, second = profiles[:2]
+        first_button = dialog._profile_actions[first][1]
+        second_row, second_button = dialog._profile_actions[second]
+
+        with patch("fieldworkbench.exposure_actions._start_analysis_job") as start:
+            first_button.click()
+            self.assertEqual(start.call_count, 1)
+            self.assertTrue(dialog._analysis_busy)
+            self.assertEqual(first_button.text(), "Running")
+
+            second_button.click()
+            second_button.click()  # Disabled/deduplicated; must not enqueue twice.
+            self.assertIn((second, None), dialog._weighted_pending_set)
+            self.assertEqual(dialog.profile_table.item(second_row, 1).text(), "Queued…")
+            self.assertEqual(start.call_count, 1)
+
+            dialog.calculate_all_profiles_button.click()
+            self.assertEqual(len(dialog._weighted_pending_set), len(profiles) - 1)
+            self.assertFalse(dialog.auto_mode.isEnabled())
+            self.assertFalse(dialog.custom_mode.isEnabled())
+            self.assertFalse(dialog.samples.isEnabled())
+
+            # Completing the active reference does not jump ahead of the
+            # target-wide scheduler. Once the workspace releases this page, the
+            # next reference is submitted and the remainder stay pending.
+            dialog._analysis_completed({"a": {"weighted_peak_index": 0.25}})
+            self.assertFalse(dialog._analysis_busy)
+            self.assertTrue(dialog._weighted_followup_pending)
+            self.assertEqual(start.call_count, 1)
+            dialog._analysis_job_released()
+            self.assertEqual(start.call_count, 2)
+            self.assertTrue(dialog._analysis_busy)
+            self.assertEqual(dialog._analysis_request_key[2], second)
+            self.assertEqual(len(dialog._weighted_pending_set), len(profiles) - 2)
+
+        dialog._analysis_cancel_requested()
+        self.assertEqual(dialog._weighted_pending_requests, [])
+        self.assertEqual(dialog._weighted_pending_set, set())
+        self.assertFalse(dialog._weighted_followup_pending)
+        dialog._set_analysis_busy(False)
+        self.assertTrue(dialog.auto_mode.isEnabled())
+        self.assertTrue(dialog.custom_mode.isEnabled())
         dialog.close()
         dialog.deleteLater()
         self.app.processEvents()
@@ -472,7 +571,10 @@ class ExposurePanelTests(unittest.TestCase):
         with patch("fieldworkbench.exposure_actions._start_analysis_job") as start:
             dialog.result_region_tree.setCurrentItem(dialog.result_region_tree._region_items[nodes[-1].key])
             self.assertEqual(dialog.region.currentData(), nodes[-1].key)
-            self.assertIs(dialog._analysis, results[nodes[-1].key])
+            cached_result = dialog.analysis_cache[("weighted", "__all_regions__", profile, None)]["regions"][nodes[-1].key]
+            self.assertIs(dialog._analysis, cached_result)
+            self.assertEqual(dialog._analysis["weighted_peak_index"], results[nodes[-1].key]["weighted_peak_index"])
+            self.assertNotIn("spectral_ratio_by_bin", dialog._analysis)
             self.assertIs(dialog.region_tree.currentItem(), dialog.region_tree._region_items[nodes[-1].key])
             dialog.view_profile(profile)
             start.assert_not_called()

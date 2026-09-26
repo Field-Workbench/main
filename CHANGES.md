@@ -1,5 +1,37 @@
 # Field Workbench changes
 
+## 0.14.0.253 — Exposure Analysis cache/queue consolidation
+
+- Finished the four-phase saved-analysis cache update with a cleanup/regression pass across selective cache management, frequency-weighted reference queueing, and compact weighted-result persistence.
+- Manage cache now reports the exact compressed derived-cache storage reclaimed by the most recent selective/all-derived removal. Per-row byte estimates are deliberately not shown because binary arrays can be shared/deduplicated across configurations; the before/after derived-cache size is authoritative.
+- Expanded regressions for selective-delete storage accounting and Undo, queue cancellation/deduplication, cached weighted browsing while other references run, and reopening compact weighted results after their shared Spectrum/FFT cache has been removed.
+- Audited Exposure Analysis Help so the cache manager, single-worker reference queue, compact weighted-cache format, and storage-recovery behavior are described together.
+
+## 0.14.0.252 — Compact frequency-weighted derived cache
+
+- Slimmed persisted Frequency-weighted screening results so they no longer duplicate the matching full Spectrum/FFT frequency, bin-RMS, reference-curve, spectral-ratio, or weighted-µT arrays for every region/reference profile.
+- Frequency-weighted cache rows now retain authoritative scalar results at full calculation precision, one bounded normalized display trace, and only the 30 strongest spectral rows needed by the results table.
+- Stored weighted display traces use float32 display precision while peak search, spectral summation, and all reported scalar values continue to be calculated before compaction at full numerical precision.
+- The matching rectangular/detrended Spectrum/FFT result remains a separate shared cache entry and continues to be reusable by later weighting profiles and the Spectrum/FFT viewer. Weighted cached results remain independently viewable even if that shared Spectrum cache is later removed through Manage cache because their strongest-frequency table rows are retained locally.
+- Updated Frequency-weighted Help and regression coverage for compact-cache storage, table rendering, and separation of authoritative calculation outputs from display-only cached data.
+
+## 0.14.0.251 — Frequency-weighted reference queue
+
+- Reworked Frequency-weighted screening so each reference profile has an independent action/state for the current sampling configuration: uncached references show **Calculate**/**Queue**, active references show **Running** or **Queued**, and completed references show **Open**.
+- Added **Calculate all uncached references** to queue every missing ICNIRP/EU reference for the selected Auto/Custom sampling configuration without running calculations concurrently.
+- Cached frequency-weighted results can now be opened and their result-region tree browsed while another reference is running or queued; opening cached data no longer overwrites the active calculation progress state.
+- Auto/Custom sampling controls stay locked until the page's pending reference queue is exhausted, duplicate submissions are suppressed, and Cancel clears both the active weighting request and the page's pending reference requests.
+- Preserved the target-wide single-worker FIFO: an already-waiting Summary/Spectrum/Timing/Threshold job keeps its place ahead of a frequency-weighting follow-up reference. Matching rectangular/detrended spectrum caches continue to be reused between profiles.
+- Updated Exposure Analysis Help and regression coverage for multi-reference queueing, cached browsing during calculation, deduplication, queue advancement, and the weighted result-browser exception to setup-region locking.
+
+## 0.14.0.250 — Selective Exposure Analysis cache management
+
+- Added **Manage cache…** to Saved Results → Exposure analyses for selectively removing individual derived analysis configurations while preserving the expensive prepared field basis and authoritative exposure source.
+- The cache manager lists each stored Summary, Spectrum/FFT, Timing, Threshold, and frequency-weighted configuration with human-readable settings plus cached/processing metadata when available.
+- Added **Select all**, **Clear selection**, **Remove selected**, and **Remove all derived results** controls. Explicit removals are undoable and automatically remove matching cache metadata without disturbing the parent preparation.
+- Saved Results immediately refreshes cached-work counts and preparation/derived/total storage after selective removal.
+- Added adapter and UI regression coverage for selective removal, metadata cleanup, preparation preservation, storage/count refresh, and Undo restoration.
+
 ## 0.14.0.249 — Final Exposure Analysis test cleanup
 
 - Updated the last stale Exposure Analysis workspace regression to patch the current all-region spectrum calculation entry point (`analyse_regions_spectrum`) instead of the removed single-region helper.

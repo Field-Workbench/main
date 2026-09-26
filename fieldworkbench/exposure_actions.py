@@ -169,8 +169,15 @@ _ACTIVE_ANALYSIS_JOBS = {}
 
 
 def _request_analysis_cancellation(owner):
+    cancel_requested = getattr(owner, "_analysis_cancel_requested", None)
     if not getattr(owner, "_analysis_busy", False):
+        # A page-local logical queue can briefly be between worker submissions.
+        # Closing/cancelling in that gap must still discard its pending work.
+        if callable(cancel_requested) and getattr(owner, "_weighted_pending_requests", None):
+            cancel_requested()
         return
+    if callable(cancel_requested):
+        cancel_requested()
     if str(getattr(owner, "_analysis_progress_state", "")) == "queued":
         cancel_queued = getattr(owner, "_analysis_queue_cancel_callback", None)
         if callable(cancel_queued):
@@ -570,6 +577,77 @@ def _analysis_cache_result_keys(cache):
     )
 
 
+_WEIGHTED_FULL_ARRAY_KEYS = {
+    "weighted_spatial_rms_uT",
+    "frequency_hz",
+    "bin_rms_uT",
+    "reference_rms_by_bin_uT",
+    "spectral_ratio_by_bin",
+}
+
+
+def _compact_frequency_weighted_result(result):
+    """Return the persistent/display form of one frequency-weighted region result.
+
+    The weighting calculation needs the full spectrum while it is running, but the
+    persistent weighted cache does not. A matching Spectrum/FFT cache already owns
+    those full spectral arrays. Keep authoritative scalar results at float64
+    precision, one bounded normalized display trace, and only the strongest 30
+    spectral rows required by the results table.
+    """
+    if not isinstance(result, dict):
+        return result
+    compact = {
+        key: value for key, value in result.items()
+        if key not in _WEIGHTED_FULL_ARRAY_KEYS
+    }
+
+    ratio = np.asarray(result.get("spectral_ratio_by_bin", ()), dtype=np.float64)
+    frequency = np.asarray(result.get("frequency_hz", ()), dtype=np.float64)
+    bin_rms = np.asarray(result.get("bin_rms_uT", ()), dtype=np.float64)
+    refs = np.asarray(result.get("reference_rms_by_bin_uT", ()), dtype=np.float64)
+    if ratio.ndim == frequency.ndim == bin_rms.ndim == refs.ndim == 1 and (
+        len(ratio) == len(frequency) == len(bin_rms) == len(refs) and len(ratio)
+    ):
+        indices = [
+            int(i) for i in np.argsort(ratio)[::-1][:30]
+            if ratio[i] > 1e-15 and np.isfinite(refs[i])
+        ]
+        compact["spectral_top_rows"] = (
+            np.column_stack((frequency[indices], bin_rms[indices], refs[indices], ratio[indices]))
+            if indices else np.empty((0, 4), dtype=np.float64)
+        )
+    else:
+        existing_rows = np.asarray(result.get("spectral_top_rows", ()), dtype=np.float64)
+        compact["spectral_top_rows"] = (
+            existing_rows if existing_rows.ndim == 2 and existing_rows.shape[1:] == (4,)
+            else np.empty((0, 4), dtype=np.float64)
+        )
+
+    # This trace is explicitly a bounded plot preview; the scalar peak was found
+    # using the full analysed samples. Float32 is ample for screen plotting and
+    # halves the only profile/region-specific large array retained in this cache.
+    compact["weighted_index"] = np.asarray(
+        result.get("weighted_index", ()), dtype=np.float32
+    )
+    compact["time_s"] = np.asarray(result.get("time_s", ()), dtype=np.float64)
+    compact["weighted_cache_format"] = "compact-v1"
+    return compact
+
+
+def _compact_frequency_weighted_cache_group(data):
+    """Compact all regional results in a weighted all-regions cache row."""
+    if not isinstance(data, dict) or not isinstance(data.get("regions"), dict):
+        return data
+    return {
+        **data,
+        "regions": {
+            str(key): _compact_frequency_weighted_result(value)
+            for key, value in data["regions"].items()
+        },
+    }
+
+
 def _analysis_home_cache_statuses(cache):
     """Summarize target-wide derived caches for the descriptive analysis home."""
     keys = [
@@ -601,6 +679,8 @@ def _store_analysis_cache_result(owner, request_key, data, *, notify=True, elaps
     """Store one derived result and notify the persistent Exposure Analysis target."""
     if request_key is None or not isinstance(getattr(owner, "analysis_cache", None), dict):
         return
+    if isinstance(request_key, tuple) and request_key and str(request_key[0]) == "weighted":
+        data = _compact_frequency_weighted_cache_group(data)
     owner.analysis_cache[request_key] = data
     meta_key = _analysis_cache_meta_key(request_key)
     if meta_key is not None:
@@ -1594,7 +1674,7 @@ class FrequencyWeightedResultsWindow(QDialog):
 
 
 class FrequencyWeightedPage(_CancellableAnalysisPage):
-    """Calculate a profile on first open and browse its cached regional results."""
+    """Queue reference-profile calculations and browse cached regional results."""
 
     def __init__(self, payload, selected_key=None, parent=None, analysis_cache=None):
         super().__init__(parent)
@@ -1603,6 +1683,10 @@ class FrequencyWeightedPage(_CancellableAnalysisPage):
         self._analysis = None
         self._analysis_busy = False
         self._analysis_request_key = None
+        self._weighted_pending_requests = []
+        self._weighted_pending_set = set()
+        self._weighted_open_after = set()
+        self._weighted_followup_pending = False
 
         root = QVBoxLayout(self)
         form = QFormLayout()
@@ -1655,7 +1739,7 @@ class FrequencyWeightedPage(_CancellableAnalysisPage):
         self.progress_label, self.progress_bar = _add_analysis_progress(root, self)
 
         self.profile_table = QTableWidget(len(FREQUENCY_WEIGHTING_PROFILES), 3, self)
-        self.profile_table.setHorizontalHeaderLabels(["Reference profile", "Status", "Open"])
+        self.profile_table.setHorizontalHeaderLabels(["Reference profile", "Status", "Action"])
         self.profile_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.profile_table.verticalHeader().hide()
         self.profile_table.setWordWrap(False)
@@ -1668,11 +1752,11 @@ class FrequencyWeightedPage(_CancellableAnalysisPage):
             label_item = QTableWidgetItem(definition["label"])
             label_item.setToolTip(definition["label"])
             self.profile_table.setItem(row, 0, label_item)
-            view = QPushButton("Open")
+            view = QPushButton("Calculate")
             view.setToolTip(
-                "Open the cached result, or calculate this profile once if it has not been cached yet."
+                "Calculate this reference for the current sampling settings. Cached references can be opened while other calculations run."
             )
-            view.clicked.connect(lambda _checked=False, k=key: self.view_profile(k))
+            view.clicked.connect(lambda _checked=False, k=key: self._profile_action_clicked(k))
             self.profile_table.setCellWidget(row, 2, view)
             self._profile_actions[key] = (row, view)
         self.region_tree = self._make_region_tree()
@@ -1684,9 +1768,19 @@ class FrequencyWeightedPage(_CancellableAnalysisPage):
         overview.setSizes([250, 780])
         overview.setChildrenCollapsible(False)
         root.addWidget(overview, 1)
+        profile_controls = QHBoxLayout()
+        self.calculate_all_profiles_button = QPushButton("Calculate all uncached references", self)
+        self.calculate_all_profiles_button.setObjectName("calculateAllFrequencyWeightedReferences")
+        self.calculate_all_profiles_button.setToolTip(
+            "Queue every reference profile that is not already cached for the current sampling settings."
+        )
+        self.calculate_all_profiles_button.clicked.connect(self.calculate_all_uncached_profiles)
+        profile_controls.addWidget(self.calculate_all_profiles_button)
+        profile_controls.addStretch(1)
+        root.addLayout(profile_controls)
         hint = QLabel(
-            "Open a reference profile to view it. If that sampling configuration is not cached yet, "
-            "Field Workbench calculates all prepared regions once and then opens the saved result."
+            "Cached references remain openable while another reference is running. Uncached references can be queued; "
+            "sampling settings stay locked until the queued frequency-weighting work finishes."
         )
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -1745,7 +1839,6 @@ class FrequencyWeightedPage(_CancellableAnalysisPage):
         result_root.addWidget(result_browser, 1)
         self._view_profile = None
         self._view_sample_spec = None
-        self._open_result_after_analysis = False
 
         self.region.currentIndexChanged.connect(self._region_changed)
         self.samples.valueChanged.connect(self._refresh_profiles)
@@ -1801,119 +1894,248 @@ class FrequencyWeightedPage(_CancellableAnalysisPage):
         prefix = f"{target_name} — " if target_name and not self._region_display_name().startswith(target_name) else ""
         self.result_window.setWindowTitle(f"{prefix}{self._region_display_name()} — {data['profile_label']}")
 
+    def _current_sample_spec(self):
+        return None if self.auto_mode.isChecked() else int(self.samples.value())
+
+    def _request_key_for(self, profile, sample_spec):
+        key = self.region.currentData()
+        if key is None or profile is None:
+            return None
+        return ("weighted", str(key), str(profile), sample_spec)
+
+    @staticmethod
+    def _request_identity(profile, sample_spec):
+        return (str(profile), sample_spec)
+
+    def _active_request_identity(self):
+        request_key = self._analysis_request_key
+        if (not self._analysis_busy or not isinstance(request_key, tuple)
+                or len(request_key) < 4):
+            return None
+        return self._request_identity(request_key[2], request_key[3])
+
+    def _sampling_queue_active(self):
+        return bool(self._analysis_busy or self._weighted_pending_requests)
+
+    def _update_sampling_controls(self):
+        locked = self._sampling_queue_active()
+        self.profile.setEnabled(not locked)
+        self.auto_mode.setEnabled(not locked)
+        self.custom_mode.setEnabled(not locked)
+        self.samples.setEnabled(not locked and self.custom_mode.isChecked())
+
     def _sampling_mode_changed(self, *_args):
-        self.samples.setEnabled(self.custom_mode.isChecked())
+        self._update_sampling_controls()
         self._refresh_profiles()
 
     def _refresh_profiles(self, *_args):
+        sample_spec = self._current_sample_spec()
+        active_identity = self._active_request_identity()
+        pending = set(self._weighted_pending_set)
+        page_cancelling = (
+            self._analysis_busy and self._analysis_progress_state == "cancelling"
+        )
+        any_uncached_available = False
         for profile, (row, view) in self._profile_actions.items():
-            request_key = self._request_key(profile)
+            request_key = self._request_key_for(profile, sample_spec)
             cached = isinstance(_analysis_cached_result(self.analysis_cache, request_key), dict)
-            count = sum(isinstance(_analysis_cached_result(self.analysis_cache,
-                ("weighted", str(k), profile, request_key[3])), dict) for k in self.payload["regions"])
-            total = len(self.payload["regions"])
-            active_profile = (
-                self._analysis_busy
-                and isinstance(self._analysis_request_key, tuple)
-                and len(self._analysis_request_key) > 2
-                and profile == self._analysis_request_key[2]
+            count = sum(
+                isinstance(
+                    _analysis_cached_result(
+                        self.analysis_cache,
+                        ("weighted", str(k), profile, sample_spec),
+                    ),
+                    dict,
+                )
+                for k in self.payload["regions"]
             )
-            queued = active_profile and self._analysis_progress_state == "queued"
-            running = active_profile and self._analysis_progress_state in {
-                "running", "pausing", "paused", "cancelling",
+            total = len(self.payload["regions"])
+            identity = self._request_identity(profile, sample_spec)
+            active = identity == active_identity
+            queued_active = active and self._analysis_progress_state == "queued"
+            cancelling = active and self._analysis_progress_state == "cancelling"
+            running = active and self._analysis_progress_state in {
+                "running", "pausing", "paused",
             }
-            status = ("Queued…" if queued else "Running…" if running else
-                      (f"Ready • {count}/{total} regions" if count else "Not calculated"))
+            queued_pending = identity in pending
+            status = (
+                "Queued…" if queued_active or queued_pending else
+                "Cancelling…" if cancelling else
+                "Running…" if running else
+                (f"Ready • {count}/{total} regions" if count else "Not calculated")
+            )
             meta = _analysis_cache_metadata(self.analysis_cache, request_key)
-            if cached and not running and "processing_time_s" in meta:
+            if cached and not active and not queued_pending and "processing_time_s" in meta:
                 status += " • " + _format_analysis_elapsed(meta["processing_time_s"])
             self.profile_table.setItem(row, 1, QTableWidgetItem(status))
-            view.setEnabled(not self._analysis_busy)
+
+            if cached:
+                view.setText("Open")
+                view.setToolTip(
+                    "Open this cached reference result. Cached results remain available while another reference calculates."
+                )
+                view.setEnabled(True)
+            elif queued_active or queued_pending:
+                view.setText("Queued")
+                view.setToolTip("This reference is already waiting in the analysis queue.")
+                view.setEnabled(False)
+            elif cancelling:
+                view.setText("Cancelling")
+                view.setToolTip("This reference is being cancelled.")
+                view.setEnabled(False)
+            elif running:
+                view.setText("Running")
+                view.setToolTip("This reference is currently being calculated.")
+                view.setEnabled(False)
+            elif page_cancelling:
+                view.setText("Wait")
+                view.setToolTip("Wait for the current frequency-weighting cancellation to finish before queueing more references.")
+                view.setEnabled(False)
+            else:
+                any_uncached_available = True
+                if self._analysis_busy or self._weighted_pending_requests:
+                    view.setText("Queue")
+                    view.setToolTip(
+                        "Add this reference to the frequency-weighting queue. It will run when earlier work finishes."
+                    )
+                else:
+                    view.setText("Calculate")
+                    view.setToolTip(
+                        "Calculate this reference for the current sampling settings."
+                    )
+                view.setEnabled(True)
+
+        self.calculate_all_profiles_button.setEnabled(any_uncached_available)
+        self._update_sampling_controls()
+
+    def _profile_action_clicked(self, profile):
+        request_key = self._request_key(profile)
+        if isinstance(_analysis_cached_result(self.analysis_cache, request_key), dict):
+            self.view_profile(profile)
+        else:
+            self.ensure_profile_cached(profile)
+
+    def calculate_all_uncached_profiles(self, *_args):
+        """Queue every uncached reference for the current sampling configuration."""
+        for profile in FREQUENCY_WEIGHTING_PROFILES:
+            request_key = self._request_key(profile)
+            if not isinstance(_analysis_cached_result(self.analysis_cache, request_key), dict):
+                self.ensure_profile_cached(profile)
+        self._refresh_profiles()
 
     def ensure_profile_cached(self, profile, *, open_result=False):
-        """Use the selected weighting cache or queue it without forcing a result popup."""
-        if self._analysis_busy:
-            return
+        """Open a cached profile or queue its calculation without duplicating requests."""
         index = self.profile.findData(profile)
-        if index >= 0:
+        if index >= 0 and not self._sampling_queue_active():
             self.profile.setCurrentIndex(index)
-        request_key = self._request_key(profile)
-        data = _analysis_cached_result(self.analysis_cache, request_key)
-        self._view_profile = profile
-        self._view_sample_spec = request_key[3] if request_key is not None else None
-        self._open_result_after_analysis = bool(open_result)
-        if not isinstance(data, dict):
-            self.error_label.clear()
-            self.recalculate()
+        sample_spec = self._current_sample_spec()
+        request_key = self._request_key_for(profile, sample_spec)
+        if request_key is None:
             return
-        _set_analysis_cached(self.progress_label, self.progress_bar, self.analysis_cache, request_key)
+        data = _analysis_cached_result(self.analysis_cache, request_key)
+        identity = self._request_identity(profile, sample_spec)
+        if isinstance(data, dict):
+            self._view_profile = str(profile)
+            self._view_sample_spec = sample_spec
+            # Browsing a saved reference must never overwrite the progress state
+            # of a different profile that is running or queued on this page.
+            if not self._sampling_queue_active():
+                _set_analysis_cached(
+                    self.progress_label, self.progress_bar, self.analysis_cache, request_key
+                )
+            if open_result:
+                self._show_region_result()
+                self.result_window.show()
+                self.result_window.raise_()
+                self.result_window.activateWindow()
+            self._refresh_profiles()
+            return
+
         if open_result:
-            self._show_region_result()
-            self.result_window.show()
-            self.result_window.raise_()
-            self.result_window.activateWindow()
+            self._weighted_open_after.add(identity)
+        if identity == self._active_request_identity() or identity in self._weighted_pending_set:
+            self._refresh_profiles()
+            return
+
+        self.error_label.clear()
+        self._weighted_pending_requests.append(identity)
+        self._weighted_pending_set.add(identity)
+        self._refresh_profiles()
+        self._start_next_weighted_request()
 
     def view_profile(self, profile):
         self.ensure_profile_cached(profile, open_result=True)
 
     def _request_key(self, profile=None):
-        key = self.region.currentData()
         profile = self.profile.currentData() if profile is None else profile
-        if key is None or profile is None:
-            return None
-        sample_spec = None if self.auto_mode.isChecked() else int(self.samples.value())
-        return ("weighted", str(key), str(profile), sample_spec)
+        return self._request_key_for(profile, self._current_sample_spec())
 
     def _set_analysis_busy(self, busy, message="Calculating frequency weighting…"):
         self._analysis_busy = bool(busy)
         _set_analysis_progress(self.progress_label, self.progress_bar, busy, message)
-        for control in (
-            self.profile, self.auto_mode, self.custom_mode, self.samples,
-        ):
-            control.setEnabled(not busy)
-        if not busy:
-            self.samples.setEnabled(self.custom_mode.isChecked())
         self._refresh_profiles()
 
-    def recalculate(self, *_args):
-        request_key = self._request_key()
-        if request_key is None or self._analysis_busy:
+    def _start_next_weighted_request(self):
+        if self._analysis_busy or not self._weighted_pending_requests:
+            self._refresh_profiles()
             return
-        profile = self.profile.currentData()
-        fft_samples = None if self.auto_mode.isChecked() else int(self.samples.value())
+        profile, sample_spec = self._weighted_pending_requests.pop(0)
+        self._weighted_pending_set.discard((profile, sample_spec))
+        self._weighted_followup_pending = False
+        self._start_weighted_request(profile, sample_spec)
+
+    def _start_weighted_request(self, profile, sample_spec):
+        request_key = self._request_key_for(profile, sample_spec)
+        if request_key is None:
+            self._refresh_profiles()
+            return
+        index = self.profile.findData(profile)
+        if index >= 0:
+            self.profile.setCurrentIndex(index)
         self._analysis_request_key = request_key
+        fft_samples = sample_spec
 
         spectrum_key = ("spectrum", "__all_regions__", fft_samples, "rectangular", True)
-        saved_spectrum = self.analysis_cache.get(spectrum_key, {}).get("regions")
 
         def calculate(progress):
-            spectra = saved_spectrum
+            # Resolve the shared spectrum when this job actually reaches the
+            # worker, not when it is submitted. A Spectrum/FFT or earlier
+            # weighted job ahead of us in the FIFO queue may have populated the
+            # matching cache while this reference was waiting.
+            spectra = self.analysis_cache.get(spectrum_key, {}).get("regions")
             spectrum_elapsed = None
             if spectra is None:
                 spectrum_started = time.perf_counter()
-                spectra = analyse_regions_spectrum(self.payload, fft_samples=fft_samples,
-                    window="rectangular", detrend=True, progress_callback=progress)
+                spectra = analyse_regions_spectrum(
+                    self.payload, fft_samples=fft_samples, window="rectangular",
+                    detrend=True, progress_callback=progress,
+                )
                 spectrum_elapsed = time.perf_counter() - spectrum_started
             results = analyse_regions_frequency_weighted(
                 self.payload, profile=profile, fft_samples=fft_samples,
                 progress_callback=progress, spectra=spectra,
             )
-            return {"results": results, "spectrum": spectra, "spectrum_key": spectrum_key,
-                    "spectrum_elapsed_s": spectrum_elapsed}
+            return {
+                "results": results, "spectrum": spectra, "spectrum_key": spectrum_key,
+                "spectrum_elapsed_s": spectrum_elapsed,
+            }
 
-        if self._analysis_progress_embedded or _long_authoritative_analysis(self.payload) or len(self.payload["regions"]) > 1:
-            self._set_analysis_busy(True)
+        self._set_analysis_busy(True)
+        if (self._analysis_progress_embedded or _long_authoritative_analysis(self.payload)
+                or len(self.payload["regions"]) > 1):
             _start_analysis_job(self, calculate)
             return
-        self._set_analysis_busy(True)
         try:
             data = calculate(None)
         except (ValueError, KeyError, TypeError) as error:
-            self._set_analysis_busy(False)
-            _set_analysis_failed(self.progress_label, self.progress_bar)
-            self._show_analysis_error(str(error))
+            self._analysis_failed(str(error))
             return
         self._analysis_completed(data)
+
+    def recalculate(self, *_args):
+        # Retained as a small compatibility shim for internal callers: derived
+        # weighting configurations are immutable and are calculated only if absent.
+        self.ensure_profile_cached(self.profile.currentData())
 
     def _analysis_progress(self, update):
         if self._analysis_busy:
@@ -1921,6 +2143,28 @@ class FrequencyWeightedPage(_CancellableAnalysisPage):
                 self.progress_label, self.progress_bar, True,
                 "Calculating frequency weighting…", update
             )
+
+    def _queue_weighted_followup(self):
+        self._weighted_followup_pending = bool(self._weighted_pending_requests)
+        self._refresh_profiles()
+        if (self._weighted_followup_pending
+                and not callable(getattr(self, "_analysis_job_finished_callback", None))):
+            QTimer.singleShot(0, self._analysis_job_released)
+
+    def _analysis_job_released(self):
+        """Submit the next reference after the shared worker slot has been released."""
+        if self._analysis_busy or not self._weighted_followup_pending:
+            return
+        self._weighted_followup_pending = False
+        self._start_next_weighted_request()
+
+    def _analysis_cancel_requested(self):
+        """Cancel means stop the current reference and discard this page's pending references."""
+        self._weighted_pending_requests.clear()
+        self._weighted_pending_set.clear()
+        self._weighted_open_after.clear()
+        self._weighted_followup_pending = False
+        self._refresh_profiles()
 
     def _analysis_completed(self, data):
         request_key = self._analysis_request_key
@@ -1936,19 +2180,25 @@ class FrequencyWeightedPage(_CancellableAnalysisPage):
                            for result in data.values())):
             _set_analysis_failed(self.progress_label, self.progress_bar)
             self._show_analysis_error("Frequency-weighted analysis returned incomplete results.")
+            self._queue_weighted_followup()
             return
         if spectrum is not None:
             if (set(spectrum) != set(self.payload["regions"]) or
                     spectrum_key != ("spectrum", "__all_regions__", request_key[3], "rectangular", True)):
-                self._analysis_failed("The calculation did not return a matching spectrum.")
+                _set_analysis_failed(self.progress_label, self.progress_bar)
+                self._show_analysis_error("The calculation did not return a matching spectrum.")
+                self._queue_weighted_followup()
                 return
             if spectrum_key not in self.analysis_cache:
-                _store_analysis_cache_result(self, spectrum_key, {"regions": spectrum},
-                                             notify=False, elapsed_s=spectrum_elapsed)
+                _store_analysis_cache_result(
+                    self, spectrum_key, {"regions": spectrum},
+                    notify=False, elapsed_s=spectrum_elapsed,
+                )
         _store_analysis_cache_result(self, _regional_config_key(request_key), {"regions": data})
+        identity = self._request_identity(request_key[2], request_key[3])
         self._refresh_profiles()
-        if self._open_result_after_analysis:
-            self._open_result_after_analysis = False
+        if identity in self._weighted_open_after:
+            self._weighted_open_after.discard(identity)
             self._view_profile = request_key[2]
             self._view_sample_spec = request_key[3]
             self._show_region_result()
@@ -1957,12 +2207,18 @@ class FrequencyWeightedPage(_CancellableAnalysisPage):
             self.result_window.activateWindow()
         elif self.result_window.isVisible():
             self._show_region_result()
+        self._queue_weighted_followup()
 
     def _analysis_failed(self, message):
-        self._open_result_after_analysis = False
+        request_key = self._analysis_request_key
+        if isinstance(request_key, tuple) and len(request_key) >= 4:
+            self._weighted_open_after.discard(
+                self._request_identity(request_key[2], request_key[3])
+            )
         self._set_analysis_busy(False)
         _set_analysis_failed(self.progress_label, self.progress_bar)
         self._show_analysis_error(str(message))
+        self._queue_weighted_followup()
 
     def _show_analysis_error(self, message):
         self.error_label.setText(f"Unable to calculate: {message}")
@@ -2079,21 +2335,15 @@ class FrequencyWeightedPage(_CancellableAnalysisPage):
         }
         self.plot.set_figure(figure, coalesce=True)
 
-        ratio = np.asarray(data["spectral_ratio_by_bin"], dtype=float)
-        frequency = np.asarray(data["frequency_hz"], dtype=float)
-        bin_rms = np.asarray(data["bin_rms_uT"], dtype=float)
-        refs = np.asarray(data["reference_rms_by_bin_uT"], dtype=float)
-        indices = [
-            int(i)
-            for i in np.argsort(ratio)[::-1][:30]
-            if ratio[i] > 1e-15 and np.isfinite(refs[i])
-        ]
-        self.table.setRowCount(len(indices))
-        for row, index in enumerate(indices):
-            self.table.setItem(row, 0, QTableWidgetItem(f"{frequency[index]:.8g}"))
-            self.table.setItem(row, 1, QTableWidgetItem(f"{bin_rms[index]:.8g}"))
-            self.table.setItem(row, 2, QTableWidgetItem(f"{refs[index]:.8g}"))
-            self.table.setItem(row, 3, QTableWidgetItem(f"{ratio[index] * 100.0:.8g}"))
+        rows = np.asarray(data.get("spectral_top_rows", ()), dtype=float)
+        if rows.ndim != 2 or rows.shape[1:] != (4,):
+            rows = np.empty((0, 4), dtype=float)
+        self.table.setRowCount(len(rows))
+        for row, (frequency_hz, bin_rms_uT, reference_uT, ratio) in enumerate(rows):
+            self.table.setItem(row, 0, QTableWidgetItem(f"{frequency_hz:.8g}"))
+            self.table.setItem(row, 1, QTableWidgetItem(f"{bin_rms_uT:.8g}"))
+            self.table.setItem(row, 2, QTableWidgetItem(f"{reference_uT:.8g}"))
+            self.table.setItem(row, 3, QTableWidgetItem(f"{ratio * 100.0:.8g}"))
 
     def cleanup(self):
         self.result_window.close()
@@ -2677,13 +2927,20 @@ class ExposureAnalysisTargetView(QWidget):
                 statuses.get(kind, "Not calculated"), activity=activity, retry=retry
             )
 
-        busy = any(getattr(page, "_analysis_busy", False) for page in self._pages.values())
+        busy = any(
+            getattr(page, "_analysis_busy", False)
+            or bool(getattr(page, "_weighted_pending_requests", ()))
+            for page in self._pages.values()
+        )
         if hasattr(self, "region_tree"):
             self.region_tree.setEnabled(not busy)
         for page in self._pages.values():
             tree = getattr(page, "result_region_tree", None)
             if isinstance(tree, QTreeWidget):
-                tree.setEnabled(not busy)
+                # The frequency-weighted result browser is a read-only view of
+                # already cached data. Keep it navigable while another
+                # reference is calculating; setup-region controls remain locked.
+                tree.setEnabled(not busy or isinstance(page, FrequencyWeightedPage))
         self.busyChanged.emit(busy)
 
     def _home_region_changed(self, *_args):
@@ -2726,7 +2983,17 @@ class ExposureAnalysisTargetView(QWidget):
     def _analysis_job_finished(self, page):
         if self._analysis_active_page is page:
             self._analysis_active_page = None
-        QTimer.singleShot(0, self._start_next_analysis_job)
+        QTimer.singleShot(0, lambda p=page: self._advance_analysis_job_queue(p))
+
+    def _advance_analysis_job_queue(self, completed_page):
+        # Give work that was already waiting in the target-wide FIFO queue the
+        # next worker slot.  A page with its own logical follow-up queue (the
+        # frequency-weighting reference queue) may then submit its next item
+        # behind that work without bypassing the shared single-worker policy.
+        self._start_next_analysis_job()
+        released = getattr(completed_page, "_analysis_job_released", None)
+        if callable(released):
+            released()
 
     def _start_next_analysis_job(self):
         if self._analysis_active_page is not None:
@@ -2977,7 +3244,11 @@ class ExposureAnalysisTargetView(QWidget):
         self._cancel_running_analyses()
 
     def is_busy(self):
-        return any(getattr(page, "_analysis_busy", False) for page in self._pages.values())
+        return any(
+            getattr(page, "_analysis_busy", False)
+            or bool(getattr(page, "_weighted_pending_requests", ()))
+            for page in self._pages.values()
+        )
 
     def open_exposure_summary(self, *_args):
         return self._show_page("summary")

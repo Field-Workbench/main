@@ -118,6 +118,7 @@ from .camera_timeline import (
     video_camera_to_plotly_view,
 )
 from .plot_view import PlotView
+from .region_analysis import FREQUENCY_WEIGHTING_PROFILES
 from .theme import current_theme, plot_theme_colors
 from .process_ipc import field_render_process_context
 from .render_process import run_field_render_process
@@ -16766,6 +16767,353 @@ class SnapshotComparisonDialog(QDialog):
         super().closeEvent(event)
 
 
+class ExposureAnalysisCacheManagerDialog(QDialog):
+    """Selectively remove derived configurations from one saved Exposure Analysis."""
+
+    TOOL_LABELS = {
+        "summary": "Exposure Summary",
+        "spectrum": "Spectrum / FFT",
+        "timing": "Timing & transitions",
+        "threshold": "Threshold & duration",
+        "weighted": "Frequency weighted",
+    }
+
+    def __init__(
+        self,
+        adapter: StudioAdapter,
+        analysis_id: str,
+        parent=None,
+        on_changed: Callable[[], None] | None = None,
+    ):
+        super().__init__(parent)
+        enable_standard_window_controls(self)
+        self.adapter = adapter
+        self.analysis_id = str(analysis_id)
+        self.on_changed = on_changed
+        self._record: dict[str, Any] = {}
+        self._result_keys: list[tuple[Any, ...]] = []
+        self._last_reclaimed_storage: tuple[int, int] | None = None
+        self.setWindowTitle("Manage Exposure Analysis cache")
+        self.resize(850, 560)
+
+        root = QVBoxLayout(self)
+        heading = QLabel("Manage cached analysis results", self)
+        heading.setObjectName("dialogHeading")
+        root.addWidget(heading)
+        self.name_label = QLabel("", self)
+        self.name_label.setWordWrap(True)
+        root.addWidget(self.name_label)
+
+        prep_group = QGroupBox("Preparation", self)
+        prep_layout = QVBoxLayout(prep_group)
+        self.preparation_label = QLabel("", prep_group)
+        self.preparation_label.setWordWrap(True)
+        self.preparation_label.setObjectName("hint")
+        prep_layout.addWidget(self.preparation_label)
+        root.addWidget(prep_group)
+
+        derived_group = QGroupBox("Derived cache", self)
+        derived_layout = QVBoxLayout(derived_group)
+        self.derived_label = QLabel("", derived_group)
+        self.derived_label.setWordWrap(True)
+        self.derived_label.setObjectName("hint")
+        derived_layout.addWidget(self.derived_label)
+        self.reclaimed_label = QLabel("", derived_group)
+        self.reclaimed_label.setWordWrap(True)
+        self.reclaimed_label.setObjectName("hint")
+        self.reclaimed_label.hide()
+        derived_layout.addWidget(self.reclaimed_label)
+
+        self.cache_tree = QTreeWidget(derived_group)
+        self.cache_tree.setObjectName("exposureAnalysisCacheManagerTree")
+        self.cache_tree.setHeaderLabels(["Analysis", "Configuration", "Cached", "Processing"])
+        self.cache_tree.setRootIsDecorated(True)
+        self.cache_tree.setAlternatingRowColors(True)
+        self.cache_tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.cache_tree.setColumnWidth(0, 190)
+        self.cache_tree.setColumnWidth(1, 360)
+        self.cache_tree.setColumnWidth(2, 150)
+        self.cache_tree.header().setStretchLastSection(True)
+        self.cache_tree.itemChanged.connect(self._selection_changed)
+        derived_layout.addWidget(self.cache_tree, 1)
+
+        selection_row = QHBoxLayout()
+        self.select_all_button = QPushButton("Select all", derived_group)
+        self.select_all_button.clicked.connect(self.select_all)
+        self.clear_selection_button = QPushButton("Clear selection", derived_group)
+        self.clear_selection_button.clicked.connect(self.clear_selection)
+        selection_row.addWidget(self.select_all_button)
+        selection_row.addWidget(self.clear_selection_button)
+        selection_row.addStretch(1)
+        derived_layout.addLayout(selection_row)
+        root.addWidget(derived_group, 1)
+
+        actions = QHBoxLayout()
+        self.remove_selected_button = QPushButton("Remove selected", self)
+        self.remove_selected_button.setObjectName("dangerButton")
+        self.remove_selected_button.clicked.connect(self.remove_selected)
+        self.remove_all_button = QPushButton("Remove all derived results", self)
+        self.remove_all_button.setObjectName("dangerButton")
+        self.remove_all_button.clicked.connect(self.remove_all)
+        close_button = QPushButton("Close", self)
+        close_button.clicked.connect(self.accept)
+        actions.addWidget(self.remove_selected_button)
+        actions.addWidget(self.remove_all_button)
+        actions.addStretch(1)
+        actions.addWidget(close_button)
+        root.addLayout(actions)
+        self.reload()
+
+    @staticmethod
+    def _format_bytes(value: Any) -> str:
+        return SnapshotManagerDialog._format_bytes(value)
+
+    @staticmethod
+    def _format_timestamp(value: Any) -> str:
+        return SnapshotManagerDialog._display_timestamp(value)
+
+    @staticmethod
+    def _format_elapsed(value: Any) -> str:
+        try:
+            seconds = max(0.0, float(value))
+        except (TypeError, ValueError):
+            return "—"
+        if seconds < 60.0:
+            return f"{seconds:.1f} s"
+        minutes, seconds = divmod(seconds, 60.0)
+        if minutes < 60.0:
+            return f"{int(minutes)}m {seconds:.0f}s"
+        hours, minutes = divmod(minutes, 60.0)
+        return f"{int(hours)}h {int(minutes)}m"
+
+    @classmethod
+    def _tool_label(cls, key: tuple[Any, ...]) -> str:
+        return cls.TOOL_LABELS.get(str(key[0]), str(key[0]).replace("_", " ").title())
+
+    @staticmethod
+    def _region_prefix(key: tuple[Any, ...]) -> str:
+        if len(key) < 2 or str(key[1]) == "__all_regions__":
+            return ""
+        return f"Region {key[1]} • "
+
+    @classmethod
+    def _configuration_label(cls, key: tuple[Any, ...]) -> str:
+        kind = str(key[0]) if key else ""
+        prefix = cls._region_prefix(key)
+        if kind == "summary":
+            return prefix + "Default"
+        if kind == "spectrum":
+            samples = key[2] if len(key) > 2 else None
+            window = str(key[3]).capitalize() if len(key) > 3 else "Rectangular"
+            detrend = bool(key[4]) if len(key) > 4 else True
+            sampling = "Auto" if samples is None else f"{int(samples):,} samples"
+            return prefix + f"{sampling} • {window} • {'detrended' if detrend else 'not detrended'}"
+        if kind in {"timing", "threshold"}:
+            try:
+                threshold = f"{float(key[2]):g}% threshold"
+            except (IndexError, TypeError, ValueError):
+                threshold = "Default threshold"
+            return prefix + threshold
+        if kind == "weighted":
+            profile = str(key[2]) if len(key) > 2 else ""
+            definition = FREQUENCY_WEIGHTING_PROFILES.get(profile, {})
+            profile_label = str(definition.get("label") or profile or "Reference")
+            samples = key[3] if len(key) > 3 else None
+            sampling = "Auto sampling" if samples is None else f"{int(samples):,} samples"
+            return prefix + f"{profile_label} • {sampling}"
+        return prefix + " • ".join(str(value) for value in key[2:])
+
+    def _selected_result_keys(self) -> list[tuple[Any, ...]]:
+        selected = []
+        for parent_index in range(self.cache_tree.topLevelItemCount()):
+            parent = self.cache_tree.topLevelItem(parent_index)
+            for child_index in range(parent.childCount()):
+                item = parent.child(child_index)
+                if item.checkState(0) != Qt.CheckState.Checked:
+                    continue
+                value = item.data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(value, tuple):
+                    selected.append(value)
+        return selected
+
+    def _selection_changed(self, item=None, _column=None) -> None:
+        if isinstance(item, QTreeWidgetItem):
+            self.cache_tree.blockSignals(True)
+            try:
+                if item.childCount():
+                    state = item.checkState(0)
+                    if state != Qt.CheckState.PartiallyChecked:
+                        for index in range(item.childCount()):
+                            item.child(index).setCheckState(0, state)
+                else:
+                    parent = item.parent()
+                    if parent is not None:
+                        states = [
+                            parent.child(index).checkState(0)
+                            for index in range(parent.childCount())
+                        ]
+                        if states and all(state == Qt.CheckState.Checked for state in states):
+                            parent.setCheckState(0, Qt.CheckState.Checked)
+                        elif states and all(state == Qt.CheckState.Unchecked for state in states):
+                            parent.setCheckState(0, Qt.CheckState.Unchecked)
+                        else:
+                            parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
+            finally:
+                self.cache_tree.blockSignals(False)
+        self.remove_selected_button.setEnabled(bool(self._selected_result_keys()))
+
+    def select_all(self, *_args) -> None:
+        self.cache_tree.blockSignals(True)
+        for index in range(self.cache_tree.topLevelItemCount()):
+            parent = self.cache_tree.topLevelItem(index)
+            for child_index in range(parent.childCount()):
+                parent.child(child_index).setCheckState(0, Qt.CheckState.Checked)
+            parent.setCheckState(0, Qt.CheckState.Checked)
+        self.cache_tree.blockSignals(False)
+        self._selection_changed()
+
+    def clear_selection(self, *_args) -> None:
+        self.cache_tree.blockSignals(True)
+        for index in range(self.cache_tree.topLevelItemCount()):
+            parent = self.cache_tree.topLevelItem(index)
+            for child_index in range(parent.childCount()):
+                parent.child(child_index).setCheckState(0, Qt.CheckState.Unchecked)
+            parent.setCheckState(0, Qt.CheckState.Unchecked)
+        self.cache_tree.blockSignals(False)
+        self._selection_changed()
+
+    def reload(self) -> None:
+        try:
+            self._record = self.adapter.exposure_analysis(self.analysis_id)
+        except Exception as error:  # noqa: BLE001 - project resource boundary
+            QMessageBox.warning(self, "Manage Exposure Analysis cache", str(error))
+            self.reject()
+            return
+        cache = self._record.get("analysis_cache")
+        cache = cache if isinstance(cache, dict) else {}
+        self._result_keys = sorted(
+            (
+                key for key in cache
+                if isinstance(key, tuple) and key and str(key[0]) != "__cache_meta__"
+            ),
+            key=lambda key: (self._tool_label(key).casefold(), self._configuration_label(key).casefold()),
+        )
+        name = str(self._record.get("name") or self.analysis_id or "Exposure Analysis")
+        total_size = self._format_bytes(self._record.get("compressed_bytes"))
+        self.name_label.setText(
+            f"<b>{html.escape(name)}</b> • {total_size} total compressed storage"
+        )
+        prep_size = self._format_bytes(self._record.get("preparation_compressed_bytes"))
+        self.preparation_label.setText(
+            f"Prepared field basis / authoritative exposure • {prep_size} compressed. "
+            "Preparation is kept by this manager; use Delete cache in Saved Results to remove the entire parent analysis."
+        )
+        derived_size = self._format_bytes(self._record.get("cache_compressed_bytes"))
+        self.derived_label.setText(
+            (
+                f"{len(self._result_keys):,} cached derived configuration"
+                f"{'s' if len(self._result_keys) != 1 else ''} • {derived_size} compressed. "
+                "Select only the configurations you no longer need. Shared numeric arrays are "
+                "deduplicated, so individual rows do not have independent reclaimable sizes."
+            )
+            if self._result_keys else
+            f"No derived analysis results are cached. Derived-cache storage is {derived_size}."
+        )
+        self._refresh_reclaimed_storage_label()
+
+        self.cache_tree.blockSignals(True)
+        self.cache_tree.clear()
+        grouped: dict[str, list[tuple[Any, ...]]] = {}
+        for key in self._result_keys:
+            grouped.setdefault(self._tool_label(key), []).append(key)
+        for tool_label, keys in grouped.items():
+            parent = QTreeWidgetItem([
+                tool_label,
+                f"{len(keys):,} configuration{'s' if len(keys) != 1 else ''}",
+                "",
+                "",
+            ])
+            parent.setFlags(
+                parent.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            parent.setCheckState(0, Qt.CheckState.Unchecked)
+            self.cache_tree.addTopLevelItem(parent)
+            for key in keys:
+                meta = cache.get(("__cache_meta__",) + key)
+                meta = meta if isinstance(meta, dict) else {}
+                item = QTreeWidgetItem([
+                    "",
+                    self._configuration_label(key),
+                    self._format_timestamp(meta.get("cached_at")),
+                    self._format_elapsed(meta.get("processing_time_s")),
+                ])
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.CheckState.Unchecked)
+                item.setData(0, Qt.ItemDataRole.UserRole, key)
+                parent.addChild(item)
+            parent.setExpanded(True)
+        self.cache_tree.blockSignals(False)
+        has_results = bool(self._result_keys)
+        self.select_all_button.setEnabled(has_results)
+        self.clear_selection_button.setEnabled(has_results)
+        self.remove_all_button.setEnabled(has_results)
+        self.remove_selected_button.setEnabled(False)
+
+    def _refresh_reclaimed_storage_label(self) -> None:
+        if self._last_reclaimed_storage is None:
+            self.reclaimed_label.clear()
+            self.reclaimed_label.hide()
+            return
+        before, after = self._last_reclaimed_storage
+        reclaimed = max(0, int(before) - int(after))
+        self.reclaimed_label.setText(
+            f"Last removal reclaimed {self._format_bytes(reclaimed)} of compressed derived-cache storage "
+            f"({self._format_bytes(before)} → {self._format_bytes(after)} derived cache)."
+        )
+        self.reclaimed_label.show()
+
+    def _remove(self, keys: list[tuple[Any, ...]] | None) -> None:
+        count = len(self._result_keys) if keys is None else len(keys)
+        if count <= 0:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove cached analysis results",
+            (
+                f"Remove all {count:,} derived configurations from this Exposure Analysis? "
+                "The prepared field basis will be kept. This can be restored with Undo."
+                if keys is None else
+                f"Remove {count:,} selected derived configuration{'s' if count != 1 else ''}? "
+                "The prepared field basis will be kept. This can be restored with Undo."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        before_compressed = int(self._record.get("cache_compressed_bytes", 0) or 0)
+        try:
+            removed = self.adapter.delete_exposure_analysis_cached_results(self.analysis_id, keys)
+        except Exception as error:  # noqa: BLE001 - project resource boundary
+            QMessageBox.warning(self, "Manage Exposure Analysis cache", str(error))
+            return
+        if removed <= 0:
+            return
+        if self.on_changed is not None:
+            self.on_changed()
+        self.reload()
+        after_compressed = int(self._record.get("cache_compressed_bytes", 0) or 0)
+        self._last_reclaimed_storage = (before_compressed, after_compressed)
+        self._refresh_reclaimed_storage_label()
+
+    def remove_selected(self, *_args) -> None:
+        self._remove(self._selected_result_keys())
+
+    def remove_all(self, *_args) -> None:
+        self._remove(None)
+
+
 class SnapshotManagerDialog(QDialog):
     """Inspect and manage persistent Maps / Analysis results for one project.
 
@@ -17035,6 +17383,11 @@ class SnapshotManagerDialog(QDialog):
             "Optionally give this automatically maintained cache a more descriptive display name"
         )
         self.exposure_analysis_rename_button.clicked.connect(self.rename_selected_exposure_analysis)
+        self.exposure_analysis_manage_cache_button = QPushButton("Manage cache…")
+        self.exposure_analysis_manage_cache_button.setToolTip(
+            "Remove selected derived analysis configurations while keeping the prepared field basis"
+        )
+        self.exposure_analysis_manage_cache_button.clicked.connect(self.manage_selected_exposure_analysis_cache)
         self.exposure_analysis_delete_button = QPushButton("Delete cache")
         self.exposure_analysis_delete_button.setObjectName("dangerButton")
         self.exposure_analysis_delete_button.setToolTip(
@@ -17044,6 +17397,7 @@ class SnapshotManagerDialog(QDialog):
         actions.addWidget(refresh)
         actions.addWidget(self.exposure_analysis_open_button)
         actions.addWidget(self.exposure_analysis_rename_button)
+        actions.addWidget(self.exposure_analysis_manage_cache_button)
         actions.addWidget(self.exposure_analysis_delete_button)
         actions.addStretch(1)
         layout.addLayout(actions)
@@ -17477,6 +17831,10 @@ class SnapshotManagerDialog(QDialog):
         selected = self.selected_exposure_analysis_ids()
         self.exposure_analysis_open_button.setEnabled(bool(selected))
         self.exposure_analysis_rename_button.setEnabled(len(selected) == 1)
+        record = self._exposure_analysis_rows_by_id.get(selected[0], {}) if len(selected) == 1 else {}
+        self.exposure_analysis_manage_cache_button.setEnabled(
+            len(selected) == 1 and int(record.get("cached_result_count", 0) or 0) > 0
+        )
         self.exposure_analysis_delete_button.setEnabled(bool(selected))
         self._update_exposure_analysis_details(selected)
 
@@ -17653,6 +18011,20 @@ class SnapshotManagerDialog(QDialog):
             return
         if self.on_changed is not None:
             self.on_changed()
+        self.refresh(select_analysis_id=analysis_id)
+        self.show_section("exposure_analyses")
+
+    def manage_selected_exposure_analysis_cache(self, *_args) -> None:
+        analysis_id = self.selected_exposure_analysis_id()
+        if analysis_id is None:
+            return
+        dialog = ExposureAnalysisCacheManagerDialog(
+            self.adapter,
+            analysis_id,
+            self,
+            on_changed=self._exposure_analysis_changed,
+        )
+        dialog.exec()
         self.refresh(select_analysis_id=analysis_id)
         self.show_section("exposure_analyses")
 

@@ -146,7 +146,9 @@ class WorkspaceNavigationTests(unittest.TestCase):
             page = d.open_spectrum()
             launch.assert_called_once()
         self.assertFalse(d.region_tree.isEnabled())
-        self.assertFalse(weighted.result_region_tree.isEnabled())
+        # Cached frequency-weighted results stay browsable while unrelated or
+        # alternate-reference calculations are running.
+        self.assertTrue(weighted.result_region_tree.isEnabled())
         d.show_home()
         card = d._analysis_home_cards['spectrum']
         self.assertEqual(card.cache_status.text(), 'Cache: Not calculated')
