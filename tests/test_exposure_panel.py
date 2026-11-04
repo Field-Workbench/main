@@ -96,6 +96,31 @@ class ExposurePanelTests(unittest.TestCase):
     def tearDown(self):
         self.app.processEvents()
 
+    def test_camera_change_refreshes_visible_view_and_preserves_camera_signal(self):
+        viewer = WaveformGLView({}, start_hibernated=True, _source_html_path="unused.html")
+        cameras = []
+        viewer.cameraChanged.connect(cameras.append)
+        try:
+            with patch.object(viewer, "isVisible", return_value=True), \
+                    patch.object(viewer, "refresh_viewport") as refresh:
+                viewer._camera_changed_from_web('{"fov_deg":45,"target":[0,0,0]}')
+                self.assertEqual(cameras, [{"fov_deg": 45, "target": [0, 0, 0]}])
+                refresh.assert_called_once_with()
+                refresh.reset_mock()
+                viewer._camera_changed_from_web('invalid')
+                viewer._camera_changed_from_web('[]')
+                refresh.assert_not_called()
+            with patch.object(viewer, "isVisible", return_value=False), \
+                    patch.object(viewer, "refresh_viewport") as refresh:
+                viewer._camera_changed_from_web('{"fov_deg":30}')
+                refresh.assert_not_called()
+                self.assertIsNone(viewer.web)
+                self.assertEqual(viewer._requested_lifecycle, "discarded")
+                self.assertEqual(cameras[-1], {"fov_deg": 30})
+        finally:
+            viewer.cleanup()
+            viewer.deleteLater()
+
     def test_region_selection_refreshes_visible_view_without_waking_hidden_view(self):
         viewer = WaveformGLView({}, start_hibernated=True, _source_html_path="unused.html")
         try:

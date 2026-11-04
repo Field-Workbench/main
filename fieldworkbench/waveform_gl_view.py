@@ -524,6 +524,12 @@ class WaveformGLView(QStackedWidget):
             return
         if isinstance(camera, dict):
             self.cameraChanged.emit(camera)
+            # Windows WebEngine may leave its compositor surface black after
+            # wheel zoom even though the camera update succeeded.
+            # Redraw after the native wheel event has finished, as for tab and
+            # selection changes. Do not wake an inactive result.
+            if self.isVisible():
+                self.refresh_viewport()
 
     def _frame_changed_from_web(self, frame_index: int, time_s: float) -> None:
         if self._cleaned_up:
