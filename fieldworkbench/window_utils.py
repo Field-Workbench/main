@@ -627,6 +627,9 @@ def enable_standard_window_controls(window: QWidget) -> QWidget:
     flags = window.windowFlags() | _STANDARD_WINDOW_CONTROL_HINTS
     flags &= ~Qt.WindowType.WindowContextHelpButtonHint
     window.setWindowFlags(flags)
+    # Qt/Win32 can normalize away the close hint in the combined flag update.
+    # Reapply it after normalization so dialogs retain an ordinary close button.
+    window.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, True)
     install_persistent_window_settings(window)
     return window
 

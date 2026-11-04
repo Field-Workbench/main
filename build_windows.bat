@@ -10,6 +10,10 @@ if not defined VIRTUAL_ENV (
   exit /b 1
 )
 
+REM Do not collect incompatible DLLs from unrelated tools on the caller's PATH.
+REM The active venv and Windows system libraries provide the release runtime.
+set "PATH=%VIRTUAL_ENV%\Scripts;%SystemRoot%\System32;%SystemRoot%"
+
 python tools\verify_release_environment.py
 if errorlevel 1 exit /b %errorlevel%
 

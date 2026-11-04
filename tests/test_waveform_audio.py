@@ -43,14 +43,14 @@ class AudioSourceTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('node'), 'Node.js required for syntax check')
     def test_embedded_viewer_script_syntax(self):
         path = Path(__file__).parents[1] / 'fieldworkbench' / 'waveform_gl_view.py'
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_text(encoding='utf-8'))
         template = next(n.value.value for n in ast.walk(tree) if isinstance(n, ast.Assign)
                         and any(isinstance(t, ast.Name) and t.id == 'template' for t in n.targets))
         html = template.replace('__PAYLOAD__', '{}').replace('__AUDIO_MONITOR__', AUDIO_MONITOR_JS)
         script = html.split('<script>')[-1].split('</script>')[0]
         with tempfile.TemporaryDirectory() as tmp:
             filename = Path(tmp) / 'viewer.js'
-            filename.write_text(script)
+            filename.write_text(script, encoding='utf-8')
             subprocess.run(['node', '--check', str(filename)], check=True, capture_output=True)
 
 
