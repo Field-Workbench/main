@@ -84,7 +84,8 @@ from .dialogs import (
     configure_field_render_worker_limit,
 )
 from .brain_view import BrainViewDialog
-from .brain_analysis import BrainRegionMetrics, BrainRegionNode
+from .spatial_analysis import AnalysisRegionNode, RegionMetrics
+from .surface_region_volume import MAXIMUM_SURFACE_DEPTH_MM, MINIMUM_SURFACE_DEPTH_MM
 from .exposure_panel import ExposureRegionPanel, ExposureResultTab, REGION_KEY_ROLE
 from .region_analysis import MeasurementRegions
 from .exposures import exposure_coil_ids
@@ -97,6 +98,7 @@ from .optimizer import (
     available_optimizer_workers,
 )
 from .plot_view import PlotView
+from .scene_view_controls import SceneViewControls
 from .waveform_gl_view import WaveformGLView
 from .portable_scene import (
     translator_filter,
@@ -720,7 +722,7 @@ class UnifiedFieldWorkspaceDialog(QDialog):
         self._closing = False
         self._result_windows: dict[int, QDialog] = {}
         self._static_measurement_results: dict[str, dict[str, Any]] = {}
-        self._static_measurement_metrics: dict[str, BrainRegionMetrics] = {}
+        self._static_measurement_metrics: dict[str, RegionMetrics] = {}
         self._measurement_panel_width = 460
         self._measurement_panel_min_width = 220
         # Responsive Maps/Analysis geometry.  Standalone map dialogs keep their
@@ -735,13 +737,14 @@ class UnifiedFieldWorkspaceDialog(QDialog):
         # One preferred panel width belongs to the whole Maps/Analysis window,
         # but visibility is remembered per visual view. Static 2D/3D owns the
         # Measurement-volumes snapshot panel; Brain owns its anatomical Brain
-        # Areas panel. Scripted 2D/3D deliberately has no region/snapshot panel:
-        # playback is a visualization path, not a place to create static
-        # snapshots or cumulative exposure analyses.
+        # Areas panel. Scripted measurement panels have their own visibility
+        # preference because the Static panel serves snapshot analysis.
         self._measurement_panel_visibility_by_view = {
             "2d": False,
             "3d": False,
             "brain": True,
+            "playback:2d": True,
+            "playback:3d": True,
         }
         self._measurement_panel_visible = self._measurement_panel_visibility_by_view["2d"]
         self._applying_measurement_panel_state = False
@@ -977,7 +980,7 @@ class UnifiedFieldWorkspaceDialog(QDialog):
 
         rows = self._measurement_volume_rows()
         nodes = tuple(
-            BrainRegionNode(object_id, label, (index + 1,), ())
+            AnalysisRegionNode(object_id, label, (index + 1,), ())
             for index, (object_id, label) in enumerate(rows)
         )
         hierarchy = MeasurementRegions(nodes)
@@ -1081,7 +1084,7 @@ class UnifiedFieldWorkspaceDialog(QDialog):
             )
 
     @staticmethod
-    def _measurement_region_metric(result: dict[str, Any]) -> BrainRegionMetrics:
+    def _measurement_region_metric(result: dict[str, Any]) -> RegionMetrics:
         magnitudes = np.asarray(result.get("magnitudes_uT", []), dtype=float).reshape(-1)
         vectors = np.asarray(result.get("values_t", []), dtype=float).reshape(-1, 3)
         finite = np.isfinite(magnitudes)
@@ -1090,7 +1093,7 @@ class UnifiedFieldWorkspaceDialog(QDialog):
         magnitudes = magnitudes[finite]
         vectors = vectors[finite] if len(vectors) == len(finite) else np.empty((0, 3))
         if not len(magnitudes):
-            return BrainRegionMetrics(
+            return RegionMetrics(
                 *(math.nan,) * 7, sample_count=0, voxel_count=0
             )
 
@@ -1120,7 +1123,7 @@ class UnifiedFieldWorkspaceDialog(QDialog):
             result.get("volume_cm3", stats.get("volume_cm3", math.nan))
         )
         count = int(len(magnitudes))
-        return BrainRegionMetrics(
+        return RegionMetrics(
             rms_uT=rms_uT,
             mean_uT=mean_uT,
             p95_uT=p95_uT,
@@ -2226,17 +2229,15 @@ class UnifiedFieldWorkspaceDialog(QDialog):
         if layout.indexOf(host) != 0:
             layout.insertWidget(0, host, 1)
 
+    def _measurement_panel_preference_key(self, view_key: str) -> str:
+        if self.mode == "playback" and view_key in {"2d", "3d"}:
+            return f"playback:{view_key}"
+        return view_key
+
     def _active_tab_has_embedded_region_panel(self) -> bool:
-        # Only Brain owns an embedded region panel in the unified workspace.
-        # Scripted 2D/3D intentionally has no Measurement-volumes panel; those
-        # volumes are a Static snapshot workflow.
-        if self.current_view_key != "brain":
-            return False
-        widget = self.shared_tabs.currentWidget()
-        if isinstance(widget, ExposureResultTab):
-            return True
-        return (
-            self.shared_tabs.currentIndex() == self._shared_selector_tab_index
+        return isinstance(self.shared_tabs.currentWidget(), ExposureResultTab) or (
+            self.current_view_key == "brain"
+            and self.shared_tabs.currentIndex() == self._shared_selector_tab_index
         )
 
     def _track_workspace_panel_splitter(self, splitter: QSplitter | None) -> None:
@@ -2263,9 +2264,8 @@ class UnifiedFieldWorkspaceDialog(QDialog):
         else:
             self._measurement_panel_visible = True
             self._measurement_panel_width = max(self._measurement_panel_min_width, right)
-        self._measurement_panel_visibility_by_view[self.current_view_key] = (
-            self._measurement_panel_visible
-        )
+        preference_key = self._measurement_panel_preference_key(self.current_view_key)
+        self._measurement_panel_visibility_by_view[preference_key] = self._measurement_panel_visible
         self._sync_workspace_regions_button()
         QTimer.singleShot(0, self._sync_workspace_footer_geometry)
 
@@ -2346,7 +2346,7 @@ class UnifiedFieldWorkspaceDialog(QDialog):
             current_index = self.shared_tabs.currentIndex()
         except RuntimeError:
             return None
-        if self.current_view_key == "brain" and isinstance(widget, ExposureResultTab):
+        if isinstance(widget, ExposureResultTab):
             return widget.splitter
         if (
             current_index == self._shared_selector_tab_index
@@ -2393,15 +2393,12 @@ class UnifiedFieldWorkspaceDialog(QDialog):
         button = getattr(self, "workspace_regions_button", None)
         if not isinstance(button, QPushButton):
             return
-        embedded_brain = self._active_tab_has_embedded_region_panel()
-        measurement_available = (
-            self.mode == "static" and self.current_view_key in {"2d", "3d"}
-        )
-        brain_available = self.current_view_key == "brain" and embedded_brain
-        button.setVisible(measurement_available or brain_available)
-        if not (measurement_available or brain_available):
+        embedded = self._active_tab_has_embedded_region_panel()
+        measurement_available = self.mode == "static" and self.current_view_key in {"2d", "3d"}
+        button.setVisible(measurement_available or embedded)
+        if not (measurement_available or embedded):
             return
-        noun = "brain areas" if brain_available else "measurements"
+        noun = "brain areas" if self.current_view_key == "brain" else "measurements"
         if self._measurement_panel_visible:
             button.setText(f"Hide {noun}")
             button.setToolTip(
@@ -2415,11 +2412,6 @@ class UnifiedFieldWorkspaceDialog(QDialog):
 
     def _sync_workspace_measurement_panel(self) -> None:
         self._sync_workspace_regions_button()
-        # Measurement volumes are Static-only. Brain uses its own embedded
-        # anatomical panel in both Static and Scripted modes. During a Brain
-        # render-progress tab there is deliberately no fallback Measurement
-        # panel: otherwise the progress screen looks like a paused playback can
-        # be analyzed/saved as a static snapshot.
         embedded = self._active_tab_has_embedded_region_panel()
         show_outer_measurements = (
             self.mode == "static"
@@ -2452,9 +2444,8 @@ class UnifiedFieldWorkspaceDialog(QDialog):
 
     def _toggle_workspace_regions(self, *_args) -> None:
         self._measurement_panel_visible = not self._measurement_panel_visible
-        self._measurement_panel_visibility_by_view[self.current_view_key] = (
-            self._measurement_panel_visible
-        )
+        preference_key = self._measurement_panel_preference_key(self.current_view_key)
+        self._measurement_panel_visibility_by_view[preference_key] = self._measurement_panel_visible
         self._sync_workspace_measurement_panel()
 
     def _close_shared_tab(self, index: int) -> None:
@@ -2631,8 +2622,9 @@ class UnifiedFieldWorkspaceDialog(QDialog):
             return
         page_key = self._page_key(self.mode, key)
         self.view_stack.setCurrentWidget(page)
-        self._measurement_panel_visible = bool(
-            self._measurement_panel_visibility_by_view.get(key, key == "brain")
+        preference_key = self._measurement_panel_preference_key(key)
+        self._measurement_panel_visible = self._measurement_panel_visibility_by_view.get(
+            preference_key, False
         )
         controls = self._control_pages.get(page_key)
         if controls is not None:
@@ -3047,46 +3039,20 @@ class MainWindow(QMainWindow):
         centre = QWidget()
         centre_layout = QVBoxLayout(centre)
         centre_layout.setContentsMargins(6, 12, 6, 12)
-        self.scene_tools = QFrame()
-        self.scene_tools.setObjectName("sceneTools")
-        scene_tools_layout = QHBoxLayout(self.scene_tools)
-        scene_tools_layout.setContentsMargins(6, 4, 6, 4)
-        scene_tools_layout.setSpacing(5)
-
-        scene_tools_label = QLabel("SCENE VIEW")
-        scene_tools_label.setObjectName("sceneToolsLabel")
-        scene_tools_layout.addWidget(scene_tools_label)
-        scene_tools_layout.addSpacing(4)
-
-        self.export_image_button = QPushButton("Export image…")
-        self.export_image_button.setToolTip("Save the current 3D view as a high-resolution PNG")
-        self.export_image_button.clicked.connect(self.export_scene_image)
-        scene_tools_layout.addWidget(self.export_image_button)
-
-        self.home_view_button = QPushButton("Home")
-        self.home_view_button.setToolTip("Fit the whole scene and restore the isometric view")
-        self.home_view_button.clicked.connect(self.home_scene_view)
-        scene_tools_layout.addWidget(self.home_view_button)
-
-        self.fullscreen_view_button = QPushButton("Fullscreen")
-        self.fullscreen_view_button.setToolTip(
-            "Open a separate true-fullscreen interactive viewer (Esc/F11 closes it)"
-        )
-        scene_tools_layout.addWidget(self.fullscreen_view_button)
-
-        self.view_preset_buttons: dict[str, QPushButton] = {}
-        for text, preset in (("Front", "front"), ("Right", "right"), ("Top", "top")):
-            button = QPushButton(text)
-            button.setToolTip(f"Fit the scene and show the {text.lower()} engineering view")
-            button.clicked.connect(
-                lambda checked=False, view_name=preset: self.plot.set_camera_preset(view_name)
-            )
-            self.view_preset_buttons[preset] = button
-            scene_tools_layout.addWidget(button)
-        scene_tools_layout.addStretch(1)
-        centre_layout.addWidget(self.scene_tools)
         self.plot = PlotView(image_filename="scene-view")
-        self.fullscreen_view_button.clicked.connect(self.plot.toggle_fullscreen)
+        self.scene_tools = SceneViewControls(
+            self.plot,
+            centre,
+            export_callback=self.export_scene_image,
+            home_callback=self.home_scene_view,
+        )
+        # Preserve the long-standing public widget attributes used by tests and
+        # downstream integrations while the implementation is now shared.
+        self.export_image_button = self.scene_tools.export_image_button
+        self.home_view_button = self.scene_tools.home_view_button
+        self.fullscreen_view_button = self.scene_tools.fullscreen_view_button
+        self.view_preset_buttons = self.scene_tools.view_preset_buttons
+        centre_layout.addWidget(self.scene_tools)
         self.plot.selection_requested.connect(self._plot_selection_requested)
         self.plot.image_ready.connect(self._scene_image_ready)
         self.plot.image_failed.connect(self._scene_image_failed)
@@ -3785,6 +3751,7 @@ class MainWindow(QMainWindow):
         self.surface_region_tree: QTreeWidget | None = None
         self.surface_region_clear_button: QPushButton | None = None
         self.surface_region_editors: dict[str, dict[str, Any]] = {}
+        self.surface_region_depth_spin: CompactDoubleSpinBox | None = None
         self.probe_reading_labels: dict[str, QLabel] = {}
         self.probe_magnitude_label: QLabel | None = None
         if object_id is None:
@@ -4573,6 +4540,44 @@ class MainWindow(QMainWindow):
         summary.setObjectName("hint")
         layout.addWidget(summary)
 
+        # Near-surface exposure uses the authored regions as the ownership map for
+        # one inward volumetric shell. Keep this setting beside the region map so
+        # users can see that it belongs to this geometry object rather than to an
+        # individual saved Exposure Analysis calculation.
+        try:
+            analysis_settings = self.adapter.surface_region_analysis_properties(object_id)
+        except StudioOperationError:
+            analysis_settings = {"depth_mm": 2.0}
+        analysis_row = QHBoxLayout()
+        analysis_label = QLabel("Exposure sampling depth")
+        analysis_label.setToolTip(
+            "Depth measured inward from the classified surface for near-surface Exposure Analysis."
+        )
+        analysis_row.addWidget(analysis_label)
+        depth_spin = CompactDoubleSpinBox()
+        depth_spin.setObjectName("surfaceRegionAnalysisDepthSpin")
+        depth_spin.setRange(MINIMUM_SURFACE_DEPTH_MM, MAXIMUM_SURFACE_DEPTH_MM)
+        depth_spin.setDecimals(3)
+        depth_spin.setSuffix(" mm")
+        depth_spin.setValue(float(analysis_settings.get("depth_mm", 2.0)))
+        depth_spin.setMinimumWidth(110)
+        depth_spin.setToolTip(
+            "Inward geometric sampling depth used to turn each authored surface region into "
+            f"a near-surface analysis volume (maximum {MAXIMUM_SURFACE_DEPTH_MM:g} mm). "
+            "Changing this makes earlier preparations stale."
+        )
+        analysis_row.addWidget(depth_spin)
+        analysis_row.addStretch(1)
+        layout.addLayout(analysis_row)
+        analysis_note = QLabel(
+            "Exposure Analysis treats each named patch as an inward near-surface volume at this "
+            "depth. This is a geometric field-sampling layer, not a tissue-thickness or dose model."
+        )
+        analysis_note.setWordWrap(True)
+        analysis_note.setObjectName("hint")
+        layout.addWidget(analysis_note)
+        self.surface_region_depth_spin = depth_spin
+
         tree = QTreeWidget()
         tree.setObjectName("surfaceRegionTree")
         tree.setHeaderLabels(
@@ -4706,8 +4711,9 @@ class MainWindow(QMainWindow):
         if validation.get("complete_partition"):
             status_bits.append("complete non-overlapping partition")
         note = QLabel(
-            "Select a row for a temporary preview. Active is the master semantic switch; Show is "
-            "display-only. Placement and DRC exclusion are independent, so a scalp region can support "
+            "Select a row for a temporary surface preview. Active is the master design-rule semantic "
+            "switch; Show is display-only. Exposure sampling uses the authored region map independently "
+            "of Active/Show/Place/DRC. Placement and DRC exclusion are independent, so a scalp region can support "
             "future surface attachment while still participating in physical clearance. Region DRC "
             "inherits the object/scene clearance unless Override is enabled. The full watertight host "
             "surface remains the penetration/containment shell whenever regional DRC is active. "
@@ -5971,6 +5977,16 @@ class MainWindow(QMainWindow):
                     },
                 }
             )
+            if self.surface_region_depth_spin is not None:
+                operations.append(
+                    {
+                        "method": "set_surface_region_analysis_settings",
+                        "params": {
+                            "object_id": self.selected_id,
+                            "depth_mm": self.surface_region_depth_spin.value(),
+                        },
+                    }
+                )
 
         try:
             if self.measurement_quality_combo is not None:

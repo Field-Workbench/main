@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 from fieldworkbench.studio_adapter import StudioAdapter
 from fieldworkbench.waveform_io import WaveformDocument, WaveformSeries
 from fieldworkbench.exposure_analysis import (exposure_analysis_targets, _measurement_target_samples,
@@ -139,7 +139,6 @@ class WorkspaceTargetTests(unittest.TestCase):
                 self.assertEqual(workspace._items['brain_0'].childCount(), 0)
                 self.assertIn('Atlas: LPBA40', workspace.target_details.text())
                 self.assertIn('Atlas regions:', workspace.target_details.text())
-                self.assertIn('Saved analyses: 1', workspace.saved_analysis_status.text())
                 self.assertEqual(workspace.saved_analysis_tree.topLevelItemCount(), 1)
                 self.assertEqual(workspace.saved_analysis_tree.topLevelItem(0).text(1), 'Current')
                 workspace.target_tree.setCurrentItem(workspace._items[boxes[0]])
@@ -189,7 +188,7 @@ class WorkspaceTargetTests(unittest.TestCase):
                 workspace.deleteLater()
                 self.app.processEvents()
 
-    def test_create_new_analysis_does_not_silently_open_saved_cache(self):
+    def test_create_new_analysis_confirms_when_current_cache_exists(self):
         adapter, exposure, boxes = scene()
         payload = prepare_exposure_analysis_payload(adapter, exposure, target_id=boxes[0])
         adapter.save_exposure_analysis_resource(payload, analysis_cache={})
@@ -197,8 +196,21 @@ class WorkspaceTargetTests(unittest.TestCase):
         try:
             workspace.target_tree.setCurrentItem(workspace._items[boxes[0]])
             self.assertEqual(workspace.saved_analysis_tree.topLevelItemCount(), 1)
-            with patch.object(workspace, '_start_preparation') as start:
+            self.assertEqual(workspace.saved_analysis_tree.topLevelItem(0).text(1), 'Current')
+
+            with patch('fieldworkbench.exposure_workspace.QMessageBox.question',
+                       return_value=QMessageBox.StandardButton.No) as question, \
+                    patch.object(workspace, '_start_preparation') as start:
                 workspace.create_button.click()
+                question.assert_called_once()
+                self.assertIn('A cached analysis already exists', question.call_args.args[2])
+                start.assert_not_called()
+
+            with patch('fieldworkbench.exposure_workspace.QMessageBox.question',
+                       return_value=QMessageBox.StandardButton.Yes) as question, \
+                    patch.object(workspace, '_start_preparation') as start:
+                workspace.create_button.click()
+                question.assert_called_once()
                 start.assert_called_once_with(boxes[0])
             self.assertIsNone(workspace._active_view)
         finally:

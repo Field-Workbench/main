@@ -141,6 +141,42 @@ class RegionAnalysisTests(unittest.TestCase):
         self.assertIsNone(c['measurement_regions'])
 
 
+    def test_live_measurement_metrics_follow_the_same_frames_in_2d_and_3d(self):
+        adapter = adapter_with_regions()
+        common = dict(
+            coil_id="coil_a", trace=validate_trace([0, .5, 1], [0, .02, 0], kind="current"),
+            frame_count=5, analysis_samples=9, playback_fps=30.,
+        )
+        analysis = dict(resolution=2, component="magnitude", live_measurement_analysis=True)
+        planar = build_2d_gpu_playback(
+            adapter, **common, map_settings=dict(
+                analysis, plane="xy", offset_mm=0., span_mm=30., field="H",
+                show_object_outlines=False,
+            ),
+        )["measurement_regions"]
+        volume = build_3d_gpu_playback(
+            adapter, **common, map_settings=dict(
+                analysis, centre_mm=[30, 0, 0], span_mm=20, slice_axis="x", slice_count=2,
+                field="B", include_scene=False, view_type="slices", waveform_render_mode="slices",
+            ),
+        )["measurement_regions"]
+        self.assertEqual(planar["metrics"]["shape"], [5, 27, 7])
+        plate = planar["objects"][-1]
+        self.assertEqual(plate["sample_count"], 24)
+        self.assertEqual(len(plate["children"]), 24)
+        self.assertEqual(plate["children"][0]["name"], "A1")
+        highlights = {row["label_id"]: row["positions"] for row in planar["highlights"]}
+        self.assertEqual(len(highlights[plate["label_id"]]), 24)
+        first_well = plate["children"][0]
+        self.assertEqual(highlights[first_well["label_id"]], [first_well["position_mm"]])
+        self.assertNotIn("playback_summary", planar["metrics"])
+        self.assertNotIn("waveform", planar)
+        values = decode_frames(planar)
+        np.testing.assert_allclose(values, decode_frames(volume))
+        self.assertGreater(values[2, -1, 0], values[0, -1, 0])
+        np.testing.assert_allclose(values[:, 2, 0], np.sqrt(np.mean(values[:, 3:, 0] ** 2, axis=1)))
+        self.assertTrue(np.isnan(values[:, 3:, 6]).all())
+
     def test_vector_spectrum_retains_opposed_fields_and_physical_slew(self):
         t=np.linspace(0,1,1025)
         samples=BrainSampleSet(np.zeros((2,3)),np.ones(2,dtype=int),np.ones(2),np.arange(2),{1:2},{1:2},1)

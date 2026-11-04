@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import copy
 import math
+import textwrap
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -32,16 +33,15 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QToolTip,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from .brain_analysis import (
-    BrainAnalysisError,
-    BrainRegionMetrics,
-    BrainRegionNode,
+from .spatial_analysis import (
+    AnalysisRegionNode, RegionMetrics, RegionalAnalysisError,
 )
 from .window_utils import CompactDoubleSpinBox
 
@@ -239,6 +239,31 @@ class _NumericTreeItem(QTreeWidgetItem):
         return self.text(column).casefold() < other.text(column).casefold()
 
 
+class _WrappedToolTipHeaderView(QHeaderView):
+    """Header view that keeps long metric help readable on narrow columns.
+
+    Some Linux Qt styles constrain the native header-item tooltip to the hovered
+    section, which can leave only the tail of a long sentence visible.  Show the
+    same tooltip explicitly with sensible line wrapping so it is sized as a normal
+    popup instead of being clipped to a statistics column.
+    """
+
+    def viewportEvent(self, event):  # noqa: N802 - Qt API name
+        if event.type() == QEvent.Type.ToolTip:
+            section = self.logicalIndexAt(event.pos())
+            if section >= 0:
+                tooltip = self.model().headerData(
+                    section, Qt.Orientation.Horizontal, Qt.ItemDataRole.ToolTipRole
+                )
+                tooltip = str(tooltip or "").strip()
+                if tooltip:
+                    wrapped = "\n".join(textwrap.wrap(tooltip, width=52))
+                    QToolTip.showText(event.globalPos(), wrapped, self)
+                    event.accept()
+                    return True
+        return super().viewportEvent(event)
+
+
 class _BrainRegionTreeWidget(QTreeWidget):
     """QTreeWidget that restores classic parent/child connector lines.
 
@@ -395,7 +420,7 @@ class _ToggleSelectedTreeRowFilter(QObject):
 
 
 def _collapse_brain_region_tree_to_major(
-    tree: QTreeWidget, hierarchy: BrainRegionNode
+    tree: QTreeWidget, hierarchy: AnalysisRegionNode
 ) -> None:
     """Show the Whole brain root plus the eight major groups, collapsed below."""
 
@@ -444,18 +469,37 @@ class ExposureRegionPanel(QWidget):
     EXPOSURE_SUMMARY_UNITS = ("", "µT", "µT", "µT", "s", "µT·s", "µT²·s", "")
     HEADER_LABELS = FRAME_HEADER_LABELS
 
-    def __init__(self, hierarchy: BrainRegionNode, parent=None, *, measurement=False):
+    def __init__(
+        self, hierarchy: AnalysisRegionNode, parent=None, *, measurement=False, region_mode=None
+    ):
         super().__init__(parent)
         self.hierarchy = hierarchy
-        self.measurement = measurement
-        if measurement:
+        if region_mode is None:
+            region_mode = "measurement" if measurement else "brain"
+        self.region_mode = str(region_mode).strip().lower() or "brain"
+        if self.region_mode not in {"brain", "measurement", "surface"}:
+            self.region_mode = "brain"
+        self.measurement = self.region_mode == "measurement"
+        self.surface_regions = self.region_mode == "surface"
+        self.non_brain = self.region_mode != "brain"
+        if self.measurement:
             self.FRAME_HEADER_LABELS = ("Object", *self.FRAME_HEADER_LABELS[1:])
             self.SUMMARY_HEADER_LABELS = ("Object", *self.SUMMARY_HEADER_LABELS[1:])
             self.EXPOSURE_SUMMARY_HEADER_LABELS = (
                 "Object", *self.EXPOSURE_SUMMARY_HEADER_LABELS[1:]
             )
+        elif self.surface_regions:
+            self.FRAME_HEADER_LABELS = ("Region", *self.FRAME_HEADER_LABELS[1:])
+            self.SUMMARY_HEADER_LABELS = ("Region", *self.SUMMARY_HEADER_LABELS[1:])
+            self.EXPOSURE_SUMMARY_HEADER_LABELS = (
+                "Region", *self.EXPOSURE_SUMMARY_HEADER_LABELS[1:7], "Volume"
+            )
+            self.EXPOSURE_SUMMARY_UNITS = (
+                *self.EXPOSURE_SUMMARY_UNITS[:7], "cm³"
+            )
         self.analysis_data = None
         self._items_by_key: dict[str, QTreeWidgetItem] = {}
+        self._nodes_by_key: dict[str, AnalysisRegionNode] = {}
         self._frame_values: np.ndarray | None = None
         self._frame_sample_indices: np.ndarray | None = None
         self._source_frame_count = 0
@@ -475,6 +519,7 @@ class ExposureRegionPanel(QWidget):
             str, list[tuple[int | str, str, float | str, str, str]]
         ] = {"frame": [], "summary": [], "exposure_summary": []}
         self._table_state_by_mode: dict[str, dict[str, Any]] = {}
+        self._exposure_summary_filters_visible = False
 
         # Keep the entire region form scrollable rather than letting a short
         # result host compress splitter children below their controls' geometry.
@@ -493,7 +538,11 @@ class ExposureRegionPanel(QWidget):
         root.setSizeConstraint(QLayout.SizeConstraint.SetMinAndMaxSize)
         self.region_scroll.setWidget(content)
         outer.addWidget(self.region_scroll)
-        heading = QLabel("Measurement volumes" if measurement else "Brain areas")
+        heading = QLabel(
+            "Measurement volumes" if self.measurement
+            else "Surface regions" if self.surface_regions
+            else "Brain areas"
+        )
         heading.setObjectName("dialogHeading")
         root.addWidget(heading)
         self.frame_note = QLabel("Static field")
@@ -621,6 +670,9 @@ class ExposureRegionPanel(QWidget):
         self.collapse_tree_button = QPushButton("Collapse")
         self.expand_tree_button = QPushButton("Expand")
         self.expand_major_tree_button = QPushButton("Expand major")
+        self.toggle_filters_button = QPushButton("Show/hide filters")
+        self.toggle_filters_button.setVisible(False)
+        self.toggle_filters_button.clicked.connect(self._toggle_exposure_summary_filters)
         self.collapse_tree_button.setToolTip(
             "Collapse the Brain Areas hierarchy to the eight major groups."
         )
@@ -631,17 +683,20 @@ class ExposureRegionPanel(QWidget):
         tree_actions.addWidget(self.collapse_tree_button)
         tree_actions.addWidget(self.expand_tree_button)
         tree_actions.addWidget(self.expand_major_tree_button)
+        tree_actions.addWidget(self.toggle_filters_button)
         tree_actions.addStretch(1)
 
         self.table = _BrainRegionTreeWidget()
         self.table.setObjectName("brainResultRegionTable")
         self.table.setMinimumHeight(180)
         self.table.setColumnCount(8)
+        self.table.setHeader(_WrappedToolTipHeaderView(Qt.Orientation.Horizontal, self.table))
         self.table.setHeaderLabels(list(self.FRAME_HEADER_LABELS))
         header = self.table.header()
         header.setObjectName("brainRegionHeader")
         header.setMinimumHeight(30)
         header.setSectionsClickable(True)
+        header.setSectionsMovable(True)
         header.setSortIndicatorShown(False)
         header.setStyleSheet(
             "QHeaderView#brainRegionHeader::up-arrow, "
@@ -702,10 +757,14 @@ class ExposureRegionPanel(QWidget):
         self.region_sections_splitter.setStretchFactor(1, 1)
         self.region_sections_splitter.setSizes([190, 520])
         root.addWidget(self.region_sections_splitter, 1)
-        if measurement:
-            for button in (self.collapse_tree_button, self.expand_tree_button, self.expand_major_tree_button):
-                button.hide()
+        if self.measurement:
+            self.expand_major_tree_button.hide()
+            if not any(node.children for node in self.hierarchy.children):
+                self.collapse_tree_button.hide()
+                self.expand_tree_button.hide()
             self.metrics_note.setText(self._measurement_note())
+        elif self.surface_regions:
+            self.metrics_note.setText(self._surface_region_note())
         self._apply_mode_headers()
         self._table_state_by_mode["frame"] = self._capture_table_state()
         self._table_state_by_mode["summary"] = {
@@ -718,14 +777,22 @@ class ExposureRegionPanel(QWidget):
             "sort_column": 0,
             "sort_order": Qt.SortOrder.AscendingOrder,
             "hidden": [False, False, False, False, False, False, False, True],
-            "widths": [240, 112, 126, 112, 100, 112, 120, 60],
+            "widths": [250, 128, 142, 128, 112, 124, 132, 72],
         }
 
     def _measurement_note(self):
         if not self.hierarchy.children:
             return "No measurement volumes in this playback's scene. Assign the Measurement role before creating a new playback."
         return ("Whole-object samples from this playback's frozen scene. Generated samples are volume-weighted; "
-                "rows marked [samples] use equal-weight user points. Overlapping objects are reported independently.")
+                "rows marked [samples] use equal-weight user points. Overlapping objects are reported independently."
+                + (" Expand an object to see its defined points (up to 2,000 per object)."
+                   if any(node.children for node in self.hierarchy.children) else ""))
+
+    def _surface_region_note(self):
+        return (
+            "Rows represent inward near-surface volumes derived from authored mesh regions. "
+            "Retained field samples are volume-weighted to represent the denser integration shell."
+        )
 
     @staticmethod
     def _metric_text(value: float, suffix: str) -> str:
@@ -760,7 +827,7 @@ class ExposureRegionPanel(QWidget):
                 ("Peak time", 4),
                 ("B-time", 5),
                 ("B²-time", 6),
-                *(() if self.measurement else (("Side", "side"),)),
+                *(() if self.non_brain else (("Side", "side"),)),
             )
         if self._display_mode == "summary":
             return (
@@ -771,7 +838,7 @@ class ExposureRegionPanel(QWidget):
                 ("B-time", 5),
                 ("B²-time", 6),
                 ("Volume", 7),
-                *(() if self.measurement else (("Side", "side"),)),
+                *(() if self.non_brain else (("Side", "side"),)),
             )
         return (
             ("RMS |B|", 1),
@@ -781,7 +848,7 @@ class ExposureRegionPanel(QWidget):
             ("Uniformity", 5),
             ("Direction", 6),
             ("Volume", 7),
-            *(() if self.measurement else (("Side", "side"),)),
+            *(() if self.non_brain else (("Side", "side"),)),
         )
 
     def _capture_table_state(self) -> dict[str, Any]:
@@ -789,6 +856,7 @@ class ExposureRegionPanel(QWidget):
         return {
             "sort_column": int(max(0, header.sortIndicatorSection())),
             "sort_order": header.sortIndicatorOrder(),
+            "column_order": [header.logicalIndex(index) for index in range(header.count())],
             "hidden": [
                 bool(self.table.isColumnHidden(column))
                 for column in range(self.table.columnCount())
@@ -800,6 +868,11 @@ class ExposureRegionPanel(QWidget):
         }
 
     def _restore_table_state(self, state: dict[str, Any]) -> None:
+        header = self.table.header()
+        for visual_index, logical_index in enumerate(state.get("column_order", range(header.count()))):
+            current_index = header.visualIndex(logical_index)
+            if current_index != visual_index:
+                header.moveSection(current_index, visual_index)
         hidden = list(state.get("hidden", []))
         widths = list(state.get("widths", []))
         for column in range(self.table.columnCount()):
@@ -825,7 +898,11 @@ class ExposureRegionPanel(QWidget):
         labels = self._active_header_labels()
         if self._display_mode == "exposure_summary":
             tooltips = (
-                "Prepared LPBA40 region" if not self.measurement else "Prepared Measurement object",
+                (
+                    "Prepared Measurement object" if self.measurement
+                    else "Prepared inward surface region" if self.surface_regions
+                    else "Prepared LPBA40 region"
+                ),
                 "Time-weighted mean of the regional spatial-RMS field magnitude",
                 "RMS over physical time of the regional spatial-RMS field magnitude",
                 "Highest regional spatial-RMS field magnitude during the exposure",
@@ -863,6 +940,13 @@ class ExposureRegionPanel(QWidget):
             if self._display_mode == "frame":
                 tooltips[2] = "Weighted mean magnitude; equal weights for rows marked [samples]"
                 tooltips[3] = "Weighted spatial 95th percentile; equal weights for rows marked [samples]"
+        elif self.surface_regions and self._display_mode != "exposure_summary":
+            tooltips = list(tooltips)
+            tooltips[0] = "Authored surface region represented by an inward sampling volume"
+            tooltips[7] = "Integrated inward shell volume represented by this region"
+            if self._display_mode == "frame":
+                tooltips[2] = "Volume-weighted mean magnitude across retained shell samples"
+                tooltips[3] = "Volume-weighted spatial 95th percentile across retained shell samples"
         header_item = self.table.headerItem()
         if header_item is not None:
             for column, (label, tooltip) in enumerate(
@@ -889,31 +973,46 @@ class ExposureRegionPanel(QWidget):
         self.playback_statistics_widget.hide()
         self._apply_mode_headers()
         self._restore_table_state(self._table_state_by_mode["exposure_summary"])
-        self.column_actions[7].setVisible(False)
-        self.table.setColumnHidden(7, True)
-        # Exposure Summary is a wide statistics view. Put the compact filter/highlight
-        # controls in a dedicated panel on the left and give the regional statistics
-        # table the full-height panel on the right instead of stacking both vertically.
-        self.region_sections_splitter.setOrientation(Qt.Orientation.Horizontal)
-        self.region_sections_splitter.setStretchFactor(0, 0)
-        self.region_sections_splitter.setStretchFactor(1, 1)
-        self.region_sections_splitter.setSizes([360, 820])
-        self.filter_section.setMinimumWidth(300)
-        self.table_section.setMinimumWidth(500)
+        self.column_actions[7].setVisible(self.surface_regions)
+        self.table.setColumnHidden(7, not self.surface_regions)
+        # Exposure Summary already presents every prepared region together, so let the
+        # regional statistics table fill the available width and keep filters available
+        # on demand in a secondary panel beneath it.
+        self.region_sections_splitter.setOrientation(Qt.Orientation.Vertical)
+        self.region_sections_splitter.insertWidget(0, self.table_section)
+        self.region_sections_splitter.insertWidget(1, self.filter_section)
+        self.region_sections_splitter.setStretchFactor(0, 1)
+        self.region_sections_splitter.setStretchFactor(1, 0)
+        self.region_sections_splitter.setSizes([820, 0])
+        self.filter_section.setMinimumWidth(0)
+        self.table_section.setMinimumWidth(0)
         self.filter_heading.setText("Filters / highlights")
-        self.filter_table.setMinimumHeight(180)
-        self.filter_table.setMaximumHeight(16777215)
-        self.metrics_note.setText(
-            "Rows combine the prepared regions with cumulative field statistics for the complete "
-            "physical exposure. B-time and B²-time are exposure descriptors, not measures of "
-            "biological effect. Filter and Highlight rules use the same controls as Brain Areas; "
-            "the regional statistics table is shown in its own panel to the right."
-        )
+        self.filter_table.setMinimumHeight(160)
+        self.filter_table.setMaximumHeight(280)
+        self.toggle_filters_button.setVisible(True)
+        self._set_exposure_summary_filters_visible(False)
+        self.metrics_note.hide()
         self.selection_note.setText(
             "Select a row to make it the active region for the other Exposure Analysis tools."
         )
         self.set_filter_rules(
             copy.deepcopy(self._filter_rules_by_mode.get("exposure_summary", []))
+        )
+
+    def _set_exposure_summary_filters_visible(self, visible: bool) -> None:
+        self._exposure_summary_filters_visible = bool(visible)
+        self.filter_section.setVisible(self._exposure_summary_filters_visible)
+        if self._display_mode == "exposure_summary":
+            if self._exposure_summary_filters_visible:
+                self.region_sections_splitter.setSizes([620, 220])
+            else:
+                self.region_sections_splitter.setSizes([820, 0])
+
+    def _toggle_exposure_summary_filters(self) -> None:
+        if self._display_mode != "exposure_summary":
+            return
+        self._set_exposure_summary_filters_visible(
+            not self._exposure_summary_filters_visible
         )
 
     def set_exposure_summary_status(self, text: str) -> None:
@@ -962,12 +1061,27 @@ class ExposureRegionPanel(QWidget):
                     Qt.ItemDataRole.UserRole,
                     number if math.isfinite(number) else None,
                 )
-            item.setToolTip(
-                0,
-                "Regional spatial-RMS statistics over the complete physical exposure."
-                if not self.measurement
-                else "Spatial-RMS statistics across this prepared Measurement sample set over the complete physical exposure.",
+            base_tooltip = (
+                "Spatial-RMS statistics across this prepared Measurement sample set over the complete physical exposure."
+                if self.measurement
+                else "Spatial-RMS statistics across this inward near-surface volume over the complete physical exposure."
+                if self.surface_regions
+                else "Regional spatial-RMS statistics over the complete physical exposure."
             )
+            if self.surface_regions:
+                node = self._nodes_by_key.get(str(key))
+                metadata = node.metadata if node is not None and isinstance(node.metadata, dict) else {}
+                try:
+                    volume = float(metadata.get("volume_cm3"))
+                except (TypeError, ValueError):
+                    volume = float("nan")
+                if math.isfinite(volume) and volume > 0.0:
+                    item.setText(7, self._metric_text(volume, "cm³"))
+                    item.setData(7, Qt.ItemDataRole.UserRole, volume)
+                extra = item.toolTip(0)
+                if extra:
+                    base_tooltip += "\n" + extra
+            item.setToolTip(0, base_tooltip)
             duration = data.get("duration_s", duration)
             samples = data.get("source_sample_count", samples)
             max_interval = data.get("max_source_interval_s", max_interval)
@@ -1010,6 +1124,7 @@ class ExposureRegionPanel(QWidget):
             copy.deepcopy(self._filter_rules_by_mode.get(requested, []))
         )
         summary = requested == "summary"
+        self.metrics_note.show()
         self.playback_statistics_widget.setVisible(summary)
         if summary:
             scope = str(self._playback_metadata.get("statistics_scope", "full") or "full").strip().lower()
@@ -1027,6 +1142,8 @@ class ExposureRegionPanel(QWidget):
             )
             if self.measurement:
                 self.metrics_note.setText(self._measurement_note())
+            elif self.surface_regions:
+                self.metrics_note.setText(self._surface_region_note())
             self._show_frame_values(
                 self._current_frame_index, self._current_frame_time_s
             )
@@ -1128,8 +1245,9 @@ class ExposureRegionPanel(QWidget):
         self.table.setSortingEnabled(False)
         self.table.clear()
         self._items_by_key.clear()
+        self._nodes_by_key.clear()
 
-        def add_node(node: BrainRegionNode, parent: QTreeWidgetItem | None) -> None:
+        def add_node(node: AnalysisRegionNode, parent: QTreeWidgetItem | None) -> None:
             item = _NumericTreeItem([node.name, "—", "—", "—", "—", "—", "—", "—"])
             item.setData(0, Qt.ItemDataRole.UserRole, node.name.casefold())
             item.setData(0, REGION_KEY_ROLE, node.key)
@@ -1137,6 +1255,35 @@ class ExposureRegionPanel(QWidget):
             side = "left" if node.key.endswith(".left") else "right" if node.key.endswith(".right") else ""
             item.setData(0, REGION_SIDE_ROLE, side)
             self._items_by_key[node.key] = item
+            self._nodes_by_key[node.key] = node
+            if self.surface_regions and isinstance(node.metadata, dict):
+                details = []
+                try:
+                    details.append(f"Sampling depth: {float(node.metadata.get('sampling_depth_mm')):,.6g} mm inward")
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    details.append(f"Sampled volume: {float(node.metadata.get('volume_cm3')):,.6g} cm³")
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    details.append(f"Surface area: {float(node.metadata.get('surface_area_cm2')):,.6g} cm²")
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    source_count = int(node.metadata.get("source_voxel_count", 0) or 0)
+                except (TypeError, ValueError):
+                    source_count = 0
+                try:
+                    retained_count = int(node.metadata.get("retained_sample_count", 0) or 0)
+                except (TypeError, ValueError):
+                    retained_count = 0
+                if source_count:
+                    details.append(f"Source voxels: {source_count:,}")
+                if retained_count:
+                    details.append(f"Retained field samples: {retained_count:,}")
+                if details:
+                    item.setToolTip(0, "\n".join(details))
             if parent is None:
                 self.table.addTopLevelItem(item)
             else:
@@ -1528,7 +1675,7 @@ class ExposureRegionPanel(QWidget):
         if current is not None and current.isHidden():
             self.table.clearSelection()
 
-    def set_static_metrics(self, metrics: dict[str, BrainRegionMetrics]) -> None:
+    def set_static_metrics(self, metrics: dict[str, RegionMetrics]) -> None:
         self.frame_note.setText("Static field")
         self.table.setSortingEnabled(False)
         for key, metric in metrics.items():
@@ -1556,7 +1703,7 @@ class ExposureRegionPanel(QWidget):
         raw = base64.b64decode(str(data.get("values_b64", "")))
         values = np.frombuffer(raw, dtype=np.float32)
         if len(shape) != 3 or int(np.prod(shape)) != values.size:
-            raise BrainAnalysisError("Animated Brain Areas metric payload has an invalid shape.")
+            raise RegionalAnalysisError("Animated Brain Areas metric payload has an invalid shape.")
         self._frame_values = values.reshape(shape)
         self._source_frame_count = max(int(data.get("source_frame_count", shape[0])), int(shape[0]))
         encoded_indices = str(data.get("sampled_frame_indices_b64", ""))
@@ -1576,7 +1723,7 @@ class ExposureRegionPanel(QWidget):
                 summary_shape != (len(self._frame_keys), 7)
                 or int(np.prod(summary_shape)) != summary_values.size
             ):
-                raise BrainAnalysisError(
+                raise RegionalAnalysisError(
                     "Animated Brain Areas playback summary has an invalid shape."
                 )
             peak_raw = base64.b64decode(
@@ -1584,7 +1731,7 @@ class ExposureRegionPanel(QWidget):
             )
             peak_times = np.frombuffer(peak_raw, dtype=np.float64)
             if peak_times.shape != (len(self._frame_keys),):
-                raise BrainAnalysisError(
+                raise RegionalAnalysisError(
                     "Animated Brain Areas playback peak times are invalid."
                 )
             self._summary_values = summary_values.reshape(summary_shape)
@@ -1793,8 +1940,18 @@ class ExposureRegionPanel(QWidget):
             number = float(value)
             item.setText(column, self._metric_text(number, suffix))
             item.setData(column, Qt.ItemDataRole.UserRole, number)
-        item.setToolTip(0, f"{sample_count:,} retained analysis samples" if self.measurement else
-                        f"{voxel_count:,} atlas voxels; {sample_count:,} retained analysis samples")
+        if self.measurement:
+            sample_tooltip = f"{sample_count:,} retained analysis samples"
+        elif self.surface_regions:
+            sample_tooltip = (
+                f"{voxel_count:,} source shell voxels; "
+                f"{sample_count:,} retained weighted field samples"
+            )
+        else:
+            sample_tooltip = (
+                f"{voxel_count:,} atlas voxels; {sample_count:,} retained analysis samples"
+            )
+        item.setToolTip(0, sample_tooltip)
         if peak_time_s is not None and math.isfinite(float(peak_time_s)):
             item.setToolTip(
                 4,
@@ -1816,9 +1973,17 @@ class ExposureRegionPanel(QWidget):
                 "mode": self._display_mode,
                 "units": list(self._active_units()),
                 "title": (
-                    ("Measurement volumes — Playback summary" if self.measurement else "Brain areas — Playback summary")
+                    (
+                        "Measurement volumes — Playback summary" if self.measurement
+                        else "Surface regions — Playback summary" if self.surface_regions
+                        else "Brain areas — Playback summary"
+                    )
                     if self._display_mode == "summary"
-                    else ("Measurement volumes" if self.measurement else "Brain areas")
+                    else (
+                        "Measurement volumes" if self.measurement
+                        else "Surface regions" if self.surface_regions
+                        else "Brain areas"
+                    )
                 ),
             }
         )
@@ -1847,17 +2012,22 @@ class ExposureRegionPanel(QWidget):
                 f"Active region: {item.text(0)} — used by the other Exposure Analysis tools."
             )
         else:
-            self.selection_note.setText(
-                f"Highlighted: {item.text(0)} • {len(label_ids)} LPBA40 region"
-                f"{'s' if len(label_ids) != 1 else ''}."
-            )
             if self.measurement:
-                self.selection_note.setText(f"Highlighted samples: {item.text(0)} (projected in 2D).")
+                self.selection_note.setText(
+                    f"Highlighted samples: {item.text(0)} (projected in 2D)."
+                )
+            elif self.surface_regions:
+                self.selection_note.setText(f"Selected surface region: {item.text(0)}.")
+            else:
+                self.selection_note.setText(
+                    f"Highlighted: {item.text(0)} • {len(label_ids)} LPBA40 region"
+                    f"{'s' if len(label_ids) != 1 else ''}."
+                )
         self.region_selected.emit(label_ids)
 
 
 def _brain_region_video_table_snapshot(
-    hierarchy: BrainRegionNode,
+    hierarchy: AnalysisRegionNode,
     tree: QTreeWidget,
     rules: list[tuple[int | str, str, float | str, str, str]],
     header_labels: tuple[str, ...] | list[str],
@@ -1866,7 +2036,7 @@ def _brain_region_video_table_snapshot(
 
     rows: list[dict[str, Any]] = []
 
-    def add_node(node: BrainRegionNode, parent_key: str | None, depth: int) -> None:
+    def add_node(node: AnalysisRegionNode, parent_key: str | None, depth: int) -> None:
         side = (
             "left" if node.key.endswith(".left")
             else "right" if node.key.endswith(".right")

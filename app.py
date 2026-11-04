@@ -152,6 +152,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("scene", nargs="?", help="optional .magpy.json scene to open")
     parser.add_argument("--smoke-test", action="store_true", help="launch briefly and exit with a status code")
     parser.add_argument("--version", action="version", version=f"Field Workbench {__version__}")
+    parser.add_argument("--automation", action="store_true", help="enable local CLI/MCP access to this instance")
+    parser.add_argument("--automation-runtime-dir", help="private directory for CLI/MCP instance discovery")
     return parser
 
 
@@ -194,6 +196,16 @@ def main(argv: list[str] | None = None) -> int:
         # then retry once on Windows if the first activation request was lost.
         _schedule_post_splash_raise(window)
     application.aboutToQuit.connect(_cleanup_browser_surfaces_for_shutdown)
+    if args.automation:
+        from fieldworkbench.automation.qt_host import AutomationController
+        try:
+            window.automation_controller = AutomationController(
+                window, directory=args.automation_runtime_dir
+            )
+            window.automation_controller.start()
+        except Exception as error:
+            print(f"Could not start FWB automation: {error}", file=sys.stderr)
+            return 2
     if args.smoke_test:
         QTimer.singleShot(2500, application.quit)
     return application.exec()

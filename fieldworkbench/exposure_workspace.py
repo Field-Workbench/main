@@ -6,7 +6,7 @@ import math
 import threading
 import time
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QDialog,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStackedWidget,
     QTreeWidget,
@@ -23,6 +24,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .exposure_analysis_header import ExposureAnalysisHeaderPanel
+from .analysis_region_viewer import AnalysisRegionViewer
 from .brain_analysis import lpba40_region_hierarchy
 from .exposure_actions import ExposureAnalysisTargetView
 from .exposure_analysis import (
@@ -31,7 +34,8 @@ from .exposure_analysis import (
     prepare_exposure_analysis_payload,
 )
 from .exposures import normalize_exposure_protocol
-from .window_utils import configure_application_window
+from .surface_region_volume import MAXIMUM_SURFACE_DEPTH_MM, MINIMUM_SURFACE_DEPTH_MM
+from .window_utils import CompactDoubleSpinBox, configure_application_window
 
 
 # Keep preparation workers alive independently of the auxiliary window so that
@@ -100,6 +104,7 @@ class ExposureAnalysisWorkspace(QDialog):
         self._preparation_started_at: float | None = None
         self._preparation_cancel_requested = False
         self._prepared_record = None
+        self._region_viewer: AnalysisRegionViewer | None = None
 
         self.setWindowTitle("Exposure analysis — " + str(exposure.get("name") or "Exposure"))
         self.resize(1080, 700)
@@ -118,9 +123,8 @@ class ExposureAnalysisWorkspace(QDialog):
         else:
             self.target_title.setText("Target: No analysis objects are available")
             self.target_details.setText(
-                "Add an SRI24 brain or assign a supported volume the Measurement role in the model."
+                "Add an SRI24 brain, a closed mesh with authored surface regions, or assign a supported volume the Measurement role in the model."
             )
-            self.saved_analysis_status.setText("")
             self.create_button.setEnabled(False)
             self.open_analysis_button.setEnabled(False)
 
@@ -129,55 +133,74 @@ class ExposureAnalysisWorkspace(QDialog):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        heading = QLabel("Create exposure analysis", page)
-        heading.setObjectName("dialogHeading")
-        layout.addWidget(heading)
-        intro = QLabel(
-            "Choose a target, then open one of its saved analyses or create a fresh analysis preparation. "
-            "Selecting an object only browses its information and saved work; it does not calculate fields.",
-            page,
+        # Exposure Analysis pages share the same upper context template. The
+        # chooser starts at roughly one-third context / two-thirds browsing.
+        chooser_splitter = QSplitter(Qt.Orientation.Vertical, page)
+        chooser_splitter.setObjectName("exposureAnalysisChooserVerticalSplitter")
+        chooser_splitter.setChildrenCollapsible(False)
+
+        self.analysis_header = ExposureAnalysisHeaderPanel(
+            chooser_splitter,
+            title="Exposure target selection",
+            explanation=(
+                "Choose a target for the analysis. After the base is prepared, various statistical "
+                "calculations can be run on the target. Calculations are automatically cached so they "
+                "only need to run once."
+            ),
+            preview_object_name="exposureAnalysisTargetPreview",
         )
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-
-        # Keep the selected target/exposure identity above both tables.  The
-        # tables then answer two separate questions: which object, and which
-        # saved analysis of that object?
-        self.target_title = QLabel("Target: Choose an object", page)
-        self.target_title.setObjectName("dialogHeading")
-        self.target_title.setWordWrap(True)
-        layout.addWidget(self.target_title)
-
-        self.exposure_summary = QLabel(
-            f"Exposure: {self.exposure.get('name') or 'Exposure'} • Full duration: {self._format_duration(self._duration)}",
-            page,
+        self.analysis_header.set_identity(
+            "Choose a target",
+            self.exposure.get("name") or "Exposure",
         )
-        self.exposure_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.exposure_summary)
+        self.target_title = self.analysis_header.target_label
+        self.exposure_title = self.analysis_header.exposure_label
+        self.target_details = self.analysis_header.stats_label
+        self.target_preview = self.analysis_header.preview
+        self.open_region_viewer_button = self.analysis_header.region_viewer_button
+        self.open_region_viewer_button.clicked.connect(self._open_selected_region_viewer)
 
-        self.target_details = QLabel("", page)
-        self.target_details.setWordWrap(True)
-        self.target_details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.target_details)
+        self.surface_depth_widget = QWidget(self.analysis_header.info_panel)
+        surface_depth_layout = QHBoxLayout(self.surface_depth_widget)
+        surface_depth_layout.setContentsMargins(0, 0, 0, 0)
+        surface_depth_layout.setSpacing(8)
+        surface_depth_layout.addWidget(QLabel("Near-surface sampling depth:", self.surface_depth_widget))
+        self.surface_depth_spin = CompactDoubleSpinBox(self.surface_depth_widget)
+        self.surface_depth_spin.setObjectName("exposureSurfaceSamplingDepthSpin")
+        self.surface_depth_spin.setRange(MINIMUM_SURFACE_DEPTH_MM, MAXIMUM_SURFACE_DEPTH_MM)
+        self.surface_depth_spin.setDecimals(3)
+        self.surface_depth_spin.setSuffix(" mm")
+        self.surface_depth_spin.setMinimumWidth(110)
+        self.surface_depth_spin.setToolTip(
+            "Depth measured inward from the authored surface regions. This changes the "
+            f"prepared geometry and therefore makes earlier preparations stale. "
+            f"The near-surface analysis limit is {MAXIMUM_SURFACE_DEPTH_MM:g} mm."
+        )
+        surface_depth_layout.addWidget(self.surface_depth_spin)
+        self.apply_surface_depth_button = QPushButton("Apply depth", self.surface_depth_widget)
+        self.apply_surface_depth_button.setToolTip(
+            "Save this depth on the selected geometry object before creating a new analysis."
+        )
+        self.apply_surface_depth_button.clicked.connect(self._apply_surface_depth)
+        surface_depth_layout.addWidget(self.apply_surface_depth_button)
+        surface_depth_layout.addStretch(1)
+        self.surface_depth_widget.hide()
+        self.analysis_header.extra_layout.addWidget(self.surface_depth_widget)
 
-        self.saved_analysis_status = QLabel("", page)
-        self.saved_analysis_status.setObjectName("hint")
-        self.saved_analysis_status.setWordWrap(True)
-        layout.addWidget(self.saved_analysis_status)
-        layout.addSpacing(6)
-
-        split = QSplitter(Qt.Orientation.Horizontal, page)
+        split = QSplitter(Qt.Orientation.Horizontal, chooser_splitter)
+        split.setObjectName("exposureAnalysisTargetSavedSplitter")
+        split.setChildrenCollapsible(False)
 
         object_panel = QWidget(split)
         object_layout = QVBoxLayout(object_panel)
         object_layout.setContentsMargins(0, 0, 6, 0)
-        object_heading = QLabel("Available objects", object_panel)
+        object_heading = QLabel("Available analysis targets", object_panel)
         object_heading.setObjectName("sectionHeading")
         object_layout.addWidget(object_heading)
         self.target_tree = QTreeWidget(object_panel)
         self.target_tree.setHeaderLabels(["Object", "Type"])
-        self.target_tree.setRootIsDecorated(False)
-        self.target_tree.setItemsExpandable(False)
+        self.target_tree.setRootIsDecorated(True)
+        self.target_tree.setItemsExpandable(True)
         self.target_tree.setAlternatingRowColors(True)
         self.target_tree.setMinimumWidth(270)
         self.target_tree.setColumnWidth(0, 205)
@@ -193,7 +216,7 @@ class ExposureAnalysisWorkspace(QDialog):
         saved_panel = QWidget(split)
         saved_layout = QVBoxLayout(saved_panel)
         saved_layout.setContentsMargins(6, 0, 0, 0)
-        saved_heading = QLabel("Saved analyses for selected object", saved_panel)
+        saved_heading = QLabel("Saved analyses for selected target", saved_panel)
         saved_heading.setObjectName("sectionHeading")
         saved_layout.addWidget(saved_heading)
         self.saved_analysis_tree = QTreeWidget(saved_panel)
@@ -213,7 +236,7 @@ class ExposureAnalysisWorkspace(QDialog):
         self.saved_analysis_tree.itemDoubleClicked.connect(self._open_saved_analysis_item)
         saved_layout.addWidget(self.saved_analysis_tree, 1)
         self.saved_analysis_hint = QLabel(
-            "Saved analyses for the selected exposure and object appear here. Current entries match the live project; stale entries remain available as historical results.",
+            "Saved analyses for the selected exposure and target appear here. Current entries match the live project; stale entries remain available as historical results.",
             saved_panel,
         )
         self.saved_analysis_hint.setObjectName("hint")
@@ -229,15 +252,40 @@ class ExposureAnalysisWorkspace(QDialog):
         split.addWidget(saved_panel)
         split.setStretchFactor(0, 1)
         split.setStretchFactor(1, 2)
-        split.setSizes([330, 690])
-        layout.addWidget(split, 1)
+        split.setSizes([340, 680])
 
+        chooser_splitter.addWidget(self.analysis_header)
+        chooser_splitter.addWidget(split)
+        chooser_splitter.setStretchFactor(0, 1)
+        chooser_splitter.setStretchFactor(1, 2)
+        chooser_splitter.setSizes([235, 465])
+        layout.addWidget(chooser_splitter, 1)
+
+        self._preview_request_serial = 0
+
+        target_groups = {
+            "anatomical": QTreeWidgetItem(["Region sets", ""]),
+            "measurement": QTreeWidgetItem(["Measurement volumes", ""]),
+        }
+        for group in target_groups.values():
+            group.setFirstColumnSpanned(False)
+            group.setExpanded(True)
+            self.target_tree.addTopLevelItem(group)
         for target in self._targets.values():
-            type_label = "Brain Areas" if target["kind"] == "brain_lpba40" else "Measurement volume"
+            kind = target.get("kind")
+            type_label = {
+                "brain_lpba40": "Brain regions",
+                "surface_region_volume": "Surface regions",
+                "measurement_volume": "Measurement volume",
+            }.get(kind, "Regional analysis")
             item = QTreeWidgetItem([target["label"], type_label])
             item.setData(0, Qt.ItemDataRole.UserRole, target["id"])
-            self.target_tree.addTopLevelItem(item)
+            group_key = "measurement" if kind == "measurement_volume" else "anatomical"
+            target_groups[group_key].addChild(item)
             self._items[target["id"]] = item
+        for group in tuple(target_groups.values()):
+            if group.childCount() == 0:
+                self.target_tree.takeTopLevelItem(self.target_tree.indexOfTopLevelItem(group))
 
         self._saved_rows_by_id = {}
         self.target_tree.currentItemChanged.connect(self._selected)
@@ -364,18 +412,31 @@ class ExposureAnalysisWorkspace(QDialog):
             reverse=True,
         )
 
-    @staticmethod
-    def _saved_analysis_summary(rows):
-        if not rows:
-            return "Saved analyses: None"
-        current = sum(str(row.get("status") or "").lower() == "current" for row in rows)
-        stale = len(rows) - current
-        parts = []
-        if current:
-            parts.append(f"{current:,} current")
-        if stale:
-            parts.append(f"{stale:,} stale")
-        return f"Saved analyses: {len(rows):,} — " + " • ".join(parts)
+    def _apply_surface_depth(self, *_args):
+        item = self.target_tree.currentItem()
+        if item is None or self._busy():
+            return
+        target_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+        target = self._targets.get(target_id)
+        if not target or str(target.get("kind") or "") != "surface_region_volume":
+            return
+        depth_mm = float(self.surface_depth_spin.value())
+        try:
+            current = float(
+                self.adapter.surface_region_analysis_properties(target_id)["depth_mm"]
+            )
+            if not math.isclose(depth_mm, current, rel_tol=0.0, abs_tol=1.0e-12):
+                self.adapter.apply_operations([
+                    {
+                        "method": "set_surface_region_analysis_settings",
+                        "params": {"object_id": target_id, "depth_mm": depth_mm},
+                    }
+                ])
+                if callable(self.on_cache_changed):
+                    self.on_cache_changed(None)
+            self._refresh_target_info(target_id)
+        except Exception as error:  # noqa: BLE001 - editor boundary
+            QMessageBox.warning(self, "Surface sampling depth", str(error))
 
     def _measurement_details(self, target_id):
         settings = self.adapter.measurement_properties(str(target_id))
@@ -395,6 +456,23 @@ class ExposureAnalysisWorkspace(QDialog):
             f"Sampling: {sampling}",
             f"Sample points: {count:,}",
         ]
+
+    def _surface_region_details(self, target_id):
+        region_map = self.adapter.surface_region_properties(str(target_id))
+        regions = region_map.get("regions", {}) if isinstance(region_map, dict) else {}
+        names = [
+            str(value.get("display_name") or key)
+            for key, value in regions.items() if isinstance(value, dict)
+        ]
+        suffix = ", ".join(names[:5])
+        if len(names) > 5:
+            suffix += f", +{len(names) - 5:,} more"
+        lines = [
+            "Type: Surface-region exposure",
+            f"Authored regions: {len(names):,}" + (f" — {suffix}" if suffix else ""),
+            "Sampling: interior voxel shell; weighted retained field samples are generated during preparation",
+        ]
+        return lines
 
     def _brain_details(self):
         hierarchy = lpba40_region_hierarchy()
@@ -441,26 +519,170 @@ class ExposureAnalysisWorkspace(QDialog):
             self.saved_analysis_tree.setCurrentItem(self.saved_analysis_tree.topLevelItem(0))
         self._saved_selection_changed()
 
+    def _queue_target_preview(self, target_id):
+        """Refresh the compact target preview after the selection event returns.
+
+        Scene resolution is intentionally kept on the UI thread because it reads
+        the live Studio adapter.  Deferring it by one event-loop turn lets the
+        loading state paint first and a serial guard prevents an older queued
+        selection from replacing a newer one.
+        """
+        self._preview_request_serial += 1
+        serial = self._preview_request_serial
+        target_id = str(target_id or "")
+        if not target_id:
+            self.target_preview.show_empty(
+                "Select an analysis target",
+                "A 3D preview of the whole target will appear here.",
+            )
+            return
+        target = self._targets.get(target_id)
+        label = str(target.get("label") or target_id) if isinstance(target, dict) else target_id
+        self.target_preview.show_loading(f"Loading {label}…")
+        QTimer.singleShot(0, lambda: self._resolve_target_preview(target_id, serial))
+
+    def _resolve_target_preview(self, target_id, serial):
+        if serial != self._preview_request_serial:
+            return
+        item = self.target_tree.currentItem()
+        current_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "") if item is not None else ""
+        if current_id != str(target_id):
+            return
+        try:
+            scene = self.adapter.analysis_region_scene(str(target_id))
+            object_figure = self.adapter.analysis_target_preview_figure(str(target_id))
+        except Exception as error:  # noqa: BLE001 - preview must never block target browsing
+            if serial == self._preview_request_serial:
+                self.target_preview.show_empty(
+                    "3D preview unavailable",
+                    str(error),
+                )
+            return
+        if serial == self._preview_request_serial:
+            self.target_preview.set_scene(scene, object_figure=object_figure)
+
+    def _set_embedded_preview_activity(self, *, chooser: bool = False, active_view=None) -> None:
+        viewer = self._region_viewer
+        region_viewer_active = viewer is not None and viewer.isVisible()
+        if region_viewer_active:
+            chooser = False
+            active_view = None
+        inactive_detail = (
+            "Preview is disabled while the Region Viewer is active."
+            if region_viewer_active
+            else "Preview is temporarily disabled while this analysis view is inactive."
+        )
+        header = getattr(self, "analysis_header", None)
+        if header is not None:
+            header.set_preview_rendering_active(
+                bool(chooser),
+                inactive_detail=inactive_detail if not chooser else None,
+            )
+        for view in tuple(self._target_views.values()):
+            setter = getattr(view, "set_visual_active", None)
+            if callable(setter):
+                is_active = view is active_view
+                setter(
+                    is_active,
+                    inactive_detail=inactive_detail if not is_active else None,
+                )
+
+    def _resume_visible_embedded_preview(self) -> None:
+        if self.stack.currentWidget() is self.chooser_page:
+            self._set_embedded_preview_activity(chooser=True, active_view=None)
+        elif self._active_view is not None and self.stack.currentWidget() is self._active_view:
+            self._set_embedded_preview_activity(chooser=False, active_view=self._active_view)
+
+    def _open_selected_region_viewer(self, *_args):
+        """Open the selected chooser target in the shared modeless Region Viewer."""
+        item = self.target_tree.currentItem()
+        if item is None:
+            return
+        target_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "").strip()
+        if target_id:
+            self._open_region_viewer(target_id)
+
+    def _open_region_viewer(self, target_id, selected_region_key=None, context_note=None):
+        """Open/reuse this workspace's single modeless Region Viewer."""
+        target_id = str(target_id or "").strip()
+        if not target_id:
+            return
+        try:
+            # Resolve live geometry on every explicit open. AnalysisRegionViewer
+            # keeps its renderer/camera when the resulting scene is unchanged,
+            # but model edits/deletions cannot be hidden behind an old preview.
+            scene = self.adapter.analysis_region_scene(target_id)
+        except Exception as error:  # noqa: BLE001 - auxiliary visualization boundary
+            viewer = self._region_viewer
+            if viewer is not None and viewer.target_id == target_id:
+                target = self._targets.get(target_id)
+                label = str(target.get("label") or "Analysis target") if isinstance(target, dict) else "Analysis target"
+                viewer.show_unavailable(label, str(error))
+            QMessageBox.warning(self, "Region viewer", str(error))
+            return
+        if self._region_viewer is None:
+            self._region_viewer = AnalysisRegionViewer()
+            self._region_viewer.viewer_hidden.connect(self._resume_visible_embedded_preview)
+        # The large modeless viewer owns the active WebGL scene while it is open.
+        # Purge hidden/smaller copies rather than making Chromium juggle them.
+        self._set_embedded_preview_activity(chooser=False, active_view=None)
+        if context_note:
+            self._region_viewer.present(
+                scene, selected_region_key=selected_region_key, context_note=str(context_note)
+            )
+        else:
+            self._region_viewer.present(scene, selected_region_key=selected_region_key)
+
+    def _sync_region_viewer_selection(self, target_id, selected_region_key=None):
+        """Follow active analysis-region changes without making viewer clicks analytical."""
+        viewer = self._region_viewer
+        if viewer is None or viewer.target_id != str(target_id or "").strip():
+            return
+        viewer.set_selected_region(selected_region_key)
+
     def _refresh_target_info(self, target_id):
         target = self._targets.get(str(target_id))
         if target is None:
-            self.target_title.setText("Target: Choose an object")
+            self.target_title.setText("Target: Choose a target")
             self.target_details.clear()
-            self.saved_analysis_status.clear()
+            self.surface_depth_widget.hide()
             self._refresh_saved_analysis_tree([])
             self.create_button.setEnabled(False)
+            self.open_region_viewer_button.setEnabled(False)
+            self._queue_target_preview(None)
             return
         self.target_title.setText("Target: " + str(target["label"]))
+        self.open_region_viewer_button.setEnabled(not self._busy())
+        self._queue_target_preview(target_id)
+        kind = str(target.get("kind") or "")
+        is_surface = kind == "surface_region_volume"
+        self.surface_depth_widget.setVisible(is_surface)
+        if is_surface:
+            try:
+                self.surface_depth_spin.setValue(
+                    float(self.adapter.surface_region_analysis_properties(str(target_id))["depth_mm"])
+                )
+            except Exception:
+                pass
+            self.apply_surface_depth_button.setEnabled(not self._busy())
         try:
-            lines = self._brain_details() if target["kind"] == "brain_lpba40" else self._measurement_details(target_id)
+            if kind == "brain_lpba40":
+                lines = self._brain_details()
+            elif kind == "surface_region_volume":
+                lines = self._surface_region_details(target_id)
+            else:
+                lines = self._measurement_details(target_id)
             self.target_details.setText(" • ".join(lines))
         except Exception as error:  # noqa: BLE001 - browsing should remain usable for invalid sampling settings
-            type_label = "Brain Areas" if target["kind"] == "brain_lpba40" else "Measurement volume"
+            type_label = {
+                "brain_lpba40": "Brain Areas",
+                "surface_region_volume": "Surface regions",
+                "measurement_volume": "Measurement volume",
+            }.get(str(target.get("kind") or ""), "Regional analysis")
             self.target_details.setText(
                 f"Type: {type_label} • Target details could not be completed: {error}"
             )
         rows = self._saved_analysis_rows(target_id)
-        self.saved_analysis_status.setText(self._saved_analysis_summary(rows))
         self._refresh_saved_analysis_tree(rows)
         self.create_button.setEnabled(not self._busy())
 
@@ -526,17 +748,22 @@ class ExposureAnalysisWorkspace(QDialog):
             analysis_cache=record.get("analysis_cache"),
             saved_record=record,
             on_cache_changed=lambda changed_id, key=analysis_id: self._cache_changed(key, changed_id),
+            on_back_to_targets=self._show_objects,
+            on_region_viewer_requested=self._open_region_viewer,
+            on_region_selection_changed=self._sync_region_viewer_selection,
         )
         view._workspace_cache_sha = record.get("cache_sha256")
         view.busyChanged.connect(lambda _busy: self._sync_busy())
         self.stack.addWidget(view)
         self._target_views[analysis_id] = view
+        view.set_visual_active(False)
         return view
 
     def _show_target_view(self, view):
         self._active_view = view
         view.show_home()
         self.stack.setCurrentWidget(view)
+        self._set_embedded_preview_activity(chooser=False, active_view=view)
         self._sync_busy()
 
     def _open_analysis_id(self, analysis_id):
@@ -570,8 +797,29 @@ class ExposureAnalysisWorkspace(QDialog):
         if item is None or self._busy():
             return
         target_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
-        if target_id:
-            self._start_preparation(target_id)
+        if not target_id:
+            return
+
+        # A fresh preparation is intentionally allowed even when a reusable
+        # current preparation exists, but require an explicit confirmation so
+        # the user does not duplicate a potentially expensive cached analysis
+        # by accident. Historical/stale preparations do not block creation.
+        current_exists = any(
+            str(row.get("status") or "").strip().lower() == "current"
+            for row in self._saved_analysis_rows(target_id)
+        )
+        if current_exists:
+            answer = QMessageBox.question(
+                self,
+                "Create new analysis",
+                "A cached analysis already exists, are you sure you want to create a new analysis?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        self._start_preparation(target_id)
 
     def _start_preparation(self, target_id):
         if self._preparation_thread is not None:
@@ -599,6 +847,7 @@ class ExposureAnalysisWorkspace(QDialog):
 
         self._active_view = None
         self.stack.setCurrentWidget(self.preparation_page)
+        self._set_embedded_preview_activity(chooser=False, active_view=None)
         self.target_tree.setEnabled(False)
         self.saved_analysis_tree.setEnabled(False)
         self.create_button.setEnabled(False)
@@ -748,6 +997,7 @@ class ExposureAnalysisWorkspace(QDialog):
             return
         self._active_view = None
         self.stack.setCurrentWidget(self.chooser_page)
+        self._set_embedded_preview_activity(chooser=True, active_view=None)
         self.target_tree.setEnabled(True)
         item = self.target_tree.currentItem()
         if item is not None:
@@ -777,8 +1027,18 @@ class ExposureAnalysisWorkspace(QDialog):
         busy = self._busy()
         self.target_tree.setEnabled(not busy)
         self.saved_analysis_tree.setEnabled(not busy)
-        self.create_button.setEnabled(not busy and self.target_tree.currentItem() is not None)
+        self.create_button.setEnabled(
+            not busy
+            and self.target_tree.currentItem() is not None
+            and bool(self.target_tree.currentItem().data(0, Qt.ItemDataRole.UserRole))
+        )
         self.open_analysis_button.setEnabled(not busy and self._selected_saved_analysis_id() is not None)
+        self.apply_surface_depth_button.setEnabled(not busy and self.surface_depth_widget.isVisible())
+        self.open_region_viewer_button.setEnabled(
+            not busy
+            and self.target_tree.currentItem() is not None
+            and bool(self.target_tree.currentItem().data(0, Qt.ItemDataRole.UserRole))
+        )
 
     def _cleanup(self):
         if self._preparation_thread is not None:
@@ -787,6 +1047,15 @@ class ExposureAnalysisWorkspace(QDialog):
             view.cleanup()
         self._target_views.clear()
         self._active_view = None
+        self._preview_request_serial = getattr(self, "_preview_request_serial", 0) + 1
+        preview = getattr(self, "target_preview", None)
+        if preview is not None:
+            preview.cleanup()
+        viewer = self._region_viewer
+        self._region_viewer = None
+        if viewer is not None:
+            viewer.cleanup()
+            viewer.close()
 
     def reject(self):
         self._cleanup()

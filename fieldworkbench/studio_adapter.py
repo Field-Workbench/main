@@ -45,8 +45,60 @@ from scipy.stats import qmc
 from .anatomy_frames import sri24_ras_mm_to_head_m
 from .field_grid import field_plane_grid_spec, field_volume_grid_spec
 from .candidate_registry import OptimizerCandidateRegistry
+from .optimizer_capabilities import (
+    optimizer_apply_source_capability_context,
+    optimizer_capability_summary,
+    optimizer_freedom_coverage,
+    optimizer_validate_requested_model_reports,
+)
+from .optimizer_search_plan import (
+    optimizer_authoritative_validation_ceiling,
+    optimizer_search_stage_plan,
+    optimizer_stage_budget,
+    optimizer_stage_budget_component,
+)
+from .optimizer_physical_refinement import (
+    optimizer_physical_seed_limit,
+)
+from .optimizer_model_policy import optimizer_resolve_model_policy
+from .optimizer_effort_policy import (
+    optimizer_effort_physical_scope,
+    optimizer_finalize_effort_coverage,
+)
+from .optimizer_directional_closure import (
+    optimizer_directional_closure_plan,
+    optimizer_directional_entries_by_id,
+    optimizer_directional_refresh_summary,
+    optimizer_directional_reopen,
+    optimizer_directional_set_conditional_context,
+)
+from .optimizer_directional_coupling import (
+    optimizer_directional_coupling_components,
+)
+from .optimizer_directional_search import (
+    DirectionalEvaluation,
+    optimizer_directional_search_spec,
+)
+from .optimizer_feasibility_boundary import (
+    optimizer_directional_search_with_feasibility_recovery,
+)
+from .optimizer_authoritative_policy import (
+    optimizer_authoritative_queue_ids,
+    optimizer_should_expand_authoritative_validation,
+)
 from .mesh_io import load_mesh
 from .surface_regions import SurfaceRegionError, load_surface_region_map
+from .surface_region_geometry import SurfaceRegionGeometry, SurfaceRegionGeometryError
+from .surface_region_volume import (
+    DEFAULT_SURFACE_DEPTH_MM, MAXIMUM_SURFACE_DEPTH_MM, MINIMUM_SURFACE_DEPTH_MM,
+    SURFACE_REGION_VOLUME_VERSION, SurfaceRegionVolumeError, SurfaceRegionVolumeSettings,
+    build_surface_region_volume_set, surface_region_volume_cache_identity,
+)
+from .spatial_analysis import (
+    REGIONAL_ANALYSIS_SCHEMA_VERSION, REGIONAL_GEOMETRY_CACHE_SCHEMA_VERSION,
+    RegionalAnalysisError, analysis_region_set_cache_payload,
+    analysis_region_set_from_cache_payload, analysis_region_set_identity,
+)
 from .scene_recipe import SceneRecipeError, parse_scene_recipe, scene_recipe_guide
 from .probe_models import ProbeDefinitionError, validate_probe_definition
 from .exposures import (
@@ -130,13 +182,15 @@ def _drive_group_load_with_overrides(
 APP_NAME = "Field Workbench"
 SCENE_SUFFIX = ".magpy.json"
 WORKBENCH_METADATA_KEY = "field_workbench"
-WORKBENCH_METADATA_VERSION = 25
+WORKBENCH_METADATA_VERSION = 26
 SNAPSHOT_FORMAT_VERSION = 1
 SAVED_MAP_FORMAT_VERSION = 1
-EXPOSURE_ANALYSIS_FORMAT_VERSION = 3
-EXPOSURE_ANALYSIS_DEPENDENCY_VERSION = 3
+EXPOSURE_ANALYSIS_FORMAT_VERSION = 5
+EXPOSURE_ANALYSIS_DEPENDENCY_VERSION = 5
 EXPOSURE_ANALYSIS_BLOB_CODEC = "zlib-json-binary-v1"
-_EXPOSURE_ANALYSIS_BLOB_MAGIC = b"FWBEA3\0"
+_EXPOSURE_ANALYSIS_BLOB_MAGIC = b"FWBEA5\0"
+REGIONAL_GEOMETRY_CACHE_FORMAT_VERSION = 1
+EXPOSURE_ANALYSIS_RESULT_CACHE_VERSION = 1
 OPTIMIZER_BENCHMARK_SCENE_RESOURCE = Path(__file__).with_name("optimizer_benchmark_scene.magpy.json")
 GENERIC_BUST_RESOURCE = Path(__file__).with_name("assets") / "generic_bust_v1.stl"
 GENERIC_BUST_REGIONS_RESOURCE = Path(__file__).with_name("assets") / "generic_bust_v1.regions.json"
@@ -1213,6 +1267,7 @@ class StudioAdapter:
         self.snapshots: list[dict[str, Any]] = []
         self.saved_maps: list[dict[str, Any]] = []
         self.exposure_analyses: list[dict[str, Any]] = []
+        self.regional_geometry_caches: list[dict[str, Any]] = []
         self.measurement_datasets: list[dict[str, Any]] = []
         self.measurement_calibrations: list[dict[str, Any]] = []
         self.exposures: list[dict[str, Any]] = []
@@ -1298,6 +1353,181 @@ class StudioAdapter:
     def coil_modeling_report(self) -> dict[str, Any]:
         """Return details from the most recent centralized field evaluation."""
         return copy.deepcopy(self._last_coil_modeling_report)
+
+    def _optimizer_model_source_support(
+        self, object_ids: Iterable[str]
+    ) -> list[dict[str, Any]]:
+        """Return source-aware model support for optimizer-participating coils.
+
+        Optimizer model policy cannot rely on method names alone. Current Sheet is
+        presently implemented for Polyline paths, while Bundled/Exact require an
+        enabled physical winding specification and Exact also has a turn-source cap.
+        Keep those facts explicit so an optimizer run cannot silently fall back to
+        Centreline and still call the requested model authoritative.
+        """
+        triangle_strip_available = getattr(magpy.current, "TriangleStrip", None) is not None
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw_id in object_ids:
+            object_id = str(raw_id)
+            if not object_id or object_id in seen:
+                continue
+            seen.add(object_id)
+            try:
+                obj = self.get_object(object_id)
+            except Exception as error:  # noqa: BLE001 - diagnostics only
+                rows.append({
+                    "id": object_id,
+                    "label": object_id,
+                    "type": "unknown",
+                    "centreline_supported": False,
+                    "current_sheet_supported": False,
+                    "bundled_supported": False,
+                    "exact_supported": False,
+                    "physical_winding_available": False,
+                    "model_reasons": {
+                        "centreline": str(error),
+                        "current_sheet": str(error),
+                        "bundled": str(error),
+                        "exact": str(error),
+                    },
+                })
+                continue
+
+            object_type = str(obj.get("type", ""))
+            label = str(obj.get("label") or object_id)
+            centreline_supported = object_type in COIL_TYPES
+            spec_id = self._coil_spec_source_id(obj)
+            dimensions = None
+            dimension_error = None
+            if spec_id is None:
+                dimension_error = "No physical winding specification is attached to this coil."
+            else:
+                dimensions, dimension_error = self._coil_solver_dimensions(spec_id)
+            physical_available = bool(dimensions is not None)
+            turns = int((dimensions or {}).get("turns", 0) or 0)
+            bundled_supported = bool(
+                centreline_supported and physical_available and object_type in COIL_TYPES
+            )
+            current_sheet_supported = bool(
+                bundled_supported
+                and object_type == "current.Polyline"
+                and triangle_strip_available
+            )
+            exact_supported = bool(
+                bundled_supported and 0 < turns <= MAX_EXACT_TURN_SOURCES
+            )
+
+            if not centreline_supported:
+                centreline_reason = "This object is not a supported optimizer coil source."
+            else:
+                centreline_reason = None
+            if not physical_available:
+                bundled_reason = str(
+                    dimension_error
+                    or "A complete enabled physical winding specification is required."
+                )
+            else:
+                bundled_reason = None
+            if not current_sheet_supported:
+                if not physical_available:
+                    sheet_reason = bundled_reason
+                elif object_type != "current.Polyline":
+                    sheet_reason = (
+                        "Current Sheet is presently implemented for closed Polyline coils; "
+                        f"this source is {object_type or 'an unsupported type'}."
+                    )
+                elif not triangle_strip_available:
+                    sheet_reason = "This Magpylib build does not provide TriangleStrip."
+                else:
+                    sheet_reason = "Current Sheet is unavailable for this coil."
+            else:
+                sheet_reason = None
+            if not exact_supported:
+                if not physical_available:
+                    exact_reason = bundled_reason
+                elif turns > MAX_EXACT_TURN_SOURCES:
+                    exact_reason = (
+                        f"Exact turns is limited to {MAX_EXACT_TURN_SOURCES:,} paths per coil; "
+                        f"this winding requests {turns:,} turns."
+                    )
+                else:
+                    exact_reason = "Exact turns is unavailable for this coil."
+            else:
+                exact_reason = None
+
+            rows.append({
+                "id": object_id,
+                "label": label,
+                "type": object_type,
+                "source_spec_id": str(spec_id) if spec_id is not None else None,
+                "turns": int(turns),
+                "physical_winding_available": bool(physical_available),
+                "centreline_supported": bool(centreline_supported),
+                "current_sheet_supported": bool(current_sheet_supported),
+                "bundled_supported": bool(bundled_supported),
+                "exact_supported": bool(exact_supported),
+                "model_reasons": {
+                    "centreline": centreline_reason,
+                    "current_sheet": sheet_reason,
+                    "bundled": bundled_reason,
+                    "exact": exact_reason,
+                },
+            })
+        return rows
+
+    def _optimizer_assert_requested_model_applied(
+        self,
+        required_coil_ids: Iterable[str],
+        *,
+        reports: Iterable[dict[str, Any]] | None = None,
+    ) -> None:
+        """Reject an optimizer candidate when a required explicit model fell back.
+
+        Ordinary field tools intentionally keep per-coil fallbacks so a project can
+        still be viewed. Optimizer physical/authoritative stages are different: a
+        fallback can erase the very freedom being searched. Current solving may use
+        temporary zero/basis adapters, so callers can provide the reports emitted by
+        those actual field solves instead of relying on this parent adapter's last
+        report.
+        """
+        requested = str(self.coil_modeling_method).strip().lower()
+        if requested == "auto":
+            return
+        report_rows = (
+            [self.coil_modeling_report()]
+            if reports is None
+            else [copy.deepcopy(item) for item in reports if isinstance(item, dict)]
+        )
+        validation = optimizer_validate_requested_model_reports(
+            requested, required_coil_ids, report_rows
+        )
+        failures: list[str] = []
+        for item in list(validation.get("failures", []) or []):
+            object_id = str(item.get("id", ""))
+            label = object_id
+            try:
+                label = str(self.get_object(object_id).get("label") or object_id)
+            except Exception:
+                pass
+            if str(item.get("code", "")) == "missing_model_report":
+                failures.append(
+                    f"{label}: no coil-model result was reported by the field solves"
+                )
+                continue
+            actual = str(item.get("actual") or "centreline").strip().lower()
+            reason = str(
+                item.get("reason") or "requested representation was not applied"
+            )
+            failures.append(
+                f"{label}: requested {requested.replace('_', ' ')}, got "
+                f"{actual.replace('_', ' ')} ({reason})"
+            )
+        if failures:
+            raise StudioOperationError(
+                "Optimizer candidate rejected because its required coil model fell back: "
+                + "; ".join(failures)
+            )
 
     def set_solver_memory_budget_mb(self, value: int | float) -> None:
         """Set the target maximum temporary memory used by one Magpylib kernel call."""
@@ -1521,6 +1751,16 @@ class StudioAdapter:
                     # Exposure analyses are derived caches. A damaged entry must
                     # never prevent the physical project model from opening.
                     continue
+        raw_region_geometry = metadata.get("regional_geometry_caches", []) if isinstance(metadata, dict) else []
+        self.regional_geometry_caches = []
+        if isinstance(raw_region_geometry, list):
+            for raw in raw_region_geometry:
+                try:
+                    self.regional_geometry_caches.append(self._validated_regional_geometry_cache_record(raw))
+                except (StudioOperationError, TypeError, ValueError):
+                    # Geometry samples are regenerable derived data and must never
+                    # prevent the physical project model from opening.
+                    continue
         raw_measurements = metadata.get("measurement_datasets", []) if isinstance(metadata, dict) else []
         self.measurement_datasets = []
         if isinstance(raw_measurements, list):
@@ -1646,6 +1886,8 @@ class StudioAdapter:
             metadata["saved_maps"] = copy.deepcopy(self.saved_maps)
         if self.exposure_analyses:
             metadata["exposure_analyses"] = copy.deepcopy(self.exposure_analyses)
+        if self.regional_geometry_caches:
+            metadata["regional_geometry_caches"] = copy.deepcopy(self.regional_geometry_caches)
         if self.measurement_datasets:
             metadata["measurement_datasets"] = copy.deepcopy(self.measurement_datasets)
         if self.measurement_calibrations:
@@ -1883,6 +2125,182 @@ class StudioAdapter:
         self.delete_saved_maps([map_id])
 
 
+    # --- shared regional geometry caches -------------------------------
+    @staticmethod
+    def _validated_regional_geometry_cache_record(value: Any) -> dict[str, Any]:
+        """Normalize one project-level resolved-region geometry cache record."""
+        if not isinstance(value, dict):
+            raise StudioOperationError("Regional geometry cache metadata must be an object.")
+        identity = str(value.get("identity", "")).strip()
+        if len(identity) != 64:
+            raise StudioOperationError("Regional geometry cache identity is invalid.")
+        try:
+            int(identity, 16)
+            format_version = int(value.get("format_version", 0))
+            schema_version = int(value.get("schema_version", 0))
+        except (TypeError, ValueError) as error:
+            raise StudioOperationError("Regional geometry cache version/identity is invalid.") from error
+        if format_version != REGIONAL_GEOMETRY_CACHE_FORMAT_VERSION:
+            raise StudioOperationError(
+                f"Unsupported regional geometry cache format {format_version}; "
+                f"expected {REGIONAL_GEOMETRY_CACHE_FORMAT_VERSION}."
+            )
+        if schema_version != REGIONAL_GEOMETRY_CACHE_SCHEMA_VERSION:
+            raise StudioOperationError(
+                f"Unsupported regional geometry schema {schema_version}; "
+                f"expected {REGIONAL_GEOMETRY_CACHE_SCHEMA_VERSION}."
+            )
+        codec = str(value.get("blob_codec", "")).strip().lower()
+        blob_b64 = str(value.get("blob_b64", "")).strip()
+        if codec != EXPOSURE_ANALYSIS_BLOB_CODEC or not blob_b64:
+            raise StudioOperationError("Regional geometry cache data is missing or unsupported.")
+        blob_sha256 = hashlib.sha256(blob_b64.encode("ascii")).hexdigest()
+        stored_sha256 = str(value.get("blob_sha256", "") or "")
+        if stored_sha256 and stored_sha256 != blob_sha256:
+            raise StudioOperationError("Regional geometry cache checksum does not match its stored data.")
+
+        def size(name: str) -> int:
+            try:
+                return max(0, int(value.get(name, 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "identity": identity,
+            "format_version": format_version,
+            "schema_version": schema_version,
+            "created_at": str(value.get("created_at") or ""),
+            "updated_at": str(value.get("updated_at") or ""),
+            "target_id": str(value.get("target_id") or ""),
+            "target_name": str(value.get("target_name") or "Analysis target"),
+            "region_set_key": str(value.get("region_set_key") or ""),
+            "region_set_name": str(value.get("region_set_name") or "Analysis regions"),
+            "region_set_kind": str(value.get("region_set_kind") or "regional"),
+            "sampling_mode": str(value.get("sampling_mode") or "provider"),
+            "provider": str(value.get("provider") or "regional"),
+            "provider_version": int(value.get("provider_version", 1) or 1),
+            "content_identity": str(value.get("content_identity") or ""),
+            "sample_count": max(0, int(value.get("sample_count", 0) or 0)),
+            "source_element_count": max(0, int(value.get("source_element_count", 0) or 0)),
+            "sampling_depth_mm": (
+                None if value.get("sampling_depth_mm") is None
+                else float(value.get("sampling_depth_mm"))
+            ),
+            "blob_codec": codec,
+            "blob_b64": blob_b64,
+            "blob_sha256": blob_sha256,
+            "raw_bytes": size("raw_bytes"),
+            "compressed_bytes": size("compressed_bytes"),
+        }
+
+    def cached_analysis_region_set(self, identity: str):
+        """Return one resolved AnalysisRegionSet from the shared geometry cache."""
+        target = str(identity or "")
+        for record in self.regional_geometry_caches:
+            if str(record.get("identity", "")) != target:
+                continue
+            try:
+                payload = self._decode_exposure_analysis_value_blob(record.get("blob_b64", ""))
+                region_set = analysis_region_set_from_cache_payload(payload)
+            except (StudioOperationError, RegionalAnalysisError, TypeError, ValueError):
+                return None
+            content_identity = str(record.get("content_identity") or "")
+            if content_identity and analysis_region_set_identity(region_set) != content_identity:
+                return None
+            return region_set
+        return None
+
+    def cache_analysis_region_set(
+        self,
+        identity: str,
+        region_set,
+        *,
+        target_id: str = "",
+        target_name: str = "",
+    ) -> str:
+        """Persist one resolved spatial region set under an exposure-independent key.
+
+        Automatic geometry-cache writes intentionally do not consume Undo history,
+        mirroring automatic Exposure Analysis result-cache writes.  The cache is
+        safe to delete independently: prepared analyses retain their field basis.
+        """
+        cache_identity = str(identity or "").strip()
+        if len(cache_identity) != 64:
+            raise StudioOperationError("Regional geometry cache identity must be a SHA-256 value.")
+        try:
+            int(cache_identity, 16)
+        except ValueError as error:
+            raise StudioOperationError("Regional geometry cache identity must be hexadecimal.") from error
+        try:
+            payload = analysis_region_set_cache_payload(region_set)
+            content_identity = analysis_region_set_identity(region_set)
+        except RegionalAnalysisError as error:
+            raise StudioOperationError(str(error)) from error
+        blob_b64, raw_bytes, compressed_bytes, _array_count = self._exposure_analysis_value_blob(payload)
+        metadata = dict(getattr(region_set, "metadata", {}) or {})
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        existing = next(
+            (item for item in self.regional_geometry_caches if str(item.get("identity", "")) == cache_identity),
+            None,
+        )
+        created_at = str((existing or {}).get("created_at") or now)
+        source_counts = getattr(getattr(region_set, "samples", None), "source_counts", {})
+        record = {
+            "identity": cache_identity,
+            "format_version": REGIONAL_GEOMETRY_CACHE_FORMAT_VERSION,
+            "schema_version": REGIONAL_GEOMETRY_CACHE_SCHEMA_VERSION,
+            "created_at": created_at,
+            "updated_at": now,
+            "target_id": str(target_id or ""),
+            "target_name": str(target_name or metadata.get("target_name") or getattr(region_set, "name", "Analysis target")),
+            "region_set_key": str(getattr(region_set, "key", "")),
+            "region_set_name": str(getattr(region_set, "name", "Analysis regions")),
+            "region_set_kind": str(getattr(region_set, "kind", "regional")),
+            "sampling_mode": str(getattr(region_set, "sampling_mode", "provider")),
+            "provider": str(metadata.get("provider") or getattr(region_set, "kind", "regional")),
+            "provider_version": int(metadata.get("provider_version", 1) or 1),
+            "content_identity": content_identity,
+            "sample_count": int(getattr(getattr(region_set, "samples", None), "point_count", 0) or 0),
+            "source_element_count": int(sum(source_counts.values())) if isinstance(source_counts, dict) else 0,
+            "sampling_depth_mm": metadata.get("depth_mm", metadata.get("sampling_depth_mm")),
+            "blob_codec": EXPOSURE_ANALYSIS_BLOB_CODEC,
+            "blob_b64": blob_b64,
+            "blob_sha256": hashlib.sha256(blob_b64.encode("ascii")).hexdigest(),
+            "raw_bytes": int(raw_bytes),
+            "compressed_bytes": int(compressed_bytes),
+        }
+        validated = self._validated_regional_geometry_cache_record(record)
+        if existing is None:
+            self.regional_geometry_caches.append(validated)
+        else:
+            self.regional_geometry_caches[self.regional_geometry_caches.index(existing)] = validated
+        return cache_identity
+
+    def list_regional_geometry_caches(self) -> list[dict[str, Any]]:
+        """Return compact metadata for independently managed spatial caches."""
+        return [
+            {key: copy.deepcopy(value) for key, value in item.items() if key != "blob_b64"}
+            for item in self.regional_geometry_caches
+        ]
+
+    def delete_regional_geometry_caches(self, identities: Iterable[str] | None = None) -> int:
+        """Delete selected/all shared geometry caches as one undoable user action."""
+        if identities is None:
+            requested = {str(item.get("identity", "")) for item in self.regional_geometry_caches}
+        else:
+            requested = {str(value) for value in identities if str(value)}
+        existing = {str(item.get("identity", "")) for item in self.regional_geometry_caches}
+        removed = requested & existing
+        if not removed:
+            return 0
+        before = self.document()
+        self.regional_geometry_caches = [
+            item for item in self.regional_geometry_caches
+            if str(item.get("identity", "")) not in removed
+        ]
+        self._commit(before)
+        return len(removed)
+
     # --- saved Exposure Analysis resources -----------------------------
     @staticmethod
     def _validated_exposure_analysis_record(value: Any) -> dict[str, Any]:
@@ -1953,6 +2371,31 @@ class StudioAdapter:
             size("compressed_bytes")
             or preparation_compressed_bytes + cache_compressed_bytes
         )
+
+        def identity(name: str) -> str:
+            text = str(value.get(name) or "").strip()
+            if len(text) != 64:
+                raise StudioOperationError(f"Exposure analysis {name} is missing or invalid.")
+            try:
+                int(text, 16)
+            except ValueError as error:
+                raise StudioOperationError(f"Exposure analysis {name} is invalid.") from error
+            return text
+
+        geometry_identity = identity("geometry_cache_identity")
+        exposure_data_identity = identity("exposure_data_identity")
+        preparation_identity = identity("preparation_identity")
+        try:
+            result_cache_version = int(
+                value.get("result_cache_schema_version", EXPOSURE_ANALYSIS_RESULT_CACHE_VERSION)
+            )
+        except (TypeError, ValueError) as error:
+            raise StudioOperationError("Exposure analysis result-cache schema is invalid.") from error
+        if result_cache_version != EXPOSURE_ANALYSIS_RESULT_CACHE_VERSION:
+            raise StudioOperationError(
+                f"Unsupported Exposure Analysis result-cache schema {result_cache_version}; "
+                f"expected {EXPOSURE_ANALYSIS_RESULT_CACHE_VERSION}."
+            )
         return {
             "id": analysis_id,
             "name": name,
@@ -1963,11 +2406,20 @@ class StudioAdapter:
             "exposure_name": str(value.get("exposure_name") or "Exposure"),
             "target_id": str(value.get("target_id") or ""),
             "target_name": str(value.get("target_name") or "Analysis target"),
-            "target_kind": str(value.get("target_kind") or "brain_lpba40"),
-            "atlas": str(value.get("atlas") or ("LPBA40" if value.get("target_kind", "brain_lpba40") == "brain_lpba40" else "")),
+            "target_kind": str(value.get("target_kind") or "regional"),
+            "atlas": str(value.get("atlas") or ("LPBA40" if value.get("target_kind") == "brain_lpba40" else "")),
+            "analysis_engine": str(value.get("analysis_engine") or "regional_analysis_v2"),
+            "regional_schema_version": int(value.get("regional_schema_version", REGIONAL_ANALYSIS_SCHEMA_VERSION) or REGIONAL_ANALYSIS_SCHEMA_VERSION),
+            "region_set_kind": str(value.get("region_set_kind") or value.get("target_kind") or "regional"),
+            "region_set_name": str(value.get("region_set_name") or value.get("target_name") or "Analysis regions"),
             "sample_count": int(value.get("sample_count", 0) or 0),
             "physical_duration_s": float(value.get("physical_duration_s", 0.0) or 0.0),
             "source_signature": str(value.get("source_signature") or ""),
+            "geometry_cache_identity": geometry_identity,
+            "region_geometry_content_identity": str(value.get("region_geometry_content_identity") or ""),
+            "exposure_data_identity": exposure_data_identity,
+            "preparation_identity": preparation_identity,
+            "result_cache_schema_version": result_cache_version,
             "cached_result_count": max(0, int(value.get("cached_result_count", 0) or 0)),
             "cached_region_count": max(0, int(value.get("cached_region_count", 0) or 0)),
             "cached_tool_counts": tool_counts,
@@ -2062,7 +2514,7 @@ class StudioAdapter:
 
     @staticmethod
     def _exposure_analysis_value_blob(value: Any) -> tuple[str, int, int, int]:
-        """Encode one preparation/cache value into the Phase-12 packed blob format."""
+        """Encode one preparation/cache value into the packed binary-array blob format."""
         arrays: list[np.ndarray] = []
         packed = StudioAdapter._exposure_analysis_pack_value(value, arrays, {})
         descriptors = [
@@ -2162,6 +2614,8 @@ class StudioAdapter:
     @staticmethod
     def _exposure_analysis_cache_blob(
         analysis_cache: dict[Any, Any] | None,
+        *,
+        preparation_identity: str = "",
     ) -> tuple[str, int, int, int]:
         rows = []
         if isinstance(analysis_cache, dict):
@@ -2169,14 +2623,45 @@ class StudioAdapter:
                 if not isinstance(key, tuple):
                     continue
                 rows.append({"key": list(key), "value": value})
-        return StudioAdapter._exposure_analysis_value_blob(rows)
+        envelope = {
+            "schema": "fieldworkbench.exposure-analysis-results",
+            "version": EXPOSURE_ANALYSIS_RESULT_CACHE_VERSION,
+            "preparation_identity": str(preparation_identity or ""),
+            "rows": rows,
+        }
+        return StudioAdapter._exposure_analysis_value_blob(envelope)
 
     @staticmethod
     def _decode_exposure_analysis_payload(record: dict[str, Any]) -> tuple[dict[str, Any], dict[Any, Any]]:
         payload = StudioAdapter._decode_exposure_analysis_value_blob(record.get("payload_b64", ""))
-        rows = StudioAdapter._decode_exposure_analysis_value_blob(record.get("cache_b64", ""))
-        if not isinstance(payload, dict) or not isinstance(rows, list):
+        encoded_cache = StudioAdapter._decode_exposure_analysis_value_blob(record.get("cache_b64", ""))
+        if not isinstance(payload, dict):
             raise StudioOperationError("Saved exposure analysis payload is malformed.")
+        # Direct helper callers from older tests/tools may still provide the raw
+        # row list. Persisted v5 resources always use the identity-scoped envelope.
+        if isinstance(encoded_cache, list):
+            rows = encoded_cache
+        elif isinstance(encoded_cache, dict):
+            try:
+                cache_version = int(encoded_cache.get("version", 0))
+            except (TypeError, ValueError) as error:
+                raise StudioOperationError("Saved exposure analysis result-cache version is invalid.") from error
+            if (
+                str(encoded_cache.get("schema", ""))
+                != "fieldworkbench.exposure-analysis-results"
+                or cache_version != EXPOSURE_ANALYSIS_RESULT_CACHE_VERSION
+                or not isinstance(encoded_cache.get("rows"), list)
+            ):
+                raise StudioOperationError("Saved exposure analysis result cache is malformed.")
+            expected_identity = str(record.get("preparation_identity") or "")
+            stored_identity = str(encoded_cache.get("preparation_identity") or "")
+            if expected_identity and stored_identity != expected_identity:
+                raise StudioOperationError(
+                    "Saved exposure analysis result cache belongs to a different preparation."
+                )
+            rows = encoded_cache["rows"]
+        else:
+            raise StudioOperationError("Saved exposure analysis result cache is malformed.")
         cache: dict[Any, Any] = {}
         for row in rows:
             if not isinstance(row, dict) or not isinstance(row.get("key"), list):
@@ -2328,7 +2813,7 @@ class StudioAdapter:
         return result
 
     def _exposure_analysis_target_dependency(self, target_id: str) -> dict[str, Any]:
-        """Canonical LPBA40 target identity and resolved world placement."""
+        """Canonical regional target identity and resolved world placement."""
         target = self._mesh(str(target_id))
         position, rotation = self._mesh_world_transform(target)
         scale = self._mesh_scale_xyz(target)
@@ -2342,15 +2827,78 @@ class StudioAdapter:
             "scale_xyz": np.asarray(scale, dtype=float).tolist(),
         }
         if str(target.get("builtin_template", "")) != "sri24_brain":
-            settings = self.measurement_properties(str(target_id))
-            sampling = {"sampling_mode": settings["sampling_mode"]}
-            if settings["sampling_mode"] == "user_defined":
-                sampling["defined_points_mm"] = settings["defined_points_mm"]
+            # Authored surface regions are intrinsic analysis geometry. Scene role
+            # does not change the Exposure Analysis provider or geometry identity.
+            if self.supports_surface_region_volume(str(target_id)):
+                dependency.update(
+                    geometry=copy.deepcopy(target.get("mesh", {})),
+                    surface_region_analysis=self.surface_region_analysis_properties(str(target_id)),
+                )
             else:
-                sampling["quality"] = settings["quality"]
-            dependency.update(geometry=copy.deepcopy(target.get("mesh", {})),
-                              role=str(target.get("role", "")), sampling=sampling)
+                settings = self.measurement_properties(str(target_id))
+                sampling = {"sampling_mode": settings["sampling_mode"]}
+                if settings["sampling_mode"] == "user_defined":
+                    sampling["defined_points_mm"] = settings["defined_points_mm"]
+                else:
+                    sampling["quality"] = settings["quality"]
+                dependency.update(geometry=copy.deepcopy(target.get("mesh", {})),
+                                  role=str(target.get("role", "")), sampling=sampling)
         return dependency
+
+    def _exposure_analysis_region_source_dependency(
+        self, target_id: str
+    ) -> dict[str, Any]:
+        """Identify the provider that resolves an object into analysis regions."""
+        target = self.get_object(str(target_id))
+        if str(target.get("builtin_template", "") or "") == "sri24_brain":
+            return {
+                "schema_version": REGIONAL_ANALYSIS_SCHEMA_VERSION,
+                "kind": "atlas_volume",
+                "provider": "sri24_lpba40",
+                "provider_version": 1,
+                "region_set_key": "sri24.lpba40",
+                "sampling_mode": "atlas",
+            }
+        if (
+            not target.get("derived")
+            and self.supports_surface_region_volume(str(target_id))
+        ):
+            properties = self.surface_region_analysis_properties(str(target_id))
+            geometry = self.surface_region_geometry(str(target_id))
+            if geometry is None:
+                raise StudioOperationError(
+                    "This object no longer provides authored surface regions."
+                )
+            settings = SurfaceRegionVolumeSettings(depth_mm=properties["depth_mm"])
+            geometry_identity, request = surface_region_volume_cache_identity(
+                geometry, settings
+            )
+            return {
+                "schema_version": REGIONAL_ANALYSIS_SCHEMA_VERSION,
+                "kind": "surface_region_volume",
+                "provider": "surface_region_volume",
+                "provider_version": SURFACE_REGION_VOLUME_VERSION,
+                "region_set_key": f"surface_regions:{target_id}:inward_surface_volume",
+                "sampling_mode": "inward_voxel_shell",
+                "sampling_depth_mm": float(properties["depth_mm"]),
+                "geometry_cache_identity": geometry_identity,
+                "geometry_request": request,
+            }
+        if (
+            not target.get("derived")
+            and target.get("role") == "measurement"
+            and self.supports_measurement(str(target_id))
+        ):
+            settings = self.measurement_properties(str(target_id))
+            return {
+                "schema_version": REGIONAL_ANALYSIS_SCHEMA_VERSION,
+                "kind": "measurement_volume",
+                "provider": "measurement_volume",
+                "provider_version": 1,
+                "region_set_key": f"measurement:{target_id}",
+                "sampling_mode": str(settings["sampling_mode"]),
+            }
+        raise StudioOperationError("Choose an eligible regional analysis target.")
 
     def exposure_analysis_dependency_components(
         self, exposure_id: str, target_id: str
@@ -2404,9 +2952,83 @@ class StudioAdapter:
             "waveforms": waveforms,
             "target": self._exposure_analysis_target_dependency(str(target_id)),
             "coil_modeling_method": str(self.coil_modeling_method),
-            "analysis_target": ("brain_lpba40_v1" if self.get_object(str(target_id)).get("builtin_template") == "sri24_brain"
-                                else "measurement_volume_v1"),
+            "analysis_engine": "regional_analysis_v2",
+            "region_source": self._exposure_analysis_region_source_dependency(str(target_id)),
         }
+
+    @staticmethod
+    def _exposure_analysis_dependency_digest(value: Any) -> str:
+        encoded = json.dumps(
+            StudioAdapter._snapshot_json_value(value),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def analysis_region_geometry_cache_identity(self, target_id: str) -> str:
+        """Return the exposure-independent cache key for a target's region set."""
+        region_source = self._exposure_analysis_region_source_dependency(str(target_id))
+        native_identity = str(region_source.get("geometry_cache_identity") or "").strip()
+        if len(native_identity) == 64:
+            try:
+                int(native_identity, 16)
+            except ValueError:
+                native_identity = ""
+        else:
+            native_identity = ""
+        if native_identity:
+            return native_identity
+        components = {
+            "cache_layer": "regional-geometry-v1",
+            "regional_schema_version": REGIONAL_ANALYSIS_SCHEMA_VERSION,
+            "target": self._exposure_analysis_target_dependency(str(target_id)),
+            "region_source": region_source,
+        }
+        return self._exposure_analysis_dependency_digest(components)
+
+    def exposure_analysis_cache_identities(
+        self, exposure_id: str, target_id: str
+    ) -> dict[str, str]:
+        """Return independent geometry, exposure-data and preparation identities.
+
+        Geometry depends only on the target/provider inputs. Exposure data depends
+        on the physical source/model/timeline inputs but not the target geometry.
+        Preparation combines both layers. Derived page settings remain scoped by
+        their existing request keys beneath this immutable preparation identity.
+        """
+        dependency = self.exposure_analysis_dependency_components(
+            str(exposure_id), str(target_id)
+        )
+        exposure_components = {
+            key: copy.deepcopy(value)
+            for key, value in dependency.items()
+            if key not in {"target", "region_source"}
+        }
+        exposure_components["cache_layer"] = "exposure-data-v1"
+        geometry_identity = self.analysis_region_geometry_cache_identity(str(target_id))
+        exposure_identity = self._exposure_analysis_dependency_digest(exposure_components)
+        preparation_identity = self._exposure_analysis_dependency_digest({
+            "cache_layer": "regional-preparation-v1",
+            "analysis_engine": str(dependency.get("analysis_engine") or "regional_analysis_v2"),
+            "regional_schema_version": REGIONAL_ANALYSIS_SCHEMA_VERSION,
+            "geometry_identity": geometry_identity,
+            "exposure_data_identity": exposure_identity,
+        })
+        return {
+            "geometry_identity": geometry_identity,
+            "exposure_data_identity": exposure_identity,
+            "preparation_identity": preparation_identity,
+        }
+
+    def exposure_analysis_region_geometry_signature(
+        self, exposure_id: str, target_id: str
+    ) -> str:
+        # ``exposure_id`` is accepted for API symmetry with the other Exposure
+        # Analysis identity helpers; geometry itself is deliberately exposure-independent.
+        _ = exposure_id
+        return self.analysis_region_geometry_cache_identity(str(target_id))
 
     def exposure_analysis_dependency_signature(
         self, exposure_id: str, target_id: str
@@ -2422,14 +3044,7 @@ class StudioAdapter:
         dependency = self.exposure_analysis_dependency_components(
             str(exposure_id), str(target_id)
         )
-        encoded = json.dumps(
-            self._snapshot_json_value(dependency),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+        return self._exposure_analysis_dependency_digest(dependency)
 
     def _exposure_analysis_status(self, record: dict[str, Any]) -> str:
         expected = str(record.get("source_signature") or "")
@@ -2466,7 +3081,7 @@ class StudioAdapter:
 
         Preview/Full selection and saved-basis provenance belonged to the retired
         Exposure Analysis workflow. They are deliberately stripped at the
-        persistence boundary so newly written version-3 caches cannot accumulate
+        persistence boundary so newly written v5 caches cannot accumulate
         those legacy fields even when a caller supplies an older-shaped payload.
         """
         if not isinstance(payload, dict):
@@ -2485,6 +3100,49 @@ class StudioAdapter:
             "reused_analysis_name",
         ):
             context.pop(key, None)
+        context["analysis_engine"] = "regional_analysis_v2"
+        context["regional_schema_version"] = REGIONAL_ANALYSIS_SCHEMA_VERSION
+        if not isinstance(context.get("region_set"), dict):
+            target_kind = str(context.get("target_kind") or "regional")
+            if target_kind == "brain_lpba40":
+                region_set = {
+                    "key": "sri24.lpba40",
+                    "name": "LPBA40 brain regions",
+                    "kind": "atlas_volume",
+                    "sampling_mode": "atlas",
+                    "provider": "sri24_lpba40",
+                    "provider_version": 1,
+                }
+            elif target_kind == "measurement_volume":
+                target_id = str(context.get("target_id") or "")
+                region_set = {
+                    "key": f"measurement:{target_id}",
+                    "name": str(context.get("target_name") or "Measurement volume"),
+                    "kind": "measurement_volume",
+                    "sampling_mode": str(context.get("sampling_mode") or "generated"),
+                    "provider": "measurement_volume",
+                    "provider_version": 1,
+                }
+            elif target_kind == "surface_region_volume":
+                target_id = str(context.get("target_id") or "")
+                region_set = {
+                    "key": f"surface_regions:{target_id}:inward_surface_volume",
+                    "name": str(context.get("target_name") or "Surface regions"),
+                    "kind": "surface_region_volume",
+                    "sampling_mode": "inward_voxel_shell",
+                    "provider": "surface_region_volume",
+                    "provider_version": SURFACE_REGION_VOLUME_VERSION,
+                }
+            else:
+                region_set = {
+                    "key": str(context.get("target_id") or "regional"),
+                    "name": str(context.get("target_name") or "Analysis regions"),
+                    "kind": target_kind,
+                    "sampling_mode": str(context.get("sampling_mode") or "provider"),
+                    "provider": target_kind,
+                    "provider_version": 1,
+                }
+            context["region_set"] = region_set
         return normalized
 
     @staticmethod
@@ -2518,12 +3176,39 @@ class StudioAdapter:
         source_signature = str(context.get("dependency_signature") or "")
         if not source_signature:
             source_signature = self.exposure_analysis_dependency_signature(exposure_id, target_id)
+        geometry_identity = str(context.get("geometry_cache_identity") or "").strip()
+        exposure_data_identity = str(context.get("exposure_data_identity") or "").strip()
+        preparation_identity = str(context.get("preparation_identity") or "").strip()
+        if not geometry_identity:
+            geometry_identity = self._exposure_analysis_dependency_digest({
+                "cache_layer": "regional-geometry-v1",
+                "target_id": target_id,
+                "region_set": copy.deepcopy(context.get("region_set") or {}),
+                "dependency_signature": source_signature,
+            })
+        if not exposure_data_identity:
+            exposure_data_identity = self._exposure_analysis_dependency_digest({
+                "cache_layer": "exposure-data-v1",
+                "exposure_id": exposure_id,
+                "dependency_signature": source_signature,
+            })
+        if not preparation_identity:
+            preparation_identity = self._exposure_analysis_dependency_digest({
+                "cache_layer": "regional-preparation-v1",
+                "geometry_identity": geometry_identity,
+                "exposure_data_identity": exposure_data_identity,
+                "analysis_engine": str(context.get("analysis_engine") or "regional_analysis_v2"),
+                "regional_schema_version": REGIONAL_ANALYSIS_SCHEMA_VERSION,
+            })
         requested = str(name or self.default_exposure_analysis_name(payload)).strip()
         if not requested:
             raise StudioOperationError("Exposure analysis name cannot be blank.")
         payload_copy = payload
         payload_context = payload_copy["exposure_analysis_context"]
         payload_context["dependency_signature"] = source_signature
+        payload_context["geometry_cache_identity"] = geometry_identity
+        payload_context["exposure_data_identity"] = exposure_data_identity
+        payload_context["preparation_identity"] = preparation_identity
         (
             payload_b64,
             preparation_bytes,
@@ -2535,7 +3220,9 @@ class StudioAdapter:
             cache_bytes,
             cache_compressed_bytes,
             _cache_array_count,
-        ) = self._exposure_analysis_cache_blob(analysis_cache)
+        ) = self._exposure_analysis_cache_blob(
+            analysis_cache, preparation_identity=preparation_identity
+        )
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         analysis_id = self._new_exposure_analysis_id()
         cache_summary = self._exposure_analysis_cache_summary(analysis_cache)
@@ -2555,11 +3242,20 @@ class StudioAdapter:
             "exposure_name": str(context.get("exposure_name") or "Exposure"),
             "target_id": target_id,
             "target_name": str(context.get("target_name") or "Analysis target"),
-            "target_kind": str(context.get("target_kind") or "brain_lpba40"),
-            "atlas": str(context.get("atlas") or ("LPBA40" if context.get("target_kind", "brain_lpba40") == "brain_lpba40" else "")),
+            "target_kind": str(context.get("target_kind") or "regional"),
+            "atlas": str(context.get("atlas") or ("LPBA40" if context.get("target_kind") == "brain_lpba40" else "")),
+            "analysis_engine": str(context.get("analysis_engine") or "regional_analysis_v2"),
+            "regional_schema_version": int(context.get("regional_schema_version", REGIONAL_ANALYSIS_SCHEMA_VERSION) or REGIONAL_ANALYSIS_SCHEMA_VERSION),
+            "region_set_kind": str((context.get("region_set") or {}).get("kind") if isinstance(context.get("region_set"), dict) else context.get("target_kind") or "regional"),
+            "region_set_name": str((context.get("region_set") or {}).get("name") if isinstance(context.get("region_set"), dict) else context.get("target_name") or "Analysis regions"),
             "sample_count": int(context.get("sample_count", 0) or 0),
             "physical_duration_s": float(context.get("physical_duration_s", 0.0) or 0.0),
             "source_signature": source_signature,
+            "geometry_cache_identity": geometry_identity,
+            "region_geometry_content_identity": str(context.get("region_geometry_content_identity") or ""),
+            "exposure_data_identity": exposure_data_identity,
+            "preparation_identity": preparation_identity,
+            "result_cache_schema_version": EXPOSURE_ANALYSIS_RESULT_CACHE_VERSION,
             **cache_summary,
             "preparation_processing_time_s": preparation_time,
             "payload_codec": EXPOSURE_ANALYSIS_BLOB_CODEC,
@@ -2602,7 +3298,10 @@ class StudioAdapter:
             cache_bytes,
             cache_compressed_bytes,
             _cache_array_count,
-        ) = self._exposure_analysis_cache_blob(analysis_cache)
+        ) = self._exposure_analysis_cache_blob(
+            analysis_cache,
+            preparation_identity=str(record.get("preparation_identity") or ""),
+        )
         record["cache_codec"] = EXPOSURE_ANALYSIS_BLOB_CODEC
         record["cache_b64"] = cache_b64
         record["cache_sha256"] = hashlib.sha256(cache_b64.encode("ascii")).hexdigest()
@@ -5097,6 +5796,11 @@ class StudioAdapter:
                         continue
                     record.pop("payload_b64", None)
                     record.pop("cache_b64", None)
+            geometry_caches = metadata.get("regional_geometry_caches")
+            if isinstance(geometry_caches, list):
+                for record in geometry_caches:
+                    if isinstance(record, dict):
+                        record.pop("blob_b64", None)
         return json.dumps(document, sort_keys=True, separators=(",", ":"))
 
     def list_objects(self) -> list[dict[str, Any]]:
@@ -5996,6 +6700,230 @@ class StudioAdapter:
             "drc_exclusion": "DRC exclusion",
         }
         return result
+
+    def surface_region_analysis_properties(self, object_id: str) -> dict[str, Any]:
+        """Return user-facing near-surface analysis settings for a region-aware mesh.
+
+        The sampling depth is stored on the geometry object so saved Exposure Analysis
+        preparations can be compared against the current project without needing hidden
+        per-window state.  Older projects simply inherit the provider default.
+        """
+        if self.surface_region_properties(str(object_id)) is None:
+            raise StudioOperationError(
+                "This object does not provide authored surface regions for exposure analysis."
+            )
+        mesh = self._mesh(str(object_id))
+        raw = mesh.get("surface_region_analysis", {})
+        raw = raw if isinstance(raw, dict) else {}
+        try:
+            depth_mm = float(raw.get("depth_mm", DEFAULT_SURFACE_DEPTH_MM))
+        except (TypeError, ValueError) as error:
+            raise StudioOperationError("Surface-region sampling depth must be numeric.") from error
+        if (
+            not math.isfinite(depth_mm)
+            or not MINIMUM_SURFACE_DEPTH_MM <= depth_mm <= MAXIMUM_SURFACE_DEPTH_MM
+        ):
+            raise StudioOperationError(
+                "Surface-region sampling depth must be between "
+                f"{MINIMUM_SURFACE_DEPTH_MM:g} and {MAXIMUM_SURFACE_DEPTH_MM:g} mm."
+            )
+        return {"depth_mm": depth_mm}
+
+    def supports_surface_region_volume(self, object_id: str) -> bool:
+        """Return whether authored surface regions can define an inward volume shell."""
+        if not self.is_geometry(str(object_id)):
+            return False
+        try:
+            region_map = self.surface_region_properties(str(object_id))
+            if region_map is None:
+                return False
+            validation = region_map.get("validation", {})
+            if isinstance(validation, dict) and int(validation.get("overlap_count", 0) or 0) > 0:
+                return False
+            return bool(self.geometry_capabilities(str(object_id))["measurement"])
+        except Exception:
+            return False
+
+    def surface_region_geometry(self, object_id: str) -> SurfaceRegionGeometry | None:
+        """Prepare world-space region-aware geometry for one triangle mesh.
+
+        This is the provider boundary used by derived spatial analyses.  Authored
+        face identity comes from :meth:`surface_region_properties`; world-space
+        geometry comes from the same transformed mesh used by rendering/DRC.
+        The returned provider is intentionally transient and can be rebuilt after
+        transforms or region metadata change rather than becoming scene state.
+        """
+        region_map = self.surface_region_properties(object_id)
+        if region_map is None:
+            return None
+        mesh = self._mesh(object_id)
+        vertices, faces = self._mesh_world_vertices_faces(mesh)
+        try:
+            return SurfaceRegionGeometry(
+                vertices,
+                faces,
+                region_map,
+                source_key=f"surface_regions:{object_id}",
+                source_name=f"{str(mesh.get('label') or object_id)} surface regions",
+            )
+        except SurfaceRegionGeometryError as error:
+            raise StudioOperationError(
+                f"Surface-region geometry for {str(mesh.get('label') or object_id)!r} "
+                f"could not be prepared: {error}"
+            ) from error
+
+    def analysis_region_scene(self, object_id: str):
+        """Return renderable region geometry for one Exposure Analysis target.
+
+        The returned object is intentionally UI-toolkit agnostic and is shared by
+        the compact analysis preview and the modeless Region Viewer.  Numerical
+        sampling remains owned by the corresponding regional analysis provider.
+        """
+        from .analysis_region_scene import (
+            AnalysisRegionSceneError, resolve_analysis_region_scene,
+        )
+
+        try:
+            return resolve_analysis_region_scene(self, str(object_id))
+        except AnalysisRegionSceneError as error:
+            raise StudioOperationError(str(error)) from error
+
+    def analysis_target_preview_figure(self, object_id: str) -> dict[str, Any]:
+        """Return a clean target-only figure using the Model Editor trace path.
+
+        Exposure Analysis compact previews are context views, not alternate scene
+        renderers.  They therefore reuse ``_geometry_mesh_traces`` -- the exact
+        helper used by :meth:`base_figure` -- then apply only preview presentation
+        cleanup (target-only, no legend/grid, tight margins).  The target is shown
+        even when hidden in the live scene because choosing an analysis target
+        should not depend on the Scene View visibility toggle.
+        """
+        mesh = self._mesh(str(object_id))
+        traces = self._geometry_mesh_traces(mesh, respect_visibility=False)
+        if not traces:
+            raise StudioOperationError(
+                f"No display geometry is available for {mesh.get('label', object_id)!r}."
+            )
+        figure = figure_in_mm({"data": copy.deepcopy(traces)}, source_length_unit="m")
+        data = figure.setdefault("data", [])
+        self._assign_trace_uids(
+            data,
+            namespace="field-workbench:analysis-target-preview",
+        )
+        for trace in data:
+            trace["showlegend"] = False
+            trace["hoverinfo"] = "skip"
+            trace["hovertemplate"] = None
+            metadata = trace.get("meta")
+            metadata = dict(metadata) if isinstance(metadata, dict) else {}
+            metadata["field_workbench_ignore_picking"] = True
+            metadata["field_workbench_analysis_target_preview"] = True
+            trace["meta"] = metadata
+
+        hidden_axis = {
+            "visible": False,
+            "showgrid": False,
+            "showbackground": False,
+            "showspikes": False,
+            "showticklabels": False,
+            "zeroline": False,
+            "ticks": "",
+            "title": {"text": ""},
+        }
+        figure["layout"] = {
+            "margin": {"l": 0, "r": 0, "t": 0, "b": 0},
+            "showlegend": False,
+            "hovermode": False,
+            "paper_bgcolor": "#ffffff",
+            "meta": {
+                "field_workbench_hide_3d_axes": True,
+                "field_workbench_analysis_target_preview": True,
+            },
+            "scene": {
+                "aspectmode": "data",
+                "dragmode": "orbit",
+                "bgcolor": "#ffffff",
+                "xaxis": dict(hidden_axis),
+                "yaxis": dict(hidden_axis),
+                "zaxis": dict(hidden_axis),
+                "camera": {"projection": {"type": "perspective"}},
+                "uirevision": f"field-workbench-analysis-target:{object_id}",
+            },
+            "uirevision": f"field-workbench-analysis-target:{object_id}",
+        }
+        return figure
+
+    def surface_region_volume_set(
+        self,
+        object_id: str,
+        *,
+        depth_mm: float | None = None,
+        maximum_samples_per_region: int = 900,
+        target_source_voxels: int = 60_000,
+        maximum_lattice_cells: int = 8_000_000,
+        grid_spacing_mm: float | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ):
+        """Resolve one region-aware mesh into inward volumetric analysis regions.
+
+        The returned :class:`AnalysisRegionSet` is derived from the current
+        world-space mesh, authored face map, and sampling settings.  A stable
+        exposure-independent request identity is checked against the shared
+        project geometry cache before the shell lattice is regenerated. Object
+        transforms, region metadata, or sampling-setting changes therefore
+        produce a distinct cache entry rather than reusing stale membership.
+        """
+        geometry = self.surface_region_geometry(object_id)
+        if geometry is None:
+            raise StudioOperationError(
+                "This object does not provide authored surface regions for volumetric analysis."
+            )
+        if depth_mm is None:
+            depth_mm = self.surface_region_analysis_properties(str(object_id))["depth_mm"]
+        settings = SurfaceRegionVolumeSettings(
+            depth_mm=depth_mm,
+            maximum_samples_per_region=maximum_samples_per_region,
+            target_source_voxels=target_source_voxels,
+            maximum_lattice_cells=maximum_lattice_cells,
+            grid_spacing_mm=grid_spacing_mm,
+        )
+        try:
+            cache_identity, _cache_request = surface_region_volume_cache_identity(
+                geometry, settings
+            )
+            cached = self.cached_analysis_region_set(cache_identity)
+            if cached is not None:
+                if callable(progress_callback):
+                    progress_callback({
+                        "stage": "Surface-region volume samples ready",
+                        "completed": 1,
+                        "total": 1,
+                        "unit": "geometry work",
+                        "detail": (
+                            f"Reused {cached.samples.point_count:,} retained field samples "
+                            "from the shared geometry cache."
+                        ),
+                    })
+                return cached
+            result = build_surface_region_volume_set(
+                geometry,
+                settings,
+                progress_callback=progress_callback,
+                cancel_requested=cancel_requested,
+            )
+            self.cache_analysis_region_set(
+                cache_identity,
+                result,
+                target_id=str(object_id),
+                target_name=str(self._mesh(object_id).get("label") or object_id),
+            )
+            return result
+        except SurfaceRegionVolumeError as error:
+            raise StudioOperationError(
+                f"Surface-region volume for {str(self._mesh(object_id).get('label') or object_id)!r} "
+                f"could not be prepared: {error}"
+            ) from error
 
     def _geometry_drc_enabled(self, mesh: dict[str, Any]) -> bool:
         """Return whether this geometry participates in DRC.
@@ -9420,6 +10348,8 @@ class StudioAdapter:
         contour_labels: bool = False,
         show_grid: bool = True,
         show_object_outlines: bool = True,
+        show_sensor_placements: bool = False,
+        show_well_rims: bool = False,
         outline_object_ids: list[str] | tuple[str, ...] | set[str] | None = None,
         active_coil_ids: list[str] | tuple[str, ...] | set[str] | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -9560,15 +10490,17 @@ class StudioAdapter:
                 )
             )
 
-        if show_object_outlines:
-            figure.setdefault("data", []).extend(
-                self._scene_cross_section_traces_2d(
-                    plane=plane_name,
-                    offset_mm=float(offset_mm),
-                    span_mm=float(span_mm),
-                    object_ids=outline_object_ids,
-                )
+        figure.setdefault("data", []).extend(
+            self._field_map_scene_traces_2d(
+                plane=plane_name,
+                offset_mm=float(offset_mm),
+                span_mm=float(span_mm),
+                object_ids=outline_object_ids,
+                show_object_outlines=show_object_outlines,
+                show_sensor_placements=show_sensor_placements,
+                show_well_rims=show_well_rims,
             )
+        )
 
         axis_labels = {
             "xy": ("X (LR, mm)", "Y (AP, mm)"),
@@ -9642,6 +10574,121 @@ class StudioAdapter:
             }
         )
         return figure
+
+    def _field_map_scene_traces_2d(
+        self,
+        *,
+        plane: str,
+        offset_mm: float,
+        span_mm: float,
+        object_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+        show_object_outlines: bool = True,
+        show_sensor_placements: bool = False,
+        show_well_rims: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Combine slice intersections with optional projected scene features."""
+        traces = (
+            self._scene_cross_section_traces_2d(
+                plane=plane, offset_mm=offset_mm, span_mm=span_mm, object_ids=object_ids
+            )
+            if show_object_outlines
+            else []
+        )
+        if not (show_sensor_placements or show_well_rims):
+            return traces
+
+        horizontal, vertical, normal = {"xy": (0, 1, 2), "xz": (0, 2, 1), "yz": (1, 2, 0)}[plane]
+        if show_well_rims:
+            selected = None if object_ids is None else set(object_ids)
+            for mesh in self.geometry:
+                visible = (
+                    self._geometry_effectively_visible(mesh)
+                    if selected is None
+                    else mesh["id"] in selected
+                )
+                if not visible:
+                    continue
+                rim_traces = self._well_plate_overlay_traces(mesh)
+                if not rim_traces:
+                    continue
+                rim = rim_traces[0]
+                coords = [rim[axis] for axis in "xyz"]
+                projected = list(zip(coords[horizontal], coords[vertical], strict=True))
+                segments = []
+                for first, second in zip(projected, projected[1:]):
+                    if first[0] is None or second[0] is None:
+                        continue
+                    clipped = self._clip_segment_to_square_2d(first, second, span_mm / 2000)
+                    if clipped is not None:
+                        segments.append(clipped)
+                outline = self._cross_section_trace_from_segments(
+                    segments,
+                    label=rim["name"],
+                    colour=rim["line"]["color"],
+                    object_id=mesh["id"],
+                )
+                if outline:
+                    outline.update(
+                        name=rim["name"],
+                        line=rim["line"],
+                        hoverinfo="skip",
+                        meta=rim["meta"],
+                    )
+                    outline.pop("hovertemplate")
+                    traces.append(outline)
+
+        if show_sensor_placements:
+            for obj in self.list_objects():
+                object_id = obj["id"]
+                object_type = obj["type"]
+                if object_type not in {"Sensor", MAGNETOMETER_PROBE_TYPE, "workbench.Mesh"}:
+                    continue
+                if not self._object_effectively_visible(object_id):
+                    continue
+                label = str(obj.get("label", object_id))
+                if object_type == "Sensor":
+                    points = self._sensor_sample_geometry(object_id)[1]
+                    labels = [label] * len(points)
+                elif object_type == MAGNETOMETER_PROBE_TYPE:
+                    samples = self.magnetometer_probe_sample_geometry(object_id)
+                    points = [sample["world_position_m"] for sample in samples]
+                    labels = [f"{label} — {sample['name']}" for sample in samples]
+                elif object_type == "workbench.Mesh" and self.supports_measurement(object_id):
+                    settings = self.measurement_properties(object_id)
+                    if settings["sampling_mode"] != "user_defined" or not settings["defined_points_mm"]:
+                        continue
+                    points = self.measurement_sample_points(object_id)["world_points_m"]
+                    labels = [f"{label} — sample {index + 1}" for index in range(len(points))]
+                    well = obj.get("well_plate") or {}
+                    well_points = np.asarray(well.get("sample_points_mm", []))
+                    well_labels = well.get("well_labels", [])
+                    if len(well_labels) == len(points) and np.array_equal(
+                        well_points, settings["defined_points_mm"]
+                    ):
+                        labels = [f"{label} — {name}" for name in well_labels]
+                else:
+                    continue
+                xyz = np.asarray(points, dtype=float).reshape(-1, 3) * 1000
+                x, y = xyz[:, horizontal], xyz[:, vertical]
+                inside = (
+                    np.isfinite(xyz).all(axis=1)
+                    & (np.abs(x) <= span_mm / 2)
+                    & (np.abs(y) <= span_mm / 2)
+                )
+                if not inside.any():
+                    continue
+                traces.append({
+                    "type": "scatter",
+                    "mode": "markers",
+                    "x": x[inside].tolist(),
+                    "y": y[inside].tolist(),
+                    "text": [name for name, keep in zip(labels, inside, strict=True) if keep],
+                    "customdata": (xyz[inside, normal] - offset_mm).tolist(),
+                    "hovertemplate": "%{text}<br>Offset from slice: %{customdata:+.3g} mm<extra></extra>",
+                    "marker": {"size": 6, "color": "#f8fafc", "line": {"width": 1, "color": "#111827"}},
+                    "showlegend": False,
+                })
+        return traces
 
     def field_map_outline_objects(self) -> list[dict[str, Any]]:
         """Return scene objects that can contribute a 2D map cross-section.
@@ -14326,7 +15373,7 @@ class StudioAdapter:
             scene = json.load(handle)
         self.replace_scene(scene)
 
-    def save_file(self, path: str | Path) -> Path:
+    def save_file(self, path: str | Path, *, overwrite: bool = True) -> Path:
         file_path = Path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(self.document(), indent=2, ensure_ascii=False) + "\n"
@@ -14338,7 +15385,11 @@ class StudioAdapter:
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary_name, file_path)
+            if overwrite:
+                os.replace(temporary_name, file_path)
+            else:
+                os.link(temporary_name, file_path)
+                os.unlink(temporary_name)
         except Exception:
             try:
                 os.unlink(temporary_name)
@@ -21086,8 +22137,8 @@ class StudioAdapter:
         excitation variable, so when current and structural freedoms are both free
         the optimizer solves the bounded current sub-problem *inside every geometry
         candidate* instead of wasting outer-search dimensions on random current
-        combinations. Optimizer 2.2 applies the same cheap-first policy to every
-        automatic structural search. Broad exploration uses the Centreline model, a
+        combinations. Optimizer 2.3 applies staged search to automatic structural
+        optimization. Broad reconnaissance uses the Centreline model, a
         deterministic reduced target sample, and reusable Bx/By/Bz field stamps whenever
         the permitted transform is stamp-compatible. One structural freedom gets a cheap
         full-range sweep; two or more also receive target/axis alignment, known relations,
@@ -21095,10 +22146,11 @@ class StudioAdapter:
         coverage, and adaptive basin subdivision. DRC is then overlaid as geometry-only
         feasibility/repair work, preserving unrelated fixed source-scene DRC violations as
         an explicit baseline rather than making every candidate impossible. Only a small
-        diverse finalist set is promoted to the full
+        diverse DRC-feasible basin set is then eligible for capable-physics refinement.
+        Capability-gap freedoms and their declared coupled coordinates can move under a
+        distributed-winding model before a small finalist set is promoted to the full
         target sample, requested coil representation, full DRC, and electrical limits.
-        After a successful map there is no exploratory full-model sweep, active-set search,
-        boundary convergence, or local full-model adaptation. If cached/design-map scouting fails,
+        If cached/design-map scouting fails,
         Workbench retries with a plain reduced-target Centreline map; the older expensive search
         path is retained only for explicit legacy/programmatic jobs. The live scene is never edited
         during the search.
@@ -21521,30 +22573,34 @@ class StudioAdapter:
             snapshot_magnitude_tolerance_pct = float(raw_settings.get("snapshot_magnitude_tolerance_pct", 5.0))
             snapshot_direction_tolerance_deg = float(raw_settings.get("snapshot_direction_tolerance_deg", 3.0))
             finalist_count = int(raw_settings.get("finalist_count", 8))
-            explicit_budget = raw_settings.get("evaluation_budget")
+            explicit_budget_raw = raw_settings.get("evaluation_budget")
             automatic_convergence = bool(
-                raw_settings.get("automatic_convergence", explicit_budget is None)
+                raw_settings.get("automatic_convergence", explicit_budget_raw is None)
             )
-            if explicit_budget is not None:
-                # Kept for saved jobs/tests and deliberate programmatic caps. The
-                # desktop wizard no longer exposes a quality/budget setting.
-                budget = int(explicit_budget)
-            else:
-                # Optimizer 2.2 is cheap-first at *every* structural dimensionality.
-                # Broad exploration belongs to the reduced-target Centreline/vector-cache
-                # map; the authoritative user-selected coil model is reserved for the
-                # final reality check of a small, diverse finalist set.  This value is
-                # therefore an exact/full-model *vetting ceiling*, not a search budget.
-                # Saved/programmatic jobs can still provide an explicit evaluation_budget
-                # to request the legacy larger exact allowance.
-                requested_finalists = max(1, int(finalist_count))
-                if search_effort == "fast":
-                    default_cap = min(8, max(6, requested_finalists))
-                elif search_effort == "balanced":
-                    default_cap = min(14, max(10, requested_finalists + 4))
-                else:
-                    default_cap = min(24, max(14, 2 * requested_finalists + 2))
-                budget = int(raw_settings.get("max_evaluations", default_cap))
+            explicit_budget = (
+                int(explicit_budget_raw) if explicit_budget_raw is not None else None
+            )
+            max_evaluations_raw = raw_settings.get("max_evaluations")
+            max_evaluations_override = (
+                int(max_evaluations_raw) if max_evaluations_raw is not None else None
+            )
+            # Optimizer 2.3 separates the three very different jobs that used to
+            # share the word "budget".  This parent allowance is specifically the
+            # requested-model/legacy exact ceiling.  Cheap reconnaissance receives
+            # its own independent budget below, while capable-physics refinement
+            # receives a distinct allowance consumed by the Phase-3 executor.
+            authoritative_validation_budget, authoritative_budget_source = (
+                optimizer_authoritative_validation_ceiling(
+                    search_effort=search_effort,
+                    finalist_count=finalist_count,
+                    explicit_evaluation_budget=explicit_budget,
+                    max_evaluations=max_evaluations_override,
+                )
+            )
+            # ``budget`` remains a compatibility alias for legacy/non-multifidelity
+            # search branches during the staged refactor.  Cheap-first code below
+            # uses the explicit stage plan for reconnaissance/final validation.
+            budget = int(authoritative_validation_budget)
             random_seed = int(raw_settings.get("random_seed", 20260816))
             requested_current_steps = int(raw_settings.get("current_steps", 161))
             worker_count = normalize_optimizer_worker_count(
@@ -21601,6 +22657,128 @@ class StudioAdapter:
 
         current_variables = [item for item in variables if str(item.get("kind")) == "current"]
         structural_variables = [item for item in variables if str(item.get("kind")) != "current"]
+
+        # Optimizer 2.4 directional closure is a separate correctness contract
+        # from model/fidelity observability. Every bounded structural freedom starts
+        # unresolved (unless it has no actual search span). Phase 2 now also records
+        # an executable bounded-search spec for each freedom; Phase 3 wires that
+        # primitive into the scout funnel and later phases make closure mandatory.
+        directional_closure = optimizer_directional_closure_plan(structural_variables)
+        directional_closure["search_specs"] = {
+            str(variable.get("id", "")): optimizer_directional_search_spec(variable)
+            for variable in structural_variables
+            if str(variable.get("id", ""))
+        }
+
+        # Optimizer capability contract.  Keep per-freedom observability separate
+        # from search policy so Fast/Balanced/Full can evolve without accumulating
+        # one-off exclusions (Optimizer 2.2 previously special-cased axial winding
+        # length directly inside the Centreline scout).  Phase 1 records the facts
+        # and uses them to preserve the existing scout behavior; the effort-policy
+        # layer consumes the same table to require capable physical refinement.
+        freedom_coverage = optimizer_freedom_coverage(
+            variables,
+            requested_model=str(self.coil_modeling_method),
+            scout_model="centreline",
+        )
+        # Source context can narrow a conservative generic descriptor.  In
+        # particular, turn count has no winding-distribution magnetic effect when
+        # every participating coil has physical winding geometry disabled.  Apply
+        # that fact before the effort/model resolver decides whether a distributed
+        # physical-search floor is mandatory.
+        optimizer_model_source_ids = list(dict.fromkeys(
+            [str(object_id) for object_id in participant_ids if str(object_id)]
+            + [
+                str(object_id)
+                for variable in variables
+                for object_id in list(variable.get("coil_ids", []) or [])
+                if str(object_id)
+            ]
+        ))
+        optimizer_model_source_support = self._optimizer_model_source_support(
+            optimizer_model_source_ids
+        )
+        freedom_coverage = optimizer_apply_source_capability_context(
+            variables,
+            freedom_coverage,
+            optimizer_model_source_support,
+            scout_model="centreline",
+            requested_model=str(self.coil_modeling_method),
+        )
+        freedom_coverage_by_id = {
+            str(item.get("id", "")): item
+            for item in freedom_coverage
+            if str(item.get("id", ""))
+        }
+        fidelity_capability_plan = optimizer_capability_summary(
+            freedom_coverage,
+            requested_model=str(self.coil_modeling_method),
+            scout_model="centreline",
+        )
+
+        # Phase 5 resolves the Preferences model before reconnaissance begins.
+        # Generic field calculations are allowed to fall back per coil, but an
+        # optimizer must not silently erase a tuned freedom and still describe the
+        # requested model as authoritative.  The resolver is source-aware (for
+        # example Current Sheet presently requires Polyline coils) and gives Auto a
+        # deterministic capability floor for movable refinement.
+        optimizer_model_policy = optimizer_resolve_model_policy(
+            requested_model=str(self.coil_modeling_method),
+            search_effort=search_effort,
+            variables=variables,
+            structural_variables=structural_variables,
+            freedom_coverage=freedom_coverage,
+            source_support=optimizer_model_source_support,
+            participant_coil_ids=participant_ids,
+        )
+        fidelity_capability_plan["model_policy"] = copy.deepcopy(optimizer_model_policy)
+        if not bool(optimizer_model_policy.get("compatible", False)):
+            issue_lines: list[str] = []
+            for issue in list(optimizer_model_policy.get("blocking_issues", []) or []):
+                message = str(issue.get("message", "Optimizer model policy is incompatible."))
+                details = list(issue.get("details", []) or [])
+                if details:
+                    detail_text = "; ".join(
+                        f"{item.get('label') or item.get('id')}: {item.get('reason')}"
+                        for item in details
+                    )
+                    message += " " + detail_text
+                issue_lines.append(message)
+            raise StudioOperationError(
+                "Optimizer model policy cannot satisfy the selected freedoms and effort mode. "
+                + " ".join(issue_lines)
+            )
+
+        resolved_physical_model = optimizer_model_policy.get("physical_search_model")
+        active_model_policy_ids = set(map(
+            str, optimizer_model_policy.get("physical_search_active_variable_ids", []) or []
+        ))
+        for coverage_entry in freedom_coverage:
+            variable_id = str(coverage_entry.get("id", ""))
+            physical_entry = coverage_entry.setdefault("physical_search", {})
+            authoritative_entry = coverage_entry.setdefault("authoritative", {})
+            physical_entry["policy_model"] = (
+                str(resolved_physical_model) if resolved_physical_model is not None else None
+            )
+            physical_entry["policy_reason"] = str(
+                optimizer_model_policy.get("physical_search_reason", "")
+            )
+            physical_entry["policy_active"] = variable_id in active_model_policy_ids
+            authoritative_entry["resolved_model"] = str(
+                optimizer_model_policy.get("authoritative_model", self.coil_modeling_method)
+            )
+            authoritative_entry["policy_mode"] = str(
+                optimizer_model_policy.get("authoritative_mode", "fixed_requested_model")
+            )
+            authoritative_entry["fallback_allowed"] = bool(
+                optimizer_model_policy.get("authoritative_fallback_allowed", False)
+            )
+        fidelity_capability_plan = optimizer_capability_summary(
+            freedom_coverage,
+            requested_model=str(self.coil_modeling_method),
+            scout_model="centreline",
+        ) | {"model_policy": copy.deepcopy(optimizer_model_policy)}
+
         structurally_affected_ids = {
             str(object_id)
             for variable in structural_variables
@@ -21618,8 +22796,42 @@ class StudioAdapter:
         mixed_current_search = bool(current_variables) and bool(structural_variables)
         total_dimensions = len(variables)
         outer_dimensions = len(structural_variables)
-        # Optimizer 2.2 policy: any structural search maps with simplified physics
-        # first, then spends authoritative full-model work only on finalist vetting.
+
+        # Optimizer 2.3 establishes the three independent execution/budget lanes before
+        # any stage runs.  The initial scout dimension count is provisional; once
+        # capability filtering has removed Centreline-invisible coordinates below,
+        # the plan is rebuilt with the real reconnaissance dimensionality.
+        search_stage_plan = optimizer_search_stage_plan(
+            search_effort=search_effort,
+            finalist_count=finalist_count,
+            requested_model=str(self.coil_modeling_method),
+            structural_variable_ids=[str(item.get("id", "")) for item in structural_variables],
+            freedom_coverage=freedom_coverage,
+            scout_coordinate_count=outer_dimensions,
+            explicit_evaluation_budget=explicit_budget,
+            max_evaluations=max_evaluations_override,
+            reconnaissance_override=(
+                int(raw_settings["_optimizer_scout_evaluations"])
+                if raw_settings.get("_optimizer_scout_evaluations") is not None
+                else None
+            ),
+            physical_refinement_override=(
+                int(raw_settings["_optimizer_physical_refinement_evaluations"])
+                if raw_settings.get("_optimizer_physical_refinement_evaluations") is not None
+                else None
+            ),
+            model_policy=optimizer_model_policy,
+        )
+        authoritative_validation_budget = optimizer_stage_budget(
+            search_stage_plan, "authoritative_validation", budget
+        )
+        # Keep the legacy alias synchronized until the older exact-search branch is
+        # split in a later phase.  Automatic cheap-first stages use named ceilings.
+        budget = int(authoritative_validation_budget)
+
+        # Optimizer 2.3 staged policy: structural searches may map with simplified
+        # physics first, then use effort/model policy to decide capable refinement
+        # before requested-model finalist validation.
         # Internal recursive scouts opt out via _skip_multifidelity so the policy does
         # not recurse indefinitely.  Fixed-process evaluations likewise remain exact.
         cheap_first_policy = bool(
@@ -22145,13 +23357,14 @@ class StudioAdapter:
         def current_basis_for_adapter(
             geometry_adapter: "StudioAdapter",
             registration_matrix_local: np.ndarray | None = None,
-        ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        ) -> tuple[np.ndarray, dict[str, np.ndarray], list[dict[str, Any]]]:
             """Build B = fixed + sum(amplitude_A * basis_group) for this geometry.
 
             In Exposure mode ``registration_matrix_local`` is a scoring-only rigid
             rotation of the optimized exposure sources about the target centre.  DRC
             and the candidate's stored physical transforms remain untouched.
             """
+            model_reports: list[dict[str, Any]] = []
             variable_current_ids = list(dict.fromkeys(
                 object_id for variable in current_variables for object_id in variable.get("coil_ids", [])
             ))
@@ -22180,7 +23393,7 @@ class StudioAdapter:
                     field_stamp_diagnostics["sampled_basis_count"] = int(
                         field_stamp_diagnostics.get("sampled_basis_count", 0)
                     ) + len(unit_fields)
-                    return fixed_vectors, basis
+                    return fixed_vectors, basis, model_reports
                 except (KeyError, ValueError, StudioOperationError, FloatingPointError):
                     # A candidate outside the cached local volume or an unexpected
                     # transform never invalidates the optimizer. Fall back to the
@@ -22228,6 +23441,9 @@ class StudioAdapter:
             else:
                 zero_field = zero_adapter.get_field(points=points, field="B")
                 fixed_vectors = np.asarray(zero_field["values"], dtype=float).reshape(-1, 3)
+                zero_report = zero_field.get("coil_modeling")
+                if isinstance(zero_report, dict):
+                    model_reports.append(copy.deepcopy(zero_report))
             basis: dict[str, np.ndarray] = {}
             for variable in current_variables:
                 basis_adapter = StudioAdapter(copy.deepcopy(zero_adapter.document()))
@@ -22242,10 +23458,13 @@ class StudioAdapter:
                 ]
                 basis_adapter.apply_operations(operations)
                 basis_field = basis_adapter.get_field(points=points, field="B")
+                basis_report = basis_field.get("coil_modeling")
+                if isinstance(basis_report, dict):
+                    model_reports.append(copy.deepcopy(basis_report))
                 basis[str(variable["id"])] = (
                     np.asarray(basis_field["values"], dtype=float).reshape(-1, 3) - fixed_vectors
                 )
-            return fixed_vectors, basis
+            return fixed_vectors, basis, model_reports
 
         def vectors_from_current_values(
             fixed_vectors: np.ndarray,
@@ -22313,6 +23532,7 @@ class StudioAdapter:
             registration_effort: str = "refined",
         ) -> dict[str, Any] | None:
             """Solve bounded current freedoms cheaply for one already-built geometry."""
+            model_reports: list[dict[str, Any]] = []
             if exposure_registration_enabled and not registration_resolved:
                 return solve_exposure_registration_for_geometry(
                     geometry_adapter,
@@ -22388,10 +23608,14 @@ class StudioAdapter:
                             field_adapter.apply_operations(registration_ops)
                     field = field_adapter.get_field(points=points, field="B")
                     vectors = np.asarray(field["values"], dtype=float).reshape(-1, 3)
+                    field_report = field.get("coil_modeling")
+                    if isinstance(field_report, dict):
+                        model_reports.append(copy.deepcopy(field_report))
                 stats = stats_for_vectors(vectors, registration_matrix_local)
                 return {
                     "current_values": [], "current_value_map": {}, "currents_a": current_map,
                     "electrical": electrical, "vectors": vectors, "stats": stats,
+                    "coil_modeling_reports": copy.deepcopy(model_reports),
                 }
 
             if precomputed_basis is not None:
@@ -22401,7 +23625,7 @@ class StudioAdapter:
                     np.asarray(registration_matrix_local, dtype=float).reshape(3, 3)
                 )
             else:
-                fixed_vectors, basis = current_basis_for_adapter(
+                fixed_vectors, basis, model_reports = current_basis_for_adapter(
                     geometry_adapter, registration_matrix_local
                 )
             lows = np.asarray([float(item["min"]) for item in current_variables], dtype=float)
@@ -22438,6 +23662,7 @@ class StudioAdapter:
                     "electrical": electrical,
                     "vectors": vectors,
                     "stats": stats,
+                    "coil_modeling_reports": copy.deepcopy(model_reports),
                 }
                 local_cache[key] = result
                 return result
@@ -22914,7 +24139,25 @@ class StudioAdapter:
         rejected_count = 0
         attempted_count = 0
         completed_count = 0
+        optimizer_budget_contract = str(
+            raw_settings.get("_optimizer_budget_contract", "") or ""
+        )
+        protected_budget_enabled = (
+            optimizer_budget_contract == "protected_correctness_plus_discretionary"
+        )
+        correctness_reserve = max(
+            0, int(raw_settings.get("_optimizer_correctness_reserve", 0) or 0)
+        )
+        discretionary_allowance = max(
+            0, int(raw_settings.get("_optimizer_discretionary_allowance", 0) or 0)
+        )
+        correctness_attempted_count = 0
+        discretionary_attempted_count = 0
+        unclassified_attempted_count = 0
+        correctness_budget_exhausted = False
+        discretionary_budget_exhausted = False
         cache: dict[tuple[Any, ...], dict[str, Any] | None] = {}
+        rejection_payload_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
         # Scout/rescue observations carry the best rigid exposure registration for
         # their structural coordinate.  Authoritative fixed workers receive that
         # rotation as a nuisance-pose seed so they perform one direct full-model
@@ -22985,6 +24228,20 @@ class StudioAdapter:
             "fast_engineering_orientation_evaluations": 0,
             "fast_engineering_placement_evaluations": 0,
             "fast_engineering_relation_evaluations": 0,
+            "fast_directional_evaluations": 0,
+            "fast_directional_axis_count": 0,
+            "fast_directional_closed_axis_count": 0,
+            "fast_directional_unresolved_axis_count": 0,
+            "fast_directional_feasibility_boundary_axis_count": 0,
+            "fast_directional_feasibility_boundary_evaluations": 0,
+            "fast_directional_axes": [],
+            "fast_coupled_directional_used": False,
+            "fast_coupled_directional_component_count": 0,
+            "fast_coupled_directional_cycle_count": 0,
+            "fast_coupled_directional_evaluations": 0,
+            "fast_coupled_directional_stable_component_count": 0,
+            "fast_coupled_directional_unresolved_component_count": 0,
+            "fast_coupled_directional_components": [],
             "fast_engineering_final_polish_evaluations": 0,
             "fast_engineering_anchor_setting": None,
             "fast_engineering_anchor_objective_key": None,
@@ -23014,6 +24271,56 @@ class StudioAdapter:
         }
         multi_fidelity: dict[str, Any] = {
             "enabled": False,
+            # Capability/observability metadata is populated even when the current
+            # run later takes a legacy path.  It is deliberately informational in
+            # Shared capability metadata now feeds effort and model-fidelity policy.
+            "capability_schema_version": int(fidelity_capability_plan.get("schema_version", 1)),
+            "fidelity_capability_plan": copy.deepcopy(fidelity_capability_plan),
+            "model_policy": copy.deepcopy(optimizer_model_policy),
+            "freedom_coverage": copy.deepcopy(freedom_coverage),
+            "directional_closure": copy.deepcopy(directional_closure),
+            "search_stage_plan": copy.deepcopy(search_stage_plan),
+            "search_stage_accounting": {
+                "reconnaissance": {
+                    "planned": 0,
+                    "planned_correctness_reserve": int(
+                        optimizer_stage_budget_component(
+                            search_stage_plan, "reconnaissance", "correctness_reserve", 0
+                        )
+                    ),
+                    "planned_discretionary_allowance": int(
+                        optimizer_stage_budget_component(
+                            search_stage_plan, "reconnaissance", "discretionary_allowance", 0
+                        )
+                    ),
+                    "correctness_evaluated": 0,
+                    "discretionary_evaluated": 0,
+                    "evaluated": 0,
+                    "status": "pending",
+                },
+                "physical_refinement": {
+                    "planned": int(optimizer_stage_budget(search_stage_plan, "physical_refinement", 0)),
+                    "planned_correctness_reserve": int(
+                        optimizer_stage_budget_component(
+                            search_stage_plan, "physical_refinement", "correctness_reserve", 0
+                        )
+                    ),
+                    "planned_discretionary_allowance": int(
+                        optimizer_stage_budget_component(
+                            search_stage_plan, "physical_refinement", "discretionary_allowance", 0
+                        )
+                    ),
+                    "correctness_evaluated": 0,
+                    "discretionary_evaluated": 0,
+                    "evaluated": 0,
+                    "status": "pending",
+                },
+                "authoritative_validation": {
+                    "planned": int(optimizer_stage_budget(search_stage_plan, "authoritative_validation", budget)),
+                    "evaluated": 0,
+                    "status": "pending",
+                },
+            },
             "scout_model": "centreline",
             "scout_sample_count": 0,
             "full_sample_count": int(full_target_sample_count),
@@ -23037,6 +24344,20 @@ class StudioAdapter:
             "scout_fast_engineering_orientation_evaluations": 0,
             "scout_fast_engineering_placement_evaluations": 0,
             "scout_fast_engineering_relation_evaluations": 0,
+            "scout_fast_directional_evaluations": 0,
+            "scout_fast_directional_axis_count": 0,
+            "scout_fast_directional_closed_axis_count": 0,
+            "scout_fast_directional_unresolved_axis_count": 0,
+            "scout_fast_directional_feasibility_boundary_axis_count": 0,
+            "scout_fast_directional_feasibility_boundary_evaluations": 0,
+            "scout_fast_directional_axes": [],
+            "scout_fast_coupled_directional_used": False,
+            "scout_fast_coupled_directional_component_count": 0,
+            "scout_fast_coupled_directional_cycle_count": 0,
+            "scout_fast_coupled_directional_evaluations": 0,
+            "scout_fast_coupled_directional_stable_component_count": 0,
+            "scout_fast_coupled_directional_unresolved_component_count": 0,
+            "scout_fast_coupled_directional_components": [],
             "scout_fast_engineering_final_polish_evaluations": 0,
             "scout_fast_engineering_anchor_setting": None,
             "scout_fast_insurance_evaluations": 0,
@@ -23253,6 +24574,7 @@ class StudioAdapter:
             trace_completed: int | None = None,
             trace_total: int | None = None,
             work_detail: str | None = None,
+            phase_label_override: str | None = None,
         ) -> None:
             if progress_callback is None:
                 return
@@ -23265,7 +24587,7 @@ class StudioAdapter:
                 "candidate_count": budget,
                 "candidate_limit": budget,
                 "worker_count": worker_count,
-                "phase_label": progress_phase,
+                "phase_label": str(phase_label_override or progress_phase),
                 "feasible": len(candidates),
                 "rejected": rejected_count,
                 **registry_counts,
@@ -23682,6 +25004,12 @@ class StudioAdapter:
                             "No bounded current setting satisfies the active electrical limits for this geometry."
                             if current_variables else
                             "The candidate violates the active electrical limits."
+                        )
+                    if bool(raw_settings.get("_optimizer_require_requested_model", False)):
+                        error_stage = "verifying candidate coil-model fidelity"
+                        candidate_adapter._optimizer_assert_requested_model_applied(
+                            list(raw_settings.get("_optimizer_required_model_coil_ids", []) or []),
+                            reports=list(current_solution.get("coil_modeling_reports", []) or []),
                         )
                     remember_exposure_registration_seed(clean, current_solution)
                     error_stage = "building candidate result"
@@ -24345,6 +25673,7 @@ class StudioAdapter:
                 if candidate is not None:
                     candidates.append(candidate)
                     cache[key] = candidate
+                    rejection_payload_by_key.pop(key, None)
                     target_registry_id = registry_observation_target_by_key.get(key)
                     if target_registry_id:
                         attached_registry_id = candidate_registry.observe_candidate_for_id(
@@ -24406,6 +25735,11 @@ class StudioAdapter:
                 else:
                     rejected_count += 1
                     cache[key] = None
+                    rejection_payload_by_key[key] = {
+                        "error": str(payload.get("error", "Candidate rejected.")),
+                        "error_stage": payload.get("error_stage"),
+                        "error_type": payload.get("error_type"),
+                    }
                     error_text = str(payload.get("error", "Candidate rejected.")).strip() or "Candidate rejected."
                     last_rejection = error_text
                     rejection_reason_counts[error_text] = rejection_reason_counts.get(error_text, 0) + 1
@@ -24469,10 +25803,26 @@ class StudioAdapter:
 
             def evaluate_structures(
                 rows: list[np.ndarray | list[float]],
+                *,
+                budget_lane: str | None = None,
             ) -> None:
-                """Evaluate an ordered independent batch using the configured workers."""
+                """Evaluate an ordered independent batch using the configured workers.
+
+                Optimizer 2.4 protected-budget scouts classify new work as either
+                mandatory ``correctness`` or optional ``discretionary``.  Cache hits
+                are free and may serve either purpose.  Legacy/non-staged calls keep
+                the historical shared-ceiling behavior.
+                """
                 nonlocal attempted_count, worker_serial_retry_count, worker_serial_recovery_count
+                nonlocal correctness_attempted_count, discretionary_attempted_count
+                nonlocal unclassified_attempted_count, correctness_budget_exhausted
+                nonlocal discretionary_budget_exhausted
                 check_pause_cancel()
+                lane = str(budget_lane or "").strip().lower()
+                if not protected_budget_enabled:
+                    lane = "shared"
+                elif lane not in {"correctness", "discretionary"}:
+                    lane = "discretionary"
                 pending: list[tuple[list[float], tuple[Any, ...], int]] = []
                 pending_keys: set[tuple[Any, ...]] = set()
                 for raw_values in rows:
@@ -24480,8 +25830,24 @@ class StudioAdapter:
                     if key in cache or key in pending_keys:
                         continue
                     if attempted_count >= budget:
+                        if lane == "correctness":
+                            correctness_budget_exhausted = True
+                        elif lane == "discretionary":
+                            discretionary_budget_exhausted = True
+                        break
+                    if lane == "correctness" and correctness_attempted_count >= correctness_reserve:
+                        correctness_budget_exhausted = True
+                        break
+                    if lane == "discretionary" and discretionary_attempted_count >= discretionary_allowance:
+                        discretionary_budget_exhausted = True
                         break
                     attempted_count += 1
+                    if lane == "correctness":
+                        correctness_attempted_count += 1
+                    elif lane == "discretionary":
+                        discretionary_attempted_count += 1
+                    else:
+                        unclassified_attempted_count += 1
                     candidate_index = attempted_count
                     fixed_candidate_index = raw_settings.get(
                         "_fixed_candidate_index"
@@ -24683,10 +26049,12 @@ class StudioAdapter:
 
             def evaluate_structure(
                 raw_values: np.ndarray | list[float],
+                *,
+                budget_lane: str | None = None,
             ) -> dict[str, Any] | None:
                 clean, key = prepared_structure(raw_values)
                 if key not in cache:
-                    evaluate_structures([clean])
+                    evaluate_structures([clean], budget_lane=budget_lane)
                 return cache.get(key)
 
             drc_probe_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
@@ -25623,10 +26991,13 @@ class StudioAdapter:
                     # from the authoritative full target sample while the run is live.
                     record_progress(best_candidate())
 
-                    # Axial pack width is purely physical in the centreline model.
-                    # Turns are a pure amplitude duplicate when they scale whole freely
-                    # solved current groups.  Leave those at their source values during
-                    # the map and restore them before DRC/full-fidelity promotion.
+                    # Build the cheap scout coordinates from the capability table.
+                    # Phase 1 deliberately preserves Optimizer 2.2 policy: freedoms
+                    # that Centreline cannot represent remain at source values here.
+                    # The important change is that this is now an explicit, reusable
+                    # observability decision rather than an axial-width special case.
+                    # Turns retain the existing run-specific redundancy shortcut when
+                    # freely solved current groups absorb their Centreline amplitude.
                     scout_current_values = {
                         str(variable["id"]): normalized(
                             variable,
@@ -25634,24 +27005,74 @@ class StudioAdapter:
                         )
                         for variable in current_variables
                     }
+                    for variable in current_variables:
+                        coverage_entry = freedom_coverage_by_id.get(str(variable["id"]))
+                        if coverage_entry is None:
+                            continue
+                        coverage_entry["scout"]["status"] = "inner_solved"
+                        coverage_entry["dynamic"]["scout_current_solver"] = "bounded_linear_inner_solve"
+                        coverage_entry["completion_status"] = "analytically_solved"
+
                     scout_structural_variables: list[dict[str, Any]] = []
                     omitted_scout_ids: set[str] = set()
+                    scout_omission_reasons: dict[str, str] = {}
                     for variable in structural_variables:
+                        variable_id = str(variable["id"])
                         kind = str(variable.get("kind", ""))
-                        if kind == "axial_winding_length":
-                            omitted_scout_ids.add(str(variable["id"]))
+                        coverage_entry = freedom_coverage_by_id.get(variable_id)
+                        scout_visibility = str(
+                            ((coverage_entry or {}).get("scout") or {}).get("visibility", "full")
+                        )
+                        if scout_visibility == "none":
+                            omitted_scout_ids.add(variable_id)
+                            scout_omission_reasons[variable_id] = "centreline_model_invisible"
+                            if coverage_entry is not None:
+                                coverage_entry["scout"]["status"] = "omitted"
+                                coverage_entry["scout"]["omission_reason"] = "centreline_model_invisible"
+                                coverage_entry["completion_status"] = "requires_physical_search"
                             continue
-                        if (
-                            kind == "turns"
-                            and current_variables
-                            and self._optimizer_tuning_turns_current_margin(
-                                variable, current_variables, scout_current_values
-                            ) is not None
-                        ):
-                            omitted_scout_ids.add(str(variable["id"]))
-                            continue
-                        scout_structural_variables.append(copy.deepcopy(variable))
 
+                        turns_current_margin = None
+                        if kind == "turns" and current_variables:
+                            turns_current_margin = self._optimizer_tuning_turns_current_margin(
+                                variable, current_variables, scout_current_values
+                            )
+                        if turns_current_margin is not None:
+                            omitted_scout_ids.add(variable_id)
+                            scout_omission_reasons[variable_id] = "centreline_amplitude_redundant_with_solved_current"
+                            if coverage_entry is not None:
+                                coverage_entry["scout"]["status"] = "omitted"
+                                coverage_entry["scout"]["omission_reason"] = (
+                                    "centreline_amplitude_redundant_with_solved_current"
+                                )
+                                coverage_entry["dynamic"]["turns_current_margin"] = float(turns_current_margin)
+                                coverage_entry["dynamic"]["centreline_amplitude_redundant"] = True
+                                # Turns may still alter winding distribution, DRC and
+                                # electrical limits, so redundancy at the Centreline
+                                # scout is not a proof that Full may ignore the freedom.
+                                coverage_entry["completion_status"] = "requires_physical_search"
+                            continue
+
+                        scout_structural_variables.append(copy.deepcopy(variable))
+                        if coverage_entry is not None:
+                            coverage_entry["scout"]["status"] = (
+                                "actively_varied_partial"
+                                if scout_visibility == "partial"
+                                else "actively_varied"
+                            )
+                            if scout_visibility == "partial":
+                                coverage_entry["completion_status"] = "requires_physical_search"
+                            else:
+                                coverage_entry["completion_status"] = "scout_represented"
+
+                    multi_fidelity["scout_omission_reasons"] = copy.deepcopy(scout_omission_reasons)
+                    multi_fidelity["freedom_coverage"] = copy.deepcopy(freedom_coverage)
+                    multi_fidelity["fidelity_capability_plan"]["scout_omitted_variable_ids"] = sorted(
+                        omitted_scout_ids
+                    )
+                    multi_fidelity["fidelity_capability_plan"]["scout_omission_reasons"] = copy.deepcopy(
+                        scout_omission_reasons
+                    )
                     scout_coordinate_count = len(scout_structural_variables)
                     multi_fidelity["scout_coordinate_count"] = int(scout_coordinate_count)
                     # The raw coordinates remain the source-of-truth contract, but the
@@ -25667,39 +27088,76 @@ class StudioAdapter:
                         for mode in scout_collective_modes
                     ]
 
-                    # Spend the *search* budget on simplified physics, at every
-                    # dimensionality.  One-dimensional jobs can cheaply cover their
-                    # entire increment grid; two-dimensional jobs get enough room for
-                    # the relation/alignment atlas plus a Sobol skeptic cloud; larger
-                    # jobs retain the broader Optimizer 2.0 map profiles.
-                    if scout_coordinate_count <= 1:
-                        scout_budget_default = {"fast": 96, "balanced": 128, "full": 192}[search_effort]
-                        scout_budget_floor = 64
-                    elif scout_coordinate_count == 2:
-                        scout_budget_default = {"fast": 320, "balanced": 640, "full": 1280}[search_effort]
-                        scout_budget_floor = 192
-                    else:
-                        scout_budget_default = min(
-                            12288,
-                            max(4096, 768 * max(4, scout_coordinate_count)),
-                        )
-                        if search_effort == "fast":
-                            # Fast is an engineering funnel, not a cheap imitation of
-                            # Full.  Recognized assemblies should normally finish their
-                            # target-alignment / relationship solve in well under this
-                            # ceiling; the remaining room is fallback insurance for an
-                            # unrecognized topology or a poor target-informed incumbent.
-                            scout_budget_default = min(1024, max(640, 96 * max(4, scout_coordinate_count)))
-                            scout_budget_floor = 384
-                        elif search_effort == "balanced":
-                            scout_budget_default = min(4096, max(2560, 192 * max(4, scout_coordinate_count)))
-                            scout_budget_floor = 1536
-                        else:
-                            scout_budget_floor = 512
-                    scout_budget = int(
-                        raw_settings.get("_optimizer_scout_evaluations", scout_budget_default)
+                    # Rebuild the stage contract with the *actual* Centreline
+                    # coordinate count after observability/redundancy filtering.  This
+                    # replaces the old inline scout-budget table and makes the cheap
+                    # map, coming capable-physics refinement, and requested-model vet
+                    # independent budget lanes.
+                    search_stage_plan = optimizer_search_stage_plan(
+                        search_effort=search_effort,
+                        finalist_count=finalist_count,
+                        requested_model=str(self.coil_modeling_method),
+                        structural_variable_ids=[
+                            str(item.get("id", "")) for item in structural_variables
+                        ],
+                        freedom_coverage=freedom_coverage,
+                        scout_coordinate_count=scout_coordinate_count,
+                        explicit_evaluation_budget=explicit_budget,
+                        max_evaluations=max_evaluations_override,
+                        reconnaissance_override=(
+                            int(raw_settings["_optimizer_scout_evaluations"])
+                            if raw_settings.get("_optimizer_scout_evaluations") is not None
+                            else None
+                        ),
+                        physical_refinement_override=(
+                            int(raw_settings["_optimizer_physical_refinement_evaluations"])
+                            if raw_settings.get("_optimizer_physical_refinement_evaluations") is not None
+                            else None
+                        ),
+                        model_policy=optimizer_model_policy,
                     )
-                    scout_budget = max(scout_budget_floor, min(16384, scout_budget))
+                    scout_budget = optimizer_stage_budget(
+                        search_stage_plan, "reconnaissance", 0
+                    )
+                    authoritative_validation_budget = optimizer_stage_budget(
+                        search_stage_plan, "authoritative_validation", budget
+                    )
+                    # Legacy branches still consult ``budget``. Synchronize that alias
+                    # while the staged cheap-first path uses explicit local ceilings.
+                    budget = int(authoritative_validation_budget)
+                    multi_fidelity["search_stage_plan"] = copy.deepcopy(search_stage_plan)
+                    stage_accounting = multi_fidelity.get("search_stage_accounting", {})
+                    if isinstance(stage_accounting, dict):
+                        reconnaissance_accounting = stage_accounting.setdefault("reconnaissance", {})
+                        reconnaissance_accounting["planned"] = int(scout_budget)
+                        reconnaissance_accounting["planned_correctness_reserve"] = int(
+                            optimizer_stage_budget_component(
+                                search_stage_plan, "reconnaissance", "correctness_reserve", 0
+                            )
+                        )
+                        reconnaissance_accounting["planned_discretionary_allowance"] = int(
+                            optimizer_stage_budget_component(
+                                search_stage_plan, "reconnaissance", "discretionary_allowance", 0
+                            )
+                        )
+                        physical_accounting = stage_accounting.setdefault("physical_refinement", {})
+                        physical_accounting["planned"] = int(
+                            optimizer_stage_budget(search_stage_plan, "physical_refinement", 0)
+                        )
+                        physical_accounting["planned_correctness_reserve"] = int(
+                            optimizer_stage_budget_component(
+                                search_stage_plan, "physical_refinement", "correctness_reserve", 0
+                            )
+                        )
+                        physical_accounting["planned_discretionary_allowance"] = int(
+                            optimizer_stage_budget_component(
+                                search_stage_plan, "physical_refinement", "discretionary_allowance", 0
+                            )
+                        )
+                        stage_accounting.setdefault("authoritative_validation", {})["planned"] = int(
+                            authoritative_validation_budget
+                        )
+
 
                     scout_settings = copy.deepcopy(raw_settings)
                     scout_settings["variables"] = copy.deepcopy(
@@ -25709,6 +27167,19 @@ class StudioAdapter:
                     scout_settings["enforce_electrical_limits"] = False
                     scout_settings["automatic_convergence"] = False
                     scout_settings["evaluation_budget"] = int(scout_budget)
+                    scout_settings["_optimizer_correctness_reserve"] = int(
+                        optimizer_stage_budget_component(
+                            search_stage_plan, "reconnaissance", "correctness_reserve", 0
+                        )
+                    )
+                    scout_settings["_optimizer_discretionary_allowance"] = int(
+                        optimizer_stage_budget_component(
+                            search_stage_plan, "reconnaissance", "discretionary_allowance", 0
+                        )
+                    )
+                    scout_settings["_optimizer_budget_contract"] = (
+                        "protected_correctness_plus_discretionary"
+                    )
                     scout_settings["finalist_count"] = max(12, min(24, finalist_count * 3))
                     scout_settings["worker_count"] = int(worker_count)
                     scout_settings["random_seed"] = int(random_seed ^ 0x5C0A7)
@@ -25854,6 +27325,37 @@ class StudioAdapter:
 
                     scout_finalists = list(scout_result.get("finalists", []) or [])
                     scout_map = scout_result.get("design_space_map", {}) or {}
+
+                    # Phase 3: carry scout directional-closure evidence back to the
+                    # parent optimizer contract. The recursive Centreline map owns the
+                    # real scalar evaluations; the parent owns the complete freedom set,
+                    # including scout-invisible coordinates that must remain unresolved
+                    # for later capable-physics stages.
+                    scout_directional = (
+                        (scout_result.get("multi_fidelity", {}) or {}).get(
+                            "directional_closure", {}
+                        )
+                        or {}
+                    )
+                    scout_directional_entries = optimizer_directional_entries_by_id(
+                        scout_directional
+                    )
+                    parent_directional_entries = optimizer_directional_entries_by_id(
+                        directional_closure
+                    )
+                    for variable_id, scout_entry in scout_directional_entries.items():
+                        if variable_id not in parent_directional_entries:
+                            continue
+                        parent_entry = parent_directional_entries[variable_id]
+                        parent_entry.clear()
+                        parent_entry.update(copy.deepcopy(scout_entry))
+                    optimizer_directional_refresh_summary(directional_closure)
+                    multi_fidelity["directional_closure"] = copy.deepcopy(
+                        directional_closure
+                    )
+                    multi_fidelity["scout_directional_closure"] = copy.deepcopy(
+                        scout_directional
+                    )
                     # Merge the complete cheap-map population into the parent registry
                     # before any DRC/promotion pruning.  The parent search can now make
                     # feasibility-aware selections from candidates that would previously
@@ -25928,6 +27430,14 @@ class StudioAdapter:
                         "scout_map_global_evaluations": int(scout_map.get("global_sobol_evaluations", 0) or 0),
                         "scout_map_adaptive_evaluations": int(scout_map.get("adaptive_evaluations", 0) or 0),
                         "scout_map_fine_recheck_evaluations": int(scout_map.get("fine_cache_recheck_evaluations", 0) or 0),
+                        "scout_budget_contract": scout_map.get("budget_contract"),
+                        "scout_correctness_reserve": int(scout_map.get("correctness_reserve", 0) or 0),
+                        "scout_discretionary_allowance": int(scout_map.get("discretionary_allowance", 0) or 0),
+                        "scout_correctness_evaluations": int(scout_map.get("correctness_evaluations", 0) or 0),
+                        "scout_discretionary_evaluations": int(scout_map.get("discretionary_evaluations", 0) or 0),
+                        "scout_unclassified_evaluations": int(scout_map.get("unclassified_evaluations", 0) or 0),
+                        "scout_correctness_budget_exhausted": bool(scout_map.get("correctness_budget_exhausted", False)),
+                        "scout_discretionary_budget_exhausted": bool(scout_map.get("discretionary_budget_exhausted", False)),
                         "scout_fast_global_early_stop": bool(scout_map.get("fast_global_early_stop", False)),
                         "scout_fast_global_cost_limited": bool(scout_map.get("fast_global_cost_limited", False)),
                         "scout_fast_global_planned_evaluations": int(scout_map.get("fast_global_planned_evaluations", 0) or 0),
@@ -25962,6 +27472,48 @@ class StudioAdapter:
                         ),
                         "scout_fast_engineering_relation_evaluations": int(
                             scout_map.get("fast_engineering_relation_evaluations", 0) or 0
+                        ),
+                        "scout_fast_directional_evaluations": int(
+                            scout_map.get("fast_directional_evaluations", 0) or 0
+                        ),
+                        "scout_fast_directional_axis_count": int(
+                            scout_map.get("fast_directional_axis_count", 0) or 0
+                        ),
+                        "scout_fast_directional_closed_axis_count": int(
+                            scout_map.get("fast_directional_closed_axis_count", 0) or 0
+                        ),
+                        "scout_fast_directional_unresolved_axis_count": int(
+                            scout_map.get("fast_directional_unresolved_axis_count", 0) or 0
+                        ),
+                        "scout_fast_directional_feasibility_boundary_axis_count": int(
+                            scout_map.get("fast_directional_feasibility_boundary_axis_count", 0) or 0
+                        ),
+                        "scout_fast_directional_feasibility_boundary_evaluations": int(
+                            scout_map.get("fast_directional_feasibility_boundary_evaluations", 0) or 0
+                        ),
+                        "scout_fast_directional_axes": copy.deepcopy(
+                            scout_map.get("fast_directional_axes", []) or []
+                        ),
+                        "scout_fast_coupled_directional_used": bool(
+                            scout_map.get("fast_coupled_directional_used", False)
+                        ),
+                        "scout_fast_coupled_directional_component_count": int(
+                            scout_map.get("fast_coupled_directional_component_count", 0) or 0
+                        ),
+                        "scout_fast_coupled_directional_cycle_count": int(
+                            scout_map.get("fast_coupled_directional_cycle_count", 0) or 0
+                        ),
+                        "scout_fast_coupled_directional_evaluations": int(
+                            scout_map.get("fast_coupled_directional_evaluations", 0) or 0
+                        ),
+                        "scout_fast_coupled_directional_stable_component_count": int(
+                            scout_map.get("fast_coupled_directional_stable_component_count", 0) or 0
+                        ),
+                        "scout_fast_coupled_directional_unresolved_component_count": int(
+                            scout_map.get("fast_coupled_directional_unresolved_component_count", 0) or 0
+                        ),
+                        "scout_fast_coupled_directional_components": copy.deepcopy(
+                            scout_map.get("fast_coupled_directional_components", []) or []
                         ),
                         "scout_fast_engineering_final_polish_evaluations": int(
                             scout_map.get("fast_engineering_final_polish_evaluations", 0) or 0
@@ -26034,6 +27586,32 @@ class StudioAdapter:
                         "scout_field_stamp_reason": scout_stamp.get("reason"),
                         "scout_omitted_variable_ids": sorted(omitted_scout_ids),
                     })
+                    stage_accounting = multi_fidelity.get("search_stage_accounting", {})
+                    if isinstance(stage_accounting, dict):
+                        reconnaissance_accounting = stage_accounting.setdefault("reconnaissance", {})
+                        reconnaissance_accounting["evaluated"] = int(
+                            multi_fidelity.get("scout_evaluations", 0) or 0
+                        )
+                        reconnaissance_accounting["correctness_evaluated"] = int(
+                            multi_fidelity.get("scout_correctness_evaluations", 0) or 0
+                        )
+                        reconnaissance_accounting["discretionary_evaluated"] = int(
+                            multi_fidelity.get("scout_discretionary_evaluations", 0) or 0
+                        )
+                        reconnaissance_accounting["unclassified_evaluated"] = int(
+                            multi_fidelity.get("scout_unclassified_evaluations", 0) or 0
+                        )
+                        reconnaissance_accounting["correctness_budget_exhausted"] = bool(
+                            multi_fidelity.get("scout_correctness_budget_exhausted", False)
+                        )
+                        reconnaissance_accounting["discretionary_budget_exhausted"] = bool(
+                            multi_fidelity.get("scout_discretionary_budget_exhausted", False)
+                        )
+                        reconnaissance_accounting["status"] = (
+                            "correctness_incomplete"
+                            if reconnaissance_accounting["correctness_budget_exhausted"]
+                            else "completed"
+                        )
 
                     # Build a feasibility-vet plan from the persistent population, not
                     # only the tiny landmark list.  Protected landmarks and the source
@@ -26046,8 +27624,15 @@ class StudioAdapter:
                     }
 
                     def parent_row_from_values(values: dict[str, Any]) -> np.ndarray:
+                        # Reconstruct every structural coordinate supplied by the
+                        # candidate, not only coordinates visible to the Centreline
+                        # scout. Capable-physics refinement may move freedoms such as
+                        # axial winding length that are intentionally omitted from
+                        # ``scout_structural_variables``; dropping those values here
+                        # silently resets the physical candidate to the source geometry
+                        # between directional axes and before authoritative vetting.
                         row = outer_bases.copy()
-                        for variable in scout_structural_variables:
+                        for variable in structural_variables:
                             variable_id = str(variable["id"])
                             column = parent_column_by_id.get(variable_id)
                             if column is None or variable_id not in values:
@@ -27905,7 +29490,7 @@ class StudioAdapter:
                     except Exception:
                         pass
 
-                    if drc_mapped_rows and attempted_count < budget:
+                    if drc_mapped_rows:
                         def registry_record_for_row(row: np.ndarray) -> dict[str, Any] | None:
                             return candidate_registry.find_by_values(
                                 variable_value_map(
@@ -27950,12 +29535,11 @@ class StudioAdapter:
                         rescue_pool.sort(key=lambda row: registry_scout_key(registry_record_for_row(row)))
                         other_pool.sort(key=lambda row: registry_scout_key(registry_record_for_row(row)))
 
-                        # A few role champions are hard insurance candidates.  They are
-                        # not merely ordered early here: their canonical IDs are carried
-                        # through any optional middle-fidelity re-ranking and then
-                        # re-fronted immediately before the authoritative ceiling is
-                        # applied.  This guarantees that the best naturally DRC-clear
-                        # scout cannot be displaced by a collection of repaired rows.
+                        # A few role champions are hard insurance candidates. Their
+                        # canonical IDs survive optional middle-fidelity re-ranking so
+                        # they can be reserved inside the authoritative ceiling.  When
+                        # capable physics has already ranked the queue, insurance sits
+                        # immediately behind that leader rather than displacing it.
                         protected_authoritative_ids: list[str] = []
 
                         def protect_authoritative_row(row: np.ndarray | None, tag: str) -> None:
@@ -28044,6 +29628,1238 @@ class StudioAdapter:
                                 except (TypeError, ValueError):
                                     continue
 
+                        # Optimizer 2.3 Phase 3: capable-physics basin refinement.
+                        #
+                        # The old middle-fidelity stage only re-ranked fixed scout
+                        # coordinates.  This stage actually generates *new* structural
+                        # settings around several DRC-feasible scout basins and evaluates
+                        # them with a winding model capable of representing the capability
+                        # gaps identified in Phase 1.  Current remains an inner solve in
+                        # every fixed physical candidate.
+                        physical_refinement_budget = int(
+                            optimizer_stage_budget(search_stage_plan, "physical_refinement", 0)
+                        )
+                        physical_correctness_reserve = int(
+                            optimizer_stage_budget_component(
+                                search_stage_plan, "physical_refinement", "correctness_reserve", 0
+                            )
+                        )
+                        physical_discretionary_allowance = int(
+                            optimizer_stage_budget_component(
+                                search_stage_plan, "physical_refinement", "discretionary_allowance", 0
+                            )
+                        )
+                        effort_physical_scope = optimizer_effort_physical_scope(
+                            search_effort=search_effort,
+                            structural_variables=structural_variables,
+                            freedom_coverage=freedom_coverage,
+                        )
+                        physical_active_variable_ids = list(
+                            effort_physical_scope.get("active_variable_ids", []) or []
+                        )
+                        # These coordinates define the capable-physics correctness
+                        # floor. Optimizer 2.4 Phase 6 directionally closes the active
+                        # physical family first; low-discrepancy samples are retained only
+                        # as a skeptic for disconnected alternatives. Balanced activates
+                        # capability gaps plus their couplings, while Full activates every
+                        # structural freedom.
+                        physical_required_variable_ids = set(map(
+                            str,
+                            effort_physical_scope.get("full_span_variable_ids", []) or [],
+                        ))
+                        physical_capability_gap_variable_ids = set(map(
+                            str,
+                            effort_physical_scope.get("capability_gap_variable_ids", []) or [],
+                        ))
+                        # Phase 5 resolved model selection before reconnaissance. Reuse
+                        # that source-aware contract here rather than making a second,
+                        # context-poor decision after the scout has already run.
+                        physical_refinement_model = optimizer_model_policy.get(
+                            "physical_search_model"
+                        )
+                        physical_model_reason = str(
+                            optimizer_model_policy.get(
+                                "physical_search_reason",
+                                "model_policy_did_not_resolve_physical_search",
+                            )
+                        )
+                        physical_refinement_performed = False
+                        physical_refinement_evaluations = 0
+                        physical_refinement_feasible = 0
+                        physical_refinement_elapsed = 0.0
+                        physical_refinement_seed_count = 0
+                        physical_refinement_generated_count = 0
+                        physical_refinement_local_evaluations = 0
+                        physical_refinement_worker_count = 0
+                        physical_refinement_reason = None
+                        physical_refinement_sample_limit = 0
+                        physical_refinement_best_candidate: dict[str, Any] | None = None
+                        physical_directional_passes: list[dict[str, Any]] = []
+                        physical_directional_evaluations = 0
+                        physical_directional_feasibility_boundary_evaluations = 0
+                        physical_directional_best_plan: dict[str, Any] | None = None
+                        physical_directional_best_pass: dict[str, Any] | None = None
+                        physical_directional_skeptic_evaluations = 0
+                        physical_correctness_evaluations = 0
+                        physical_discretionary_evaluations = 0
+                        physical_correctness_budget_exhausted = False
+                        physical_discretionary_budget_exhausted = False
+
+                        if (
+                            physical_refinement_budget > 0
+                            and physical_active_variable_ids
+                            and physical_refinement_model
+                            and all_validation_rows
+                        ):
+                            progress_phase = (
+                                "Physical refinement • "
+                                + COIL_MODELING_LABELS.get(
+                                    str(physical_refinement_model),
+                                    str(physical_refinement_model),
+                                )
+                            )
+                            physical_refinement_sample_limit = min(
+                                full_target_sample_count,
+                                max(
+                                    int(scout_sample_limit),
+                                    {"fast": 96, "balanced": 160, "full": 256}[search_effort],
+                                ),
+                            )
+                            active_columns = [
+                                index
+                                for index, variable in enumerate(structural_variables)
+                                if str(variable.get("id", "")) in set(physical_active_variable_ids)
+                            ]
+                            physical_refinement_seed_count = optimizer_physical_seed_limit(
+                                evaluation_budget=physical_refinement_budget,
+                                active_dimension_count=len(active_columns),
+                                available_seed_count=len(all_validation_rows),
+                            )
+                            physical_seed_rows = [
+                                np.asarray(row, dtype=float).copy()
+                                for row in all_validation_rows[:physical_refinement_seed_count]
+                            ]
+                            physical_settings = copy.deepcopy(raw_settings)
+                            physical_settings["use_drc"] = bool(use_drc)
+                            physical_settings["automatic_convergence"] = False
+                            physical_settings["evaluation_budget"] = 2
+                            physical_settings["finalist_count"] = 1
+                            physical_settings["_optimizer_sample_limit"] = int(
+                                physical_refinement_sample_limit
+                            )
+                            physical_settings["_optimizer_design_map"] = False
+                            physical_settings["_optimizer_use_field_stamps"] = False
+                            physical_settings["_skip_multifidelity"] = True
+                            physical_settings["_skip_active_screening"] = True
+                            physical_settings["_optimizer_require_requested_model"] = True
+                            physical_settings["_optimizer_required_model_coil_ids"] = list(
+                                optimizer_model_policy.get(
+                                    "physical_search_coil_ids", []
+                                ) or []
+                            )
+                            physical_settings.pop("_fixed_structural_values", None)
+                            physical_settings.pop("_fixed_structural_value_map", None)
+                            physical_settings.pop("_fixed_candidate_index", None)
+                            physical_settings.pop("_fixed_exposure_registration_euler_deg", None)
+                            if inherited_fixed_drc_baseline:
+                                physical_settings["_optimizer_inherited_fixed_drc"] = [
+                                    copy.deepcopy(item)
+                                    for item in inherited_fixed_drc_baseline.values()
+                                ]
+
+                            physical_seen_keys: set[tuple[Any, ...]] = set()
+                            physical_candidate_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+                            physical_rejection_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+                            physical_observed_values: dict[str, set[float]] = {
+                                str(variable.get("id", "")): set()
+                                for variable in structural_variables
+                            }
+                            physical_evaluation_serial = 0
+                            physical_pool: _PersistentOptimizerProcessPool | None = None
+                            physical_started = time.perf_counter()
+
+                            def physical_candidate_row(candidate: dict[str, Any]) -> np.ndarray:
+                                return parent_row_from_values(
+                                    candidate.get("variable_values", {}) or {}
+                                )
+
+                            def physical_candidate_key(candidate: dict[str, Any]) -> tuple[Any, ...]:
+                                return prepared_structure(physical_candidate_row(candidate))[1]
+
+                            def physical_evaluate_rows(
+                                rows: list[np.ndarray],
+                                *,
+                                stage_label: str,
+                                local: bool = False,
+                                budget_lane: str = "discretionary",
+                            ) -> list[dict[str, Any]]:
+                                nonlocal physical_refinement_evaluations
+                                nonlocal physical_refinement_feasible
+                                nonlocal physical_evaluation_serial
+                                nonlocal physical_pool
+                                nonlocal physical_refinement_worker_count
+                                nonlocal physical_refinement_local_evaluations
+                                nonlocal physical_correctness_evaluations
+                                nonlocal physical_discretionary_evaluations
+                                nonlocal physical_correctness_budget_exhausted
+                                nonlocal physical_discretionary_budget_exhausted
+                                lane = str(budget_lane or "discretionary").strip().lower()
+                                if lane not in {"correctness", "discretionary"}:
+                                    lane = "discretionary"
+                                display_phase = progress_phase
+                                suffix = str(stage_label).replace("Physical refinement", "").strip(" •-")
+                                if suffix:
+                                    display_phase = f"{progress_phase} • {suffix}"
+                                total_remaining = max(
+                                    0,
+                                    int(physical_refinement_budget)
+                                    - int(physical_refinement_evaluations),
+                                )
+                                lane_remaining = (
+                                    max(
+                                        0,
+                                        int(physical_correctness_reserve)
+                                        - int(physical_correctness_evaluations),
+                                    )
+                                    if lane == "correctness"
+                                    else max(
+                                        0,
+                                        int(physical_discretionary_allowance)
+                                        - int(physical_discretionary_evaluations),
+                                    )
+                                )
+                                remaining = min(total_remaining, lane_remaining)
+                                if remaining <= 0:
+                                    if lane == "correctness":
+                                        physical_correctness_budget_exhausted = True
+                                    else:
+                                        physical_discretionary_budget_exhausted = True
+                                    return []
+                                unique_rows: list[np.ndarray] = []
+                                unique_keys: list[tuple[Any, ...]] = []
+                                for row in rows:
+                                    clean, key = prepared_structure(row)
+                                    if key in physical_seen_keys:
+                                        continue
+                                    physical_seen_keys.add(key)
+                                    unique_rows.append(np.asarray(clean, dtype=float))
+                                    unique_keys.append(key)
+                                    if len(unique_rows) >= remaining:
+                                        break
+                                if not unique_rows:
+                                    return []
+                                tasks: list[tuple[dict[str, float], int, list[float] | None]] = []
+                                for row in unique_rows:
+                                    physical_evaluation_serial += 1
+                                    registration_seed = None
+                                    if exposure_registration_enabled:
+                                        registration_seed = copy.deepcopy(
+                                            fixed_exposure_registration_by_key.get(
+                                                prepared_structure(row)[1]
+                                            )
+                                        )
+                                    tasks.append((
+                                        variable_value_map(
+                                            structural_variables,
+                                            [float(value) for value in row],
+                                        ),
+                                        200000 + physical_evaluation_serial,
+                                        registration_seed,
+                                    ))
+                                worker_limit = max(1, min(int(worker_count), 3, len(tasks)))
+                                physical_refinement_worker_count = max(
+                                    int(physical_refinement_worker_count), worker_limit
+                                )
+                                payloads: list[dict[str, Any]] = []
+                                if worker_limit > 1:
+                                    if physical_pool is None:
+                                        physical_pool = _PersistentOptimizerProcessPool(
+                                            max_workers=worker_limit,
+                                            document=source_document,
+                                            settings=physical_settings,
+                                            coil_modeling_method=str(physical_refinement_model),
+                                            solver_memory_budget_mb=self.solver_memory_budget_mb,
+                                        )
+                                    for start_index in range(0, len(tasks), worker_limit):
+                                        check_pause_cancel()
+                                        chunk = tasks[start_index : start_index + worker_limit]
+                                        payloads.extend(
+                                            physical_pool.evaluate(
+                                                chunk,
+                                                parent_cancel_event=cancel_event,
+                                                parent_pause_event=pause_event,
+                                            )
+                                        )
+                                        record_progress(
+                                            best_candidate(),
+                                            trace_completed=min(
+                                                physical_refinement_evaluations
+                                                + len(payloads),
+                                                physical_refinement_budget,
+                                            ),
+                                            trace_total=int(physical_refinement_budget),
+                                            phase_label_override=display_phase,
+                                        )
+                                else:
+                                    for task in tasks:
+                                        check_pause_cancel()
+                                        value_map, candidate_index, registration_seed = task
+                                        one_settings = copy.deepcopy(physical_settings)
+                                        one_settings["_fixed_structural_value_map"] = copy.deepcopy(
+                                            value_map
+                                        )
+                                        one_settings["_fixed_candidate_index"] = int(candidate_index)
+                                        if registration_seed is not None:
+                                            one_settings["_fixed_exposure_registration_euler_deg"] = copy.deepcopy(
+                                                registration_seed
+                                            )
+                                        physical_adapter = StudioAdapter(copy.deepcopy(source_document))
+                                        physical_adapter.set_coil_modeling_method(
+                                            str(physical_refinement_model)
+                                        )
+                                        physical_adapter.set_solver_memory_budget_mb(
+                                            self.solver_memory_budget_mb
+                                        )
+                                        try:
+                                            one_result = physical_adapter.run_optimizer_tuning(
+                                                one_settings,
+                                                cancel_event=cancel_event,
+                                                pause_event=pause_event,
+                                            )
+                                            one_finalists = list(one_result.get("finalists", []) or [])
+                                            payloads.append(
+                                                {"candidate": copy.deepcopy(one_finalists[0])}
+                                                if one_finalists
+                                                else {"candidate": None}
+                                            )
+                                        except OptimizationCancelled:
+                                            raise
+                                        except Exception as error:  # noqa: BLE001 - candidate may be invalid
+                                            payloads.append(
+                                                {"candidate": None, "error": str(error)}
+                                            )
+                                        record_progress(
+                                            best_candidate(),
+                                            trace_completed=min(
+                                                physical_refinement_evaluations
+                                                + len(payloads),
+                                                physical_refinement_budget,
+                                            ),
+                                            trace_total=int(physical_refinement_budget),
+                                            phase_label_override=display_phase,
+                                        )
+                                physical_refinement_evaluations += len(payloads)
+                                if lane == "correctness":
+                                    physical_correctness_evaluations += len(payloads)
+                                else:
+                                    physical_discretionary_evaluations += len(payloads)
+                                if local:
+                                    physical_refinement_local_evaluations += len(payloads)
+                                accepted: list[dict[str, Any]] = []
+                                for requested_key, payload in zip(
+                                    unique_keys, payloads, strict=True
+                                ):
+                                    candidate = (
+                                        payload.get("candidate")
+                                        if isinstance(payload, dict)
+                                        else None
+                                    )
+                                    if candidate is None:
+                                        physical_rejection_by_key[requested_key] = (
+                                            copy.deepcopy(payload)
+                                            if isinstance(payload, dict)
+                                            else {"error": "Physical candidate rejected."}
+                                        )
+                                        continue
+                                    physical_rejection_by_key.pop(requested_key, None)
+                                    physical_refinement_feasible += 1
+                                    observed_id = candidate_registry.observe_candidate(
+                                        candidate,
+                                        stage=stage_label,
+                                        fidelity="physical_refinement",
+                                        origin="physical_refinement",
+                                        model=str(physical_refinement_model),
+                                        sample_count=int(physical_refinement_sample_limit),
+                                    )
+                                    if use_drc:
+                                        candidate_registry.mark_drc(
+                                            candidate.get("variable_values", {}) or {},
+                                            {
+                                                "feasible": True,
+                                                "minimum_clearance_mm": candidate.get(
+                                                    "metrics", {}
+                                                ).get("minimum_clearance_mm"),
+                                                "reasons": [],
+                                            },
+                                            stage=stage_label,
+                                            origin="physical_refinement_drc",
+                                        )
+                                    candidate_registry.set_retired(observed_id, None)
+                                    candidate_values = candidate.get("variable_values", {}) or {}
+                                    for variable in structural_variables:
+                                        variable_id = str(variable.get("id", ""))
+                                        if variable_id not in candidate_values:
+                                            continue
+                                        try:
+                                            observed_value = normalized(
+                                                variable, float(candidate_values[variable_id])
+                                            )
+                                        except (TypeError, ValueError):
+                                            continue
+                                        physical_observed_values.setdefault(
+                                            variable_id, set()
+                                        ).add(round(float(observed_value), 10))
+                                    candidate_key = physical_candidate_key(candidate)
+                                    physical_candidate_by_key[candidate_key] = candidate
+                                    # Keep the requested key as an alias too.  Fixed
+                                    # workers normally return exactly the requested
+                                    # structural row, but periodic coordinates may
+                                    # canonicalize to an equivalent representation.
+                                    physical_candidate_by_key.setdefault(
+                                        requested_key, candidate
+                                    )
+                                    accepted.append(candidate)
+                                return accepted
+
+                            def physical_directional_evaluate_row(
+                                row: np.ndarray,
+                                *,
+                                stage_label: str,
+                            ) -> DirectionalEvaluation:
+                                clean, key = prepared_structure(row)
+
+                                # Reuse the prepared geometry-only DRC map before
+                                # paying for a capable-physics solve.  This mirrors
+                                # the Fast correctness floor and lets the generic
+                                # feasibility-boundary engine distinguish a real
+                                # geometric stop from a solver/model failure.
+                                drc_probe = probe_structure_drc_only(clean)
+                                if not bool(drc_probe.get("feasible", False)):
+                                    reasons = [
+                                        str(item) for item in list(drc_probe.get("reasons", []) or [])
+                                        if str(item)
+                                    ]
+                                    return DirectionalEvaluation(
+                                        False,
+                                        payload={
+                                            "row": np.asarray(clean, dtype=float),
+                                            "drc": copy.deepcopy(drc_probe),
+                                        },
+                                        rejection_reason=(
+                                            "; ".join(reasons)
+                                            if reasons else "Physical directional candidate violates Workbench DRC."
+                                        ),
+                                        feasibility_kind="drc",
+                                    )
+
+                                existing = physical_candidate_by_key.get(key)
+                                if existing is not None:
+                                    return DirectionalEvaluation(
+                                        True,
+                                        objective_key=self._optimizer_tuning_objective_key(
+                                            existing.get("metrics", {}), objective
+                                        ),
+                                        payload=existing,
+                                    )
+                                previous_rejection = dict(
+                                    physical_rejection_by_key.get(key, {}) or {}
+                                )
+                                if previous_rejection:
+                                    error_text = str(
+                                        previous_rejection.get("error")
+                                        or "Physical directional candidate was rejected."
+                                    )
+                                    error_lower = error_text.lower()
+                                    if (
+                                        "electrical limit" in error_lower
+                                        or "bounded current setting satisfies" in error_lower
+                                        or "current density" in error_lower
+                                        or "copper loss" in error_lower
+                                        or "resistive voltage" in error_lower
+                                    ):
+                                        failure_kind = "electrical"
+                                    elif (
+                                        "drc" in error_lower
+                                        or "clearance" in error_lower
+                                        or "intersect" in error_lower
+                                    ):
+                                        failure_kind = "drc"
+                                    else:
+                                        failure_kind = "evaluation"
+                                    return DirectionalEvaluation(
+                                        False,
+                                        rejection_reason=error_text,
+                                        feasibility_kind=failure_kind,
+                                    )
+
+                                accepted = physical_evaluate_rows(
+                                    [np.asarray(clean, dtype=float)],
+                                    stage_label=stage_label,
+                                    budget_lane="correctness",
+                                )
+                                candidate = (
+                                    accepted[0]
+                                    if accepted
+                                    else physical_candidate_by_key.get(key)
+                                )
+                                if candidate is not None:
+                                    return DirectionalEvaluation(
+                                        True,
+                                        objective_key=self._optimizer_tuning_objective_key(
+                                            candidate.get("metrics", {}), objective
+                                        ),
+                                        payload=candidate,
+                                    )
+                                rejection = dict(physical_rejection_by_key.get(key, {}) or {})
+                                error_text = str(
+                                    rejection.get("error")
+                                    or (
+                                        "Protected physical correctness reserve exhausted before this direction could be evaluated."
+                                        if physical_correctness_evaluations >= physical_correctness_reserve
+                                        else (
+                                            "Physical-refinement budget exhausted before this direction could be evaluated."
+                                            if physical_refinement_evaluations >= physical_refinement_budget
+                                            else "Physical directional candidate was not feasible/evaluable."
+                                        )
+                                    )
+                                )
+                                error_lower = error_text.lower()
+                                if (
+                                    "electrical limit" in error_lower
+                                    or "bounded current setting satisfies" in error_lower
+                                    or "current density" in error_lower
+                                    or "copper loss" in error_lower
+                                    or "resistive voltage" in error_lower
+                                ):
+                                    failure_kind = "electrical"
+                                elif (
+                                    "drc" in error_lower
+                                    or "clearance" in error_lower
+                                    or "intersect" in error_lower
+                                ):
+                                    failure_kind = "drc"
+                                elif "correctness reserve exhausted" in error_lower or "budget exhausted" in error_lower:
+                                    failure_kind = "budget"
+                                else:
+                                    failure_kind = "evaluation"
+                                return DirectionalEvaluation(
+                                    False,
+                                    rejection_reason=error_text,
+                                    feasibility_kind=failure_kind,
+                                )
+
+                            physical_active_columns = list(active_columns)
+                            physical_kind_order = {
+                                # Bring the physical-only winding freedom into the
+                                # search early, then repolish path geometry and spacing
+                                # around it.  Coupled cycling below makes the final
+                                # result independent of this first-pass order.
+                                "axial_winding_length": 10,
+                                "turns": 11,
+                                "racetrack_end_diameter": 20,
+                                "racetrack_straight_length": 21,
+                                "circular_diameter": 22,
+                                "square_length": 23,
+                                "square_width": 24,
+                                "pair_spacing": 30,
+                                "position_x": 40,
+                                "position_y": 41,
+                                "position_z": 42,
+                                "orientation_x": 50,
+                                "orientation_y": 51,
+                                "orientation_z": 52,
+                                "assembly_orientation_x": 50,
+                                "assembly_orientation_y": 51,
+                                "assembly_orientation_z": 52,
+                                "coil_orientation_x": 50,
+                                "coil_orientation_y": 51,
+                                "coil_orientation_z": 52,
+                            }
+                            physical_active_columns.sort(
+                                key=lambda column: (
+                                    physical_kind_order.get(
+                                        str(structural_variables[column].get("kind", "")), 35
+                                    ),
+                                    column,
+                                )
+                            )
+
+                            def run_physical_directional_pass(
+                                start_candidate: dict[str, Any],
+                                *,
+                                pass_label: str,
+                            ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+                                nonlocal physical_directional_evaluations
+                                nonlocal physical_directional_feasibility_boundary_evaluations
+                                nonlocal physical_refinement_generated_count
+                                nonlocal physical_correctness_budget_exhausted
+                                closure_variables = [
+                                    structural_variables[column]
+                                    for column in physical_active_columns
+                                ]
+                                closure_plan = optimizer_directional_closure_plan(
+                                    closure_variables
+                                )
+                                closure_entries = optimizer_directional_entries_by_id(
+                                    closure_plan
+                                )
+                                incumbent = start_candidate
+                                anchor = physical_candidate_row(start_candidate)
+                                axis_records: list[dict[str, Any]] = []
+                                component_records: list[dict[str, Any]] = []
+                                pass_start_evaluations = int(physical_refinement_evaluations)
+
+                                def close_axis(
+                                    column: int,
+                                    *,
+                                    cycle_index: int = 0,
+                                    component_id: str | None = None,
+                                    revisit: bool = False,
+                                ) -> dict[str, Any]:
+                                    nonlocal incumbent, anchor
+                                    nonlocal physical_directional_evaluations
+                                    nonlocal physical_directional_feasibility_boundary_evaluations
+                                    nonlocal physical_refinement_generated_count
+                                    variable = structural_variables[column]
+                                    variable_id = str(variable.get("id", ""))
+                                    axis_anchor = np.asarray(anchor, dtype=float).copy()
+                                    entry = closure_entries.get(variable_id)
+                                    if entry is not None:
+                                        optimizer_directional_set_conditional_context(
+                                            entry,
+                                            {
+                                                str(structural_variables[index].get("id", "")): float(axis_anchor[index])
+                                                for index in physical_active_columns
+                                                if index != column
+                                                and str(structural_variables[index].get("id", ""))
+                                            },
+                                        )
+                                    total_remaining = max(
+                                        0,
+                                        int(physical_refinement_budget)
+                                        - int(physical_refinement_evaluations),
+                                    )
+                                    correctness_remaining = max(
+                                        0,
+                                        int(physical_correctness_reserve)
+                                        - int(physical_correctness_evaluations),
+                                    )
+                                    configured_limit = max(
+                                        4,
+                                        int(raw_settings.get(
+                                            "_optimizer_physical_directional_axis_limit", 33
+                                        )),
+                                    )
+                                    axis_limit = max(
+                                        4,
+                                        min(
+                                            configured_limit,
+                                            max(4, min(total_remaining, correctness_remaining)),
+                                        ),
+                                    )
+                                    before = int(physical_refinement_evaluations)
+                                    evidence_stage = (
+                                        "physical_coupled_directional_revisit"
+                                        if revisit else "physical_directional_closure"
+                                    )
+
+                                    def evaluate_value(value: float) -> DirectionalEvaluation:
+                                        row = axis_anchor.copy()
+                                        row[column] = normalized(variable, float(value))
+                                        return physical_directional_evaluate_row(
+                                            row,
+                                            stage_label=(
+                                                f"Physical directional refinement • {pass_label}"
+                                            ),
+                                        )
+
+                                    result = optimizer_directional_search_with_feasibility_recovery(
+                                        variable,
+                                        evaluate_value,
+                                        incumbent_value=float(axis_anchor[column]),
+                                        closure_entry=entry,
+                                        evidence_stage=evidence_stage,
+                                        max_evaluations=axis_limit,
+                                    )
+                                    actual = int(physical_refinement_evaluations - before)
+                                    physical_directional_evaluations += actual
+                                    physical_refinement_generated_count += actual
+                                    boundary_evaluations = int(
+                                        result.get("feasibility_boundary_evaluations", 0) or 0
+                                    )
+                                    physical_directional_feasibility_boundary_evaluations += (
+                                        boundary_evaluations
+                                    )
+                                    best_payload = result.get("best_payload")
+                                    if isinstance(best_payload, dict):
+                                        incumbent = best_payload
+                                        anchor = physical_candidate_row(best_payload)
+                                    axis_records.append({
+                                        "variable_id": variable_id,
+                                        "label": str(variable.get("label", variable_id)),
+                                        "kind": str(variable.get("kind", "")),
+                                        "pass_label": str(pass_label),
+                                        "cycle_index": int(cycle_index),
+                                        "component_id": component_id,
+                                        "revisit": bool(revisit),
+                                        "new_physical_evaluations": actual,
+                                        "closed": bool(result.get("closed", False)),
+                                        "closure_reason": result.get("closure_reason"),
+                                        "closure_bound": result.get("closure_bound"),
+                                        "best_value": result.get("best_value"),
+                                        "trend_direction": result.get("trend_direction"),
+                                        "budget_exhausted": bool(result.get("budget_exhausted", False)),
+                                        "feasibility_recovery_used": bool(
+                                            result.get("feasibility_recovery_used", False)
+                                        ),
+                                        "feasibility_boundary_evaluations": boundary_evaluations,
+                                    })
+                                    return result
+
+                                for column in physical_active_columns:
+                                    if (
+                                        physical_refinement_evaluations >= physical_refinement_budget
+                                        or physical_correctness_evaluations >= physical_correctness_reserve
+                                    ):
+                                        physical_correctness_budget_exhausted = True
+                                        break
+                                    close_axis(column)
+
+                                column_by_id = {
+                                    str(structural_variables[column].get("id", "")): column
+                                    for column in physical_active_columns
+                                    if str(structural_variables[column].get("id", ""))
+                                }
+                                coupling_plan = optimizer_directional_coupling_components(
+                                    [structural_variables[column] for column in physical_active_columns],
+                                    eligible_ids=column_by_id,
+                                )
+                                coupled_components = [
+                                    item
+                                    for item in list(coupling_plan.get("components", []) or [])
+                                    if bool(item.get("coupled", False))
+                                ]
+                                max_cycles = max(
+                                    1,
+                                    int(raw_settings.get(
+                                        "_optimizer_physical_coupled_directional_cycles", 6
+                                    )),
+                                )
+                                for component in coupled_components:
+                                    component_id = str(
+                                        component.get("component_id", "physical_coupled")
+                                    )
+                                    component_ids = [
+                                        str(value)
+                                        for value in list(component.get("variable_ids", []) or [])
+                                        if str(value) in column_by_id
+                                    ]
+                                    record: dict[str, Any] = {
+                                        "component_id": component_id,
+                                        "variable_ids": component_ids,
+                                        "families": copy.deepcopy(
+                                            component.get("families", []) or []
+                                        ),
+                                        "cycles": [],
+                                        "stable": False,
+                                        "budget_exhausted": False,
+                                    }
+                                    for cycle_index in range(1, max_cycles + 1):
+                                        if (
+                                            physical_refinement_evaluations >= physical_refinement_budget
+                                            or physical_correctness_evaluations >= physical_correctness_reserve
+                                        ):
+                                            record["budget_exhausted"] = True
+                                            physical_correctness_budget_exhausted = True
+                                            break
+                                        start_values = {
+                                            variable_id: float(anchor[column_by_id[variable_id]])
+                                            for variable_id in component_ids
+                                        }
+                                        cycle_before = int(physical_refinement_evaluations)
+                                        for variable_id in component_ids:
+                                            if (
+                                                physical_refinement_evaluations >= physical_refinement_budget
+                                                or physical_correctness_evaluations >= physical_correctness_reserve
+                                            ):
+                                                record["budget_exhausted"] = True
+                                                physical_correctness_budget_exhausted = True
+                                                break
+                                            column = column_by_id[variable_id]
+                                            entry = closure_entries.get(variable_id)
+                                            if entry is not None:
+                                                optimizer_directional_reopen(
+                                                    entry,
+                                                    reason="physical_coupled_coordinate_revisit",
+                                                    triggered_by_variable_id=None,
+                                                    evidence_stage="physical_coupled_directional_cycle",
+                                                    new_context={
+                                                        other_id: float(anchor[column_by_id[other_id]])
+                                                        for other_id in component_ids
+                                                        if other_id != variable_id
+                                                    },
+                                                )
+                                            close_axis(
+                                                column,
+                                                cycle_index=cycle_index,
+                                                component_id=component_id,
+                                                revisit=True,
+                                            )
+                                        end_values = {
+                                            variable_id: float(anchor[column_by_id[variable_id]])
+                                            for variable_id in component_ids
+                                        }
+                                        moved_ids = [
+                                            variable_id
+                                            for variable_id in component_ids
+                                            if not math.isclose(
+                                                start_values[variable_id],
+                                                end_values[variable_id],
+                                                rel_tol=0.0,
+                                                abs_tol=1.0e-12,
+                                            )
+                                        ]
+                                        all_closed = all(
+                                            bool((closure_entries.get(variable_id, {}).get("closure") or {}).get("closed", False))
+                                            for variable_id in component_ids
+                                        )
+                                        record["cycles"].append({
+                                            "cycle_index": int(cycle_index),
+                                            "start_values": start_values,
+                                            "end_values": end_values,
+                                            "moved_variable_ids": moved_ids,
+                                            "new_physical_evaluations": int(
+                                                physical_refinement_evaluations - cycle_before
+                                            ),
+                                            "all_closed": bool(all_closed),
+                                        })
+                                        if not moved_ids and all_closed:
+                                            record["stable"] = True
+                                            break
+                                    component_records.append(record)
+
+                                optimizer_directional_refresh_summary(closure_plan)
+                                pass_record = {
+                                    "pass_label": str(pass_label),
+                                    "start_setting": str(start_candidate.get("setting_summary", "")),
+                                    "end_setting": str(incumbent.get("setting_summary", "")),
+                                    "start_candidate_key": list(physical_candidate_key(start_candidate)),
+                                    "end_candidate_key": list(physical_candidate_key(incumbent)),
+                                    "new_physical_evaluations": int(
+                                        physical_refinement_evaluations - pass_start_evaluations
+                                    ),
+                                    "axis_records": axis_records,
+                                    "coupled_components": component_records,
+                                    "closure_summary": copy.deepcopy(
+                                        closure_plan.get("summary", {}) or {}
+                                    ),
+                                }
+                                return incumbent, closure_plan, pass_record
+
+                            try:
+                                # Establish capable-physics scores for several scout
+                                # basins first.  The best physical anchor, not the best
+                                # Centreline anchor, becomes the starting point for the
+                                # correctness-floor directional search.
+                                # One physical anchor is mandatory correctness setup;
+                                # additional basin anchors are discretionary insurance.
+                                if physical_seed_rows:
+                                    physical_evaluate_rows(
+                                        physical_seed_rows[:1],
+                                        stage_label="Physical refinement mandatory anchor",
+                                        budget_lane="correctness",
+                                    )
+                                    physical_evaluate_rows(
+                                        physical_seed_rows[1:],
+                                        stage_label="Physical refinement alternate basin anchors",
+                                        budget_lane="discretionary",
+                                    )
+                                ranked_anchors = sorted(
+                                    {
+                                        physical_candidate_key(candidate): candidate
+                                        for candidate in physical_candidate_by_key.values()
+                                    }.values(),
+                                    key=lambda candidate: self._optimizer_tuning_objective_key(
+                                        candidate.get("metrics", {}), objective
+                                    ),
+                                )
+                                directional_incumbent: dict[str, Any] | None = None
+                                if ranked_anchors:
+                                    directional_incumbent, first_plan, first_pass = (
+                                        run_physical_directional_pass(
+                                            ranked_anchors[0],
+                                            pass_label="primary basin closure",
+                                        )
+                                    )
+                                    physical_directional_passes.append(first_pass)
+                                    physical_directional_best_plan = first_plan
+                                    physical_directional_best_pass = first_pass
+
+                                # Global physical samples are now a skeptic, not the
+                                # primary optimizer.  They look for disconnected basins
+                                # after the obvious bounded/coupled directions have been
+                                # closed.  If the skeptic wins, it must itself undergo a
+                                # second directional-closure pass before it can support a
+                                # completed Balanced/Full contract.
+                                remaining = max(
+                                    0,
+                                    int(physical_refinement_budget)
+                                    - int(physical_refinement_evaluations),
+                                )
+                                discretionary_remaining = max(
+                                    0,
+                                    int(physical_discretionary_allowance)
+                                    - int(physical_discretionary_evaluations),
+                                )
+                                skeptic_budget = min(
+                                    remaining,
+                                    discretionary_remaining,
+                                    max(0, int(round(0.25 * physical_refinement_budget))),
+                                )
+                                skeptic_rows: list[np.ndarray] = []
+                                if physical_seed_rows and physical_active_columns and skeptic_budget > 0:
+                                    per_seed_counts = [
+                                        skeptic_budget // len(physical_seed_rows)
+                                    ] * len(physical_seed_rows)
+                                    for index in range(skeptic_budget % len(physical_seed_rows)):
+                                        per_seed_counts[index] += 1
+                                    for seed_index, (seed_row, seed_count) in enumerate(
+                                        zip(physical_seed_rows, per_seed_counts, strict=True)
+                                    ):
+                                        if seed_count <= 0:
+                                            continue
+                                        unit = self._optimizer_tuning_sobol_unit_samples(
+                                            seed_count,
+                                            len(physical_active_columns),
+                                            random_seed + 37001 + 101 * seed_index,
+                                        )
+                                        for unit_row in unit:
+                                            trial = np.asarray(seed_row, dtype=float).copy()
+                                            for local_column, column in enumerate(
+                                                physical_active_columns
+                                            ):
+                                                variable = structural_variables[column]
+                                                raw_value = (
+                                                    float(outer_lows[column])
+                                                    + float(unit_row[local_column])
+                                                    * (
+                                                        float(outer_highs[column])
+                                                        - float(outer_lows[column])
+                                                    )
+                                                )
+                                                trial[column] = normalized(variable, raw_value)
+                                            skeptic_rows.append(trial)
+                                    physical_refinement_generated_count += len(skeptic_rows)
+                                    skeptic_before = int(physical_refinement_evaluations)
+                                    physical_evaluate_rows(
+                                        skeptic_rows,
+                                        stage_label="Physical refinement global skeptic",
+                                        budget_lane="discretionary",
+                                    )
+                                    physical_directional_skeptic_evaluations += int(
+                                        physical_refinement_evaluations - skeptic_before
+                                    )
+
+                                ranked_after_skeptic = sorted(
+                                    {
+                                        physical_candidate_key(candidate): candidate
+                                        for candidate in physical_candidate_by_key.values()
+                                    }.values(),
+                                    key=lambda candidate: self._optimizer_tuning_objective_key(
+                                        candidate.get("metrics", {}), objective
+                                    ),
+                                )
+                                if ranked_after_skeptic:
+                                    skeptic_champion = ranked_after_skeptic[0]
+                                    incumbent_key = (
+                                        physical_candidate_key(directional_incumbent)
+                                        if directional_incumbent is not None
+                                        else None
+                                    )
+                                    skeptic_key = physical_candidate_key(skeptic_champion)
+                                    if (
+                                        skeptic_key != incumbent_key
+                                        and physical_refinement_evaluations < physical_refinement_budget
+                                        and physical_correctness_evaluations < physical_correctness_reserve
+                                    ):
+                                        challenger, challenger_plan, challenger_pass = (
+                                            run_physical_directional_pass(
+                                                skeptic_champion,
+                                                pass_label="skeptic basin closure",
+                                            )
+                                        )
+                                        physical_directional_passes.append(challenger_pass)
+                                        physical_directional_best_plan = challenger_plan
+                                        physical_directional_best_pass = challenger_pass
+                                        directional_incumbent = challenger
+
+                                ranked_physical = sorted(
+                                    {
+                                        physical_candidate_key(candidate): candidate
+                                        for candidate in physical_candidate_by_key.values()
+                                    }.values(),
+                                    key=lambda candidate: self._optimizer_tuning_objective_key(
+                                        candidate["metrics"], objective
+                                    ),
+                                )
+                                if ranked_physical:
+                                    physical_refinement_best_candidate = ranked_physical[0]
+                                    physical_refinement_performed = True
+                                    # A global skeptic may become the best physical
+                                    # candidate after the directional pass but exhaust
+                                    # the remaining stage budget before it can itself be
+                                    # directionally closed.  Never transfer closure
+                                    # evidence from another basin onto that champion.
+                                    if physical_directional_best_pass is not None:
+                                        closed_key = tuple(
+                                            physical_directional_best_pass.get(
+                                                "end_candidate_key", []
+                                            ) or []
+                                        )
+                                        champion_key = physical_candidate_key(
+                                            physical_refinement_best_candidate
+                                        )
+                                        if closed_key != champion_key:
+                                            physical_directional_best_plan = (
+                                                optimizer_directional_closure_plan([
+                                                    structural_variables[column]
+                                                    for column in physical_active_columns
+                                                ])
+                                            )
+                                            physical_directional_best_plan.setdefault(
+                                                "notes", []
+                                            ).append(
+                                                "The best capable-physics candidate was discovered by the global skeptic after the last completed directional pass; its directions remain unresolved until a closure pass is completed on that basin."
+                                            )
+                                    refined_rows = [
+                                        physical_candidate_row(candidate)
+                                        for candidate in ranked_physical
+                                    ]
+                                    # Physical rankings lead the authoritative queue,
+                                    # while every original DRC survivor remains available
+                                    # as fallback insurance.
+                                    merged_rows: list[np.ndarray] = []
+                                    merged_keys: set[tuple[Any, ...]] = set()
+                                    for row in refined_rows + all_validation_rows:
+                                        clean, key = prepared_structure(row)
+                                        if key in merged_keys:
+                                            continue
+                                        merged_keys.add(key)
+                                        merged_rows.append(np.asarray(clean, dtype=float))
+                                    all_validation_rows = merged_rows
+                                    best_record = candidate_registry.find_by_values(
+                                        physical_refinement_best_candidate.get(
+                                            "variable_values", {}
+                                        )
+                                        or {}
+                                    )
+                                    if best_record is not None:
+                                        best_id = str(best_record["id"])
+                                        candidate_registry.tag(
+                                            best_id,
+                                            "protected",
+                                            "physical_refinement_champion",
+                                        )
+                                        candidate_registry.set_retired(best_id, None)
+                                        if best_id not in protected_authoritative_ids:
+                                            protected_authoritative_ids.append(best_id)
+                            except OptimizationCancelled:
+                                raise
+                            except Exception as error:  # noqa: BLE001 - fall back to fixed promotion/final vet
+                                physical_refinement_reason = (
+                                    "Capable-physics refinement was unavailable; the optimizer retained the DRC-ranked scout pool: "
+                                    + str(error)
+                                )
+                            finally:
+                                if physical_pool is not None:
+                                    physical_pool.close(cancel=False)
+                                physical_refinement_elapsed = (
+                                    time.perf_counter() - physical_started
+                                )
+                        elif physical_refinement_budget <= 0:
+                            physical_refinement_reason = "No physical-refinement budget was reserved for this effort mode."
+                        elif not physical_active_variable_ids:
+                            physical_refinement_reason = "No capability-gap structural freedoms required capable-physics movement."
+                        elif not physical_refinement_model:
+                            physical_refinement_reason = (
+                                "No capable physical search model was resolved for the selected freedoms ("
+                                + str(physical_model_reason)
+                                + ")."
+                            )
+                        else:
+                            physical_refinement_reason = "No DRC-feasible scout basin was available for physical refinement."
+
+                        multi_fidelity.update({
+                            "physical_refinement_model": physical_refinement_model,
+                            "physical_refinement_model_reason": physical_model_reason,
+                            "physical_refinement_effort_scope": copy.deepcopy(
+                                effort_physical_scope
+                            ),
+                            "physical_refinement_active_variable_ids": list(
+                                physical_active_variable_ids
+                            ),
+                            "physical_refinement_required_variable_ids": sorted(
+                                physical_required_variable_ids
+                            ),
+                            "physical_refinement_capability_gap_variable_ids": sorted(
+                                physical_capability_gap_variable_ids
+                            ),
+                            "physical_refinement_seed_count": int(
+                                physical_refinement_seed_count
+                            ),
+                            "physical_refinement_generated_count": int(
+                                physical_refinement_generated_count
+                            ),
+                            "physical_refinement_evaluations": int(
+                                physical_refinement_evaluations
+                            ),
+                            "physical_refinement_correctness_reserve": int(
+                                physical_correctness_reserve
+                            ),
+                            "physical_refinement_discretionary_allowance": int(
+                                physical_discretionary_allowance
+                            ),
+                            "physical_refinement_correctness_evaluations": int(
+                                physical_correctness_evaluations
+                            ),
+                            "physical_refinement_discretionary_evaluations": int(
+                                physical_discretionary_evaluations
+                            ),
+                            "physical_refinement_correctness_budget_exhausted": bool(
+                                physical_correctness_budget_exhausted
+                            ),
+                            "physical_refinement_discretionary_budget_exhausted": bool(
+                                physical_discretionary_budget_exhausted
+                            ),
+                            "physical_refinement_feasible_count": int(
+                                physical_refinement_feasible
+                            ),
+                            "physical_refinement_local_evaluations": int(
+                                physical_refinement_local_evaluations
+                            ),
+                            "physical_refinement_sample_count": int(
+                                physical_refinement_sample_limit
+                            ),
+                            "physical_refinement_worker_count": int(
+                                physical_refinement_worker_count
+                            ),
+                            "physical_refinement_elapsed_seconds": float(
+                                physical_refinement_elapsed
+                            ),
+                            "physical_refinement_performed": bool(
+                                physical_refinement_performed
+                            ),
+                            "physical_refinement_reason": physical_refinement_reason,
+                            "physical_directional_closure": copy.deepcopy(
+                                physical_directional_best_plan
+                            ) if physical_directional_best_plan is not None else None,
+                            "physical_directional_passes": copy.deepcopy(
+                                physical_directional_passes
+                            ),
+                            "physical_directional_evaluations": int(
+                                physical_directional_evaluations
+                            ),
+                            "physical_directional_skeptic_evaluations": int(
+                                physical_directional_skeptic_evaluations
+                            ),
+                            "physical_directional_feasibility_boundary_evaluations": int(
+                                physical_directional_feasibility_boundary_evaluations
+                            ),
+                        })
+                        stage_accounting = multi_fidelity.get(
+                            "search_stage_accounting", {}
+                        )
+                        if isinstance(stage_accounting, dict):
+                            physical_accounting = stage_accounting.setdefault(
+                                "physical_refinement", {}
+                            )
+                            physical_accounting["evaluated"] = int(
+                                physical_refinement_evaluations
+                            )
+                            physical_accounting["correctness_evaluated"] = int(
+                                physical_correctness_evaluations
+                            )
+                            physical_accounting["discretionary_evaluated"] = int(
+                                physical_discretionary_evaluations
+                            )
+                            physical_accounting["correctness_budget_exhausted"] = bool(
+                                physical_correctness_budget_exhausted
+                            )
+                            physical_accounting["discretionary_budget_exhausted"] = bool(
+                                physical_discretionary_budget_exhausted
+                            )
+                            physical_accounting["feasible"] = int(
+                                physical_refinement_feasible
+                            )
+                            physical_unresolved_count = int(
+                                ((physical_directional_best_plan or {}).get("summary", {}) or {}).get(
+                                    "unresolved_count", 0
+                                ) or 0
+                            )
+                            physical_accounting["status"] = (
+                                "correctness_incomplete"
+                                if (
+                                    physical_refinement_performed
+                                    and physical_correctness_budget_exhausted
+                                    and physical_unresolved_count > 0
+                                )
+                                else "completed"
+                                if physical_refinement_performed
+                                else "not_executed"
+                            )
+                        stage_plan_payload = multi_fidelity.get(
+                            "search_stage_plan", {}
+                        )
+                        if isinstance(stage_plan_payload, dict):
+                            stages_payload = stage_plan_payload.get("stages", {})
+                            if isinstance(stages_payload, dict) and isinstance(
+                                stages_payload.get("physical_refinement"), dict
+                            ):
+                                stages_payload["physical_refinement"][
+                                    "execution_status"
+                                ] = str(physical_accounting.get("status", "not_executed"))
+                                stages_payload["physical_refinement"][
+                                    "model"
+                                ] = physical_refinement_model
+
+                        # Mark coverage only when the physical stage actually moved
+                        # coordinates and produced usable candidates. The effort-policy
+                        # layer below turns these observations into completion invariants.
+                        if physical_refinement_performed:
+                            physical_value_counts: dict[str, int] = {}
+                            for variable_id in physical_active_variable_ids:
+                                coverage_entry = freedom_coverage_by_id.get(
+                                    str(variable_id)
+                                )
+                                if coverage_entry is None:
+                                    continue
+                                observed_count = len(
+                                    physical_observed_values.get(str(variable_id), set())
+                                )
+                                physical_value_counts[str(variable_id)] = int(observed_count)
+                                coverage_entry["physical_search"]["status"] = (
+                                    "actively_varied"
+                                    if observed_count >= 2
+                                    else "evaluated_fixed"
+                                )
+                                coverage_entry["physical_search"]["model"] = str(
+                                    physical_refinement_model
+                                )
+                                coverage_entry["physical_search"][
+                                    "distinct_value_count"
+                                ] = int(observed_count)
+                                coverage_entry["completion_status"] = (
+                                    "physically_refined"
+                                    if observed_count >= 2
+                                    else "requires_physical_search"
+                                )
+                            multi_fidelity[
+                                "physical_refinement_distinct_value_counts"
+                            ] = physical_value_counts
+                            multi_fidelity["freedom_coverage"] = copy.deepcopy(
+                                freedom_coverage
+                            )
+
                         # Optimizer 2.2 inserts a cost-aware middle-fidelity promotion
                         # stage for expensive segmented windings.  The cheap map has
                         # already located useful basins and DRC has already decided
@@ -28059,7 +30875,11 @@ class StudioAdapter:
                             if str(self.get_object(object_id).get("type", "")) == "current.Polyline"
                         ]
                         intermediate_model: str | None = None
-                        if requested_model != "centreline" and len(all_validation_rows) > 1:
+                        if (
+                            not physical_refinement_performed
+                            and requested_model != "centreline"
+                            and len(all_validation_rows) > 1
+                        ):
                             if requested_model == "exact":
                                 intermediate_model = "bundled"
                             elif requested_model in {"bundled", "current_sheet"}:
@@ -28076,7 +30896,11 @@ class StudioAdapter:
                         intermediate_elapsed = 0.0
                         intermediate_sample_limit = 0
                         intermediate_worker_count = 0
-                        intermediate_reason = None
+                        intermediate_reason = (
+                            "Capable-physics refinement supplied movable physical candidates; fixed-coordinate promotion was skipped."
+                            if physical_refinement_performed
+                            else None
+                        )
 
                         if intermediate_enabled:
                             progress_phase = (
@@ -28110,6 +30934,10 @@ class StudioAdapter:
                             intermediate_settings["_optimizer_use_field_stamps"] = False
                             intermediate_settings["_skip_multifidelity"] = True
                             intermediate_settings["_skip_active_screening"] = True
+                            intermediate_settings["_optimizer_require_requested_model"] = True
+                            intermediate_settings["_optimizer_required_model_coil_ids"] = list(
+                                optimizer_model_policy.get("authoritative_coil_ids", []) or []
+                            )
                             intermediate_settings.pop("_fixed_structural_values", None)
                             intermediate_settings.pop("_fixed_candidate_index", None)
 
@@ -28439,31 +31267,61 @@ class StudioAdapter:
                             }[search_effort]
                             initial_validation_target = int(effort_validation_cap)
 
-                        # Re-front protected role champions *after* any optional
-                        # physical-promotion ranking.  The middle fidelity is allowed to
-                        # reorder the rest of the queue, but it must not consume every
-                        # authoritative slot before the source baseline and best
-                        # naturally-clear scout are checked.
-                        if protected_authoritative_ids:
-                            protected_order = {
-                                candidate_id: index
-                                for index, candidate_id in enumerate(protected_authoritative_ids)
-                            }
-                            protected_rows: list[tuple[int, np.ndarray]] = []
-                            ordinary_rows: list[np.ndarray] = []
-                            for row in all_validation_rows:
-                                record = registry_record_for_row(np.asarray(row, dtype=float))
-                                registry_id = str(record["id"]) if record is not None else ""
-                                if registry_id in protected_order:
-                                    protected_rows.append((protected_order[registry_id], np.asarray(row, dtype=float)))
-                                else:
-                                    ordinary_rows.append(np.asarray(row, dtype=float))
-                            protected_rows.sort(key=lambda item: item[0])
-                            all_validation_rows = [row for _index, row in protected_rows] + ordinary_rows
+                        # Protected role champions are *insurance*, not ranking
+                        # overrides.  Once a capable physical stage has established a
+                        # higher-fidelity ordering, preserve its leader in slot 0 and
+                        # insert protected/source rows immediately behind it.  This is
+                        # crucial for Fast, where a decisive physical screen may open
+                        # only one authoritative slot initially.  Without this rule the
+                        # source baseline could displace a better physically-ranked
+                        # candidate and then trigger an incorrect early stop.
+                        higher_fidelity_ranked_queue = bool(
+                            physical_refinement_performed
+                            or (intermediate_enabled and intermediate_feasible > 0)
+                        )
+                        authoritative_ranked_leader_id = ""
+                        authoritative_ranked_leader_key: tuple[Any, ...] | None = None
+                        if all_validation_rows and higher_fidelity_ranked_queue:
+                            leader_row = np.asarray(all_validation_rows[0], dtype=float)
+                            leader_record = registry_record_for_row(leader_row)
+                            if leader_record is not None:
+                                authoritative_ranked_leader_id = str(leader_record["id"])
+                            _leader_clean, authoritative_ranked_leader_key = prepared_structure(
+                                leader_row
+                            )
+
+                        if protected_authoritative_ids and all_validation_rows:
+                            queue_tokens: list[str] = []
+                            row_by_token: dict[str, np.ndarray] = {}
+                            for index, row in enumerate(all_validation_rows):
+                                row_array = np.asarray(row, dtype=float)
+                                record = registry_record_for_row(row_array)
+                                token = (
+                                    str(record["id"])
+                                    if record is not None
+                                    else f"__anonymous_authoritative_row_{index}"
+                                )
+                                queue_tokens.append(token)
+                                row_by_token[token] = row_array
+                            ordered_tokens = optimizer_authoritative_queue_ids(
+                                queue_tokens,
+                                protected_authoritative_ids,
+                                preserve_ranked_leader=higher_fidelity_ranked_queue,
+                            )
+                            all_validation_rows = [
+                                row_by_token[token] for token in ordered_tokens
+                            ]
+
+                        multi_fidelity["authoritative_ranked_leader_id"] = (
+                            authoritative_ranked_leader_id or None
+                        )
+                        multi_fidelity["authoritative_ranked_leader_required"] = bool(
+                            higher_fidelity_ranked_queue
+                        )
 
                         validation_cap = min(
                             len(all_validation_rows),
-                            max(0, budget - attempted_count),
+                            max(0, authoritative_validation_budget - attempted_count),
                             int(effort_validation_cap),
                         )
                         initial_validation_limit = min(
@@ -28499,6 +31357,18 @@ class StudioAdapter:
                                 for row in validation_rows
                                 if prepared_structure(row)[1] in fixed_exposure_registration_by_key
                             )
+                        # Authoritative validation must honor an explicit Preferences
+                        # model on every tuned coil. Auto remains intentionally dynamic;
+                        # explicit models may not silently fall back candidate-by-candidate.
+                        raw_settings["_optimizer_require_requested_model"] = not bool(
+                            optimizer_model_policy.get("authoritative_fallback_allowed", False)
+                        )
+                        raw_settings["_optimizer_required_model_coil_ids"] = list(
+                            optimizer_model_policy.get("authoritative_coil_ids", []) or []
+                        )
+                        # Recreate any parent worker pool with the strict authoritative
+                        # settings rather than reusing one opened earlier in the run.
+                        close_process_pool(cancel=False)
                         before_physical = attempted_count
                         evaluate_structures(validation_rows)
                         validation_count = int(attempted_count - before_physical)
@@ -28513,22 +31383,31 @@ class StudioAdapter:
                         collect_validated(validation_rows)
 
                         # Progressive opening of authoritative slots.  A decisive
-                        # intermediate ranking plus a surviving first full-model check
-                        # is enough for Fast. Otherwise add the remaining ranked rows
-                        # only up to the effort-specific final-vet ceiling.
+                        # intermediate ranking may stop early only after the actual
+                        # higher-fidelity leader has survived authority.  A protected
+                        # insurance candidate surviving is not sufficient if the ranked
+                        # leader failed or was not tested.
                         progressive_extra_count = 0
-                        should_expand_validation = bool(
-                            validation_count < validation_cap
-                            and (
-                                not scout_full_candidates
-                                or not intermediate_enabled
-                                or not intermediate_decisive
-                            )
+                        authoritative_ranked_leader_survived = bool(
+                            authoritative_ranked_leader_key is not None
+                            and cache.get(authoritative_ranked_leader_key) is not None
+                        )
+                        multi_fidelity["authoritative_ranked_leader_survived"] = bool(
+                            authoritative_ranked_leader_survived
+                        )
+                        should_expand_validation = optimizer_should_expand_authoritative_validation(
+                            validation_count=validation_count,
+                            validation_cap=validation_cap,
+                            has_survivor=bool(scout_full_candidates),
+                            intermediate_enabled=bool(intermediate_enabled),
+                            intermediate_decisive=bool(intermediate_decisive),
+                            ranked_leader_required=bool(higher_fidelity_ranked_queue),
+                            ranked_leader_survived=bool(authoritative_ranked_leader_survived),
                         )
                         if should_expand_validation:
                             extra_limit = min(
                                 int(validation_cap - validation_count),
-                                max(0, budget - attempted_count),
+                                max(0, authoritative_validation_budget - attempted_count),
                             )
                             extra_rows = all_validation_rows[
                                 validation_count : validation_count + extra_limit
@@ -28613,8 +31492,16 @@ class StudioAdapter:
                         multi_fidelity.update({
                             "physical_seed_feasible_count": int(len(deduped_promoted)),
                             "physical_seed_repaired_count": int(drc_boundary_seed_count),
-                            "physical_refinement_seed_count": 0,
-                            "physical_refinement_evaluations": 0,
+                            # Preserve Phase-3 movable-refinement accounting.  Earlier
+                            # code reset these to zero during authoritative cleanup,
+                            # which erased the evidence Phase 4 needs for effort
+                            # completeness even though the refined candidates remained.
+                            "physical_refinement_seed_count": int(
+                                multi_fidelity.get("physical_refinement_seed_count", 0) or 0
+                            ),
+                            "physical_refinement_evaluations": int(
+                                multi_fidelity.get("physical_refinement_evaluations", 0) or 0
+                            ),
                             "physical_validation_evaluations": int(validation_count),
                             "exact_finalist_validation_count": int(validation_count),
                             "authoritative_progressive_extra_count": int(progressive_extra_count),
@@ -28622,33 +31509,221 @@ class StudioAdapter:
                             "fast_exact_validation_count": int(validation_count if search_effort == "fast" else 0),
                             "fast_map_early_accept": bool(fast_map_accepted),
                         })
+                        stage_accounting = multi_fidelity.get("search_stage_accounting", {})
+                        if isinstance(stage_accounting, dict):
+                            authoritative_accounting = stage_accounting.setdefault(
+                                "authoritative_validation", {}
+                            )
+                            authoritative_accounting["evaluated"] = int(validation_count)
+                            authoritative_accounting["status"] = (
+                                "completed" if validation_count > 0 else "no_candidate_evaluated"
+                            )
+                        stage_plan_payload = multi_fidelity.get("search_stage_plan", {})
+                        if isinstance(stage_plan_payload, dict):
+                            stages_payload = stage_plan_payload.get("stages", {})
+                            if isinstance(stages_payload, dict):
+                                if isinstance(stages_payload.get("reconnaissance"), dict):
+                                    reconnaissance_status = str(
+                                        (multi_fidelity.get("search_stage_accounting", {}) or {})
+                                        .get("reconnaissance", {})
+                                        .get("status", "completed")
+                                    )
+                                    stages_payload["reconnaissance"]["execution_status"] = (
+                                        reconnaissance_status
+                                    )
+                                if isinstance(stages_payload.get("authoritative_validation"), dict):
+                                    stages_payload["authoritative_validation"]["execution_status"] = (
+                                        "completed" if validation_count > 0 else "completed_without_candidate"
+                                    )
+
+            if cheap_first_policy:
+                # Phase 4 effort contract: turn raw fidelity observations into a
+                # user-facing completion verdict before convergence is decided.
+                # Fast may be intentionally limited; Balanced must close every
+                # Centreline capability gap; Full must physically vary every
+                # structural freedom (or have an explicit redundancy proof).
+                finalized_coverage, effort_completion = optimizer_finalize_effort_coverage(
+                    search_effort=search_effort,
+                    variables=variables,
+                    freedom_coverage=freedom_coverage,
+                    physical_distinct_value_counts=dict(
+                        multi_fidelity.get(
+                            "physical_refinement_distinct_value_counts", {}
+                        )
+                        or {}
+                    ),
+                    physical_directional_closure=(
+                        multi_fidelity.get("physical_directional_closure")
+                        if isinstance(
+                            multi_fidelity.get("physical_directional_closure"), dict
+                        )
+                        else None
+                    ),
+                )
+                # Optimizer 2.4 correctness floor also applies to Fast's
+                # scout-visible scalar directions.  Fast may intentionally leave
+                # scout-invisible physical freedoms limited, but it may not claim a
+                # completed search while one of the directions it *did* promise to
+                # close remains open (including protected-reserve exhaustion).
+                if (
+                    search_effort == "fast"
+                    and bool(multi_fidelity.get("scout_fast_engineering_funnel_used", False))
+                ):
+                    required_fast_directional_ids = list(dict.fromkeys(
+                        str(item.get("variable_id", ""))
+                        for item in list(
+                            multi_fidelity.get("scout_fast_directional_axes", []) or []
+                        )
+                        if str(item.get("variable_id", ""))
+                    ))
+                    closure_entries = optimizer_directional_entries_by_id(
+                        dict(multi_fidelity.get("directional_closure", {}) or {})
+                    )
+                    unresolved_fast_directional = [
+                        variable_id
+                        for variable_id in required_fast_directional_ids
+                        if not bool(
+                            (closure_entries.get(variable_id, {}).get("closure") or {}).get(
+                                "closed", False
+                            )
+                        )
+                    ]
+                    if unresolved_fast_directional:
+                        existing_unresolved = list(
+                            effort_completion.get("unresolved_variable_ids", []) or []
+                        )
+                        effort_completion["unresolved_variable_ids"] = list(dict.fromkeys(
+                            existing_unresolved + unresolved_fast_directional
+                        ))
+                        effort_completion["complete"] = False
+                        effort_completion["scout_directional_required_variable_ids"] = (
+                            required_fast_directional_ids
+                        )
+                        effort_completion["scout_directional_unresolved_variable_ids"] = (
+                            unresolved_fast_directional
+                        )
+                        effort_completion["message"] = (
+                            "Fast correctness-floor search is incomplete because one or more "
+                            "scout-visible bounded directions remain open. Fast may reduce "
+                            "discretionary exploration, but it may not trade away bound/"
+                            "directional closure."
+                        )
+                        by_id = {
+                            str(item.get("id", "")): item for item in finalized_coverage
+                        }
+                        for variable_id in unresolved_fast_directional:
+                            entry = by_id.get(variable_id)
+                            if entry is not None:
+                                entry["completion_status"] = (
+                                    "incomplete_fast_directional_closure"
+                                )
+
+                freedom_coverage = finalized_coverage
+                freedom_coverage_by_id = {
+                    str(item.get("id", "")): item
+                    for item in freedom_coverage
+                    if str(item.get("id", ""))
+                }
+                multi_fidelity["freedom_coverage"] = copy.deepcopy(freedom_coverage)
+                multi_fidelity["effort_completion"] = copy.deepcopy(effort_completion)
+                multi_fidelity["effort_policy_contract"] = str(
+                    effort_completion.get("contract", "")
+                )
+                stage_plan_payload = multi_fidelity.get("search_stage_plan", {})
+                if isinstance(stage_plan_payload, dict):
+                    stage_plan_payload["effort_contract"] = copy.deepcopy(effort_completion)
 
             if cheap_first_vetted:
                 progress_phase = "Final vet complete • authoritative finalists validated"
-                record_progress(best_candidate())
                 fast_budget_completed = False
-                converged = True
                 exact_count = int(multi_fidelity.get("exact_finalist_validation_count", 0) or 0)
-                convergence_reason = (
-                    "Cheap-first structural search completed: simplified Centreline/reduced-target mapping and "
-                    "vector-field caching supplied the exploration, geometry-only DRC filtered/repaired the map, "
-                    f"and the authoritative coil model was used only to vet {exact_count} finalist setting"
-                    f"{'s' if exact_count != 1 else ''}. No exploratory full-model sweep, active-set search, "
-                    "boundary convergence, or local full-model adaptation was run."
+                effort_completion = dict(multi_fidelity.get("effort_completion", {}) or {})
+                effort_complete = bool(effort_completion.get("complete", True))
+                refine_count = int(
+                    multi_fidelity.get("physical_refinement_evaluations", 0) or 0
                 )
+                refine_model = str(
+                    multi_fidelity.get("physical_refinement_model") or "physical"
+                )
+                if not effort_complete:
+                    converged = False
+                    progress_phase = "Final vet complete • search coverage incomplete"
+                    unresolved_ids = list(
+                        effort_completion.get("unresolved_variable_ids", []) or []
+                    )
+                    unresolved_text = (
+                        ", ".join(map(str, unresolved_ids))
+                        if unresolved_ids
+                        else "one or more selected freedoms"
+                    )
+                    convergence_reason = (
+                        str(effort_completion.get("message", "Search coverage is incomplete."))
+                        + f" Authoritative finalist validation still produced {exact_count} vetted setting"
+                        + ("s" if exact_count != 1 else "")
+                        + f", but this {search_effort.title()} run is not marked converged until the effort contract is satisfied. "
+                        + f"Unresolved freedom(s): {unresolved_text}."
+                    )
+                else:
+                    converged = True
+                    if search_effort == "fast":
+                        limited_ids = list(
+                            effort_completion.get("limited_variable_ids", []) or []
+                        )
+                        limited_text = (
+                            " Physical-only freedom(s) left intentionally limited: "
+                            + ", ".join(map(str, limited_ids))
+                            + "."
+                            if limited_ids
+                            else ""
+                        )
+                        convergence_reason = (
+                            "Fast reconnaissance completed: simplified Centreline/reduced-target mapping supplied the rapid global search, "
+                            "geometry-only DRC filtered the map, and the authoritative coil model vetted "
+                            f"{exact_count} finalist setting{'s' if exact_count != 1 else ''}. "
+                            "Fast does not claim exhaustive capable-physics optimization of scout-invisible freedoms."
+                            + limited_text
+                        )
+                    elif search_effort == "balanced":
+                        convergence_reason = (
+                            "Balanced hybrid search completed: Centreline/reduced-target reconnaissance located the broad field landscape, "
+                            "geometry-only DRC filtered/repaired the map, and every Centreline capability-gap freedom was actively varied "
+                            f"during {refine_count} capable-physics refinement evaluation{'s' if refine_count != 1 else ''} with {refine_model}; "
+                            f"the authoritative coil model then vetted {exact_count} finalist setting{'s' if exact_count != 1 else ''}."
+                        )
+                    else:
+                        convergence_reason = (
+                            "Full dimensional search completed: Centreline/reduced-target reconnaissance supplied multiple starting basins, "
+                            "geometry-only DRC filtered/repaired the map, then every selected structural freedom was reopened and actively "
+                            f"varied under capable physics across {refine_count} refinement evaluation{'s' if refine_count != 1 else ''} with {refine_model}; "
+                            f"current freedoms were solved internally and the authoritative coil model vetted {exact_count} finalist setting"
+                            f"{'s' if exact_count != 1 else ''}."
+                        )
+                record_progress(best_candidate())
             elif cheap_first_policy:
-                # Automatic Optimizer 2.2 never converts a failed cheap map/finalist
-                # vet into an exploratory authoritative-model search.  The primary
-                # map has already received a plain-Centreline retry above; reaching
-                # this branch means no authoritative finalist survived.
-                progress_phase = "Final vet complete • no authoritative finalist survived"
+                # The staged optimizer may already have spent capable-physics work
+                # before authority.  Report what actually happened instead of the
+                # old Optimizer 2.2 assumption that expensive physics was only a vet.
+                progress_phase = "Authoritative validation complete • no finalist survived"
                 record_progress(best_candidate())
                 converged = False
-                convergence_reason = (
-                    "Cheap-first mapping completed, including the simplified-map fallback when needed, but no "
-                    "DRC-feasible map finalist survived the authoritative coil-model/electrical vet. No exploratory "
-                    "full-model search was launched; broaden the permitted freedoms or use a higher cheap-map effort."
-                )
+                refine_count = int(multi_fidelity.get("physical_refinement_evaluations", 0) or 0)
+                if refine_count > 0:
+                    convergence_reason = (
+                        "Centreline reconnaissance and capable-physics refinement completed, but no DRC/electrical-feasible "
+                        "candidate survived authoritative validation. Inspect the rejection diagnostics and broaden the permitted "
+                        "freedoms, limits, or target if appropriate."
+                    )
+                elif search_effort == "fast":
+                    convergence_reason = (
+                        "Fast reconnaissance completed, but no leading DRC-feasible candidate survived authoritative validation. "
+                        "Fast intentionally does not launch movable capable-physics refinement; inspect rejection diagnostics or "
+                        "use Balanced/Full when physical-only freedoms need active search."
+                    )
+                else:
+                    convergence_reason = (
+                        "Reconnaissance completed, but the required capable-physics/authoritative stages did not produce a surviving "
+                        "finalist. Inspect the effort/fidelity diagnostics and rejection reasons; the run is not reported as converged."
+                    )
             elif fast_map_accepted:
                 # Retained as a legacy/internal fallback for saved jobs that bypass the
                 # universal cheap-first finalist-vetting policy.
@@ -30079,42 +33154,23 @@ class StudioAdapter:
                         return selected
 
                     # Optimizer 2.0 stages A--D. Balanced/Full still use the broad
-                    # atlas. Fast first checks whether the participating topology is a
-                    # recognizable linked two-coil assembly; if so, do not waste the
-                    # first magnetic evaluations on every raw +/- XYZ/Euler endpoint.
-                    # The staged engineering funnel below will solve the physically
-                    # meaningful families in order, and a small later Sobol skeptic
-                    # remains responsible for challenging unexpected coupled answers.
-                    fast_pair_funnel_candidate = False
-                    if (
-                        fast_map_profile
-                        and raw_settings.get("_optimizer_fast_engineering_funnel", True)
-                        and (
-                            not snapshot_match
-                            or relationship_preferred_field_axis is not None
-                            or exposure_registration_enabled
-                        )
-                    ):
-                        pair_probe_ids = list(dict.fromkeys(
-                            str(value) for value in participant_ids if self.is_coil(str(value))
-                        ))
-                        fast_pair_funnel_candidate = bool(
-                            len(pair_probe_ids) == 2
-                            and all(
-                                str(self.get_object(object_id).get("type", "")) in COIL_TYPES
-                                for object_id in pair_probe_ids
-                            )
-                        )
-
+                    # atlas. Optimizer 2.4 no longer suppresses raw endpoint insurance
+                    # merely because Fast recognizes a two-coil assembly: every bounded
+                    # freedom gets explicit endpoint evidence. The directional funnel
+                    # below then closes useful scalar directions on the evolving
+                    # incumbent, while the small later Sobol cloud remains a skeptic for
+                    # unexpected coupled/disconnected answers.
                     progress_phase = "Design-space map • Stage A canonical assembly"
                     raw_boundary_rows: list[np.ndarray] = []
-                    if not fast_pair_funnel_candidate:
-                        for column in range(outer_dimensions):
-                            low_seed = outer_bases.copy(); low_seed[column] = outer_lows[column]; seeds.append(low_seed); raw_boundary_rows.append(low_seed)
-                            high_seed = outer_bases.copy(); high_seed[column] = outer_highs[column]; seeds.append(high_seed); raw_boundary_rows.append(high_seed)
+                    for column in range(outer_dimensions):
+                        low_seed = outer_bases.copy(); low_seed[column] = outer_lows[column]; seeds.append(low_seed); raw_boundary_rows.append(low_seed)
+                        high_seed = outer_bases.copy(); high_seed[column] = outer_highs[column]; seeds.append(high_seed); raw_boundary_rows.append(high_seed)
                     record_progress(best_candidate(), trace_completed=0, trace_total=len(seeds))
                     before_stage = attempted_count
-                    evaluate_structures(seeds)
+                    evaluate_structures(
+                        seeds,
+                        budget_lane=("correctness" if protected_budget_enabled else None),
+                    )
                     design_space_map["canonical_evaluations"] += int(attempted_count - before_stage)
                     if compact_map_profile:
                         priority_boundary_candidates.extend(profile_candidates_for_rows(raw_boundary_rows))
@@ -30335,62 +33391,413 @@ class StudioAdapter:
                                 counter_key="fast_engineering_placement_evaluations",
                             )
 
-                        # 3) Known physical relations. Pair spacing gets an explicit
-                        # full-range 1-D profile, followed by a local bracket refinement.
-                        # That makes monotonic facts such as "closer matches better"
-                        # visible in ~a dozen field probes. DRC is intentionally deferred
-                        # to the parent reality map, which can then back the magnetic
-                        # optimum out to the nearest legal boundary.
-                        relation_columns = [
-                            column for column, variable in enumerate(structural_variables)
-                            if str(variable.get("kind", "")) in {
-                                "pair_spacing", "circular_diameter",
-                                "square_length", "square_width",
-                            }
-                        ]
-                        relation_columns.sort(
-                            key=lambda column: ({
-                                "pair_spacing": 0, "circular_diameter": 10,
-                                "square_length": 20, "square_width": 21,
-                            }.get(str(structural_variables[column].get("kind", "")), 100), column)
+                        # 3) Optimizer 2.4 correctness floor: bounded directional
+                        # closure for every remaining scout-visible scalar freedom.
+                        #
+                        # Do not whitelist geometry kinds here. The .303 Fast funnel
+                        # accidentally omitted racetrack end diameter/straight length
+                        # because only pair spacing, circular diameter and square
+                        # dimensions were recognized as "known relations". A freedom
+                        # earns this search because the user made it free and the scout
+                        # can represent it, not because its kind happens to appear in a
+                        # topology-specific list.
+                        directional_entries = optimizer_directional_entries_by_id(
+                            directional_closure
                         )
-                        for column in relation_columns:
-                            variable = structural_variables[column]
-                            low = float(variable["min"]); high = float(variable["max"])
-                            coarse_count = 9 if str(variable.get("kind", "")) == "pair_spacing" else 7
-                            coarse_values = np.linspace(low, high, coarse_count, dtype=float).tolist()
-                            coarse_values.extend([
-                                float(variable.get("base", funnel_anchor[column])),
-                                float(funnel_anchor[column]),
-                            ])
-                            funnel_scan_axis(
-                                column, coarse_values,
-                                phase="Design-space map • Fast funnel • known relationships",
-                                counter_key="fast_engineering_relation_evaluations",
+                        reserved_columns = set(orientation_columns + placement_columns)
+                        directional_columns = [
+                            column
+                            for column, variable in enumerate(structural_variables)
+                            if column not in reserved_columns
+                            and float(variable.get("max", 0.0))
+                            > float(variable.get("min", 0.0)) + 1.0e-15
+                        ]
+                        directional_kind_order = {
+                            # Shape first, separation after shape. Phase 4 cycles the
+                            # coupled family until changing one no longer reopens another.
+                            "racetrack_end_diameter": 10,
+                            "racetrack_straight_length": 11,
+                            "circular_diameter": 12,
+                            "square_length": 13,
+                            "square_width": 14,
+                            "pair_spacing": 30,
+                        }
+                        directional_columns.sort(
+                            key=lambda column: (
+                                directional_kind_order.get(
+                                    str(structural_variables[column].get("kind", "")), 20
+                                ),
+                                column,
                             )
+                        )
+                        design_space_map["fast_directional_axis_count"] = int(
+                            len(directional_columns)
+                        )
 
-                            # Refine only the winning coarse bracket, still changing one
-                            # physical relation at a time.
-                            current = float(funnel_anchor[column])
-                            normalized_coarse = sorted({
-                                float(normalized(variable, value)) for value in coarse_values
-                            })
-                            if len(normalized_coarse) >= 2:
-                                nearest = int(np.argmin(np.abs(np.asarray(normalized_coarse) - current)))
-                                left = normalized_coarse[max(0, nearest - 1)]
-                                right = normalized_coarse[min(len(normalized_coarse) - 1, nearest + 1)]
-                                if right > left + 1.0e-12:
-                                    funnel_scan_axis(
-                                        column,
-                                        np.linspace(left, right, 7, dtype=float).tolist(),
-                                        phase="Design-space map • Fast funnel • relation refinement",
-                                        counter_key="fast_engineering_relation_evaluations",
+                        def funnel_directional_axis(
+                            column: int,
+                            *,
+                            cycle_index: int = 0,
+                            component_id: str | None = None,
+                            revisit: bool = False,
+                        ) -> dict[str, Any]:
+                            nonlocal funnel_incumbent, funnel_anchor, progress_phase
+                            variable = structural_variables[column]
+                            variable_id = str(variable.get("id", ""))
+                            axis_anchor = np.asarray(funnel_anchor, dtype=float).copy()
+                            axis_candidates: list[dict[str, Any]] = []
+                            total_remaining = max(0, int(budget - attempted_count))
+                            correctness_remaining = (
+                                max(0, int(correctness_reserve - correctness_attempted_count))
+                                if protected_budget_enabled else total_remaining
+                            )
+                            configured_limit = max(
+                                4,
+                                int(raw_settings.get("_optimizer_fast_directional_axis_limit", 33)),
+                            )
+                            axis_limit = max(
+                                4,
+                                min(
+                                    configured_limit,
+                                    max(4, min(total_remaining, correctness_remaining)),
+                                ),
+                            )
+                            progress_phase = "Design-space map • Fast funnel • directional closure"
+                            record_progress(
+                                best_candidate(), trace_completed=0, trace_total=axis_limit
+                            )
+                            before = attempted_count
+
+                            def evaluate_directional_value(value: float) -> DirectionalEvaluation:
+                                row = axis_anchor.copy()
+                                row[column] = normalized(variable, float(value))
+
+                                # Optimizer 2.4 Phase 5: feasibility is part of
+                                # directional closure, not a later veto. Probe the
+                                # prepared geometry-only DRC map before paying for
+                                # the Centreline field. If a hard endpoint collides,
+                                # the directional engine will bisect back to the
+                                # nearest legal lattice point and score that actual
+                                # safe-side boundary candidate.
+                                drc_probe = probe_structure_drc_only(row)
+                                if not bool(drc_probe.get("feasible", False)):
+                                    reasons = [
+                                        str(item) for item in list(drc_probe.get("reasons", []) or [])
+                                        if str(item)
+                                    ]
+                                    return DirectionalEvaluation(
+                                        False,
+                                        payload={
+                                            "row": np.asarray(row, dtype=float),
+                                            "drc": copy.deepcopy(drc_probe),
+                                        },
+                                        rejection_reason=(
+                                            "; ".join(reasons)
+                                            if reasons else "Directional candidate violates Workbench DRC."
+                                        ),
+                                        feasibility_kind="drc",
                                     )
 
-                        # One tiny final coordinate pass catches quantization/coupling
-                        # introduced by the ordered stages without reopening the whole
-                        # raw search box.
-                        final_columns = orientation_columns + placement_columns + relation_columns
+                                before_directional_attempts = attempted_count
+                                candidate = evaluate_structure(
+                                    row,
+                                    budget_lane=(
+                                        "correctness" if protected_budget_enabled else None
+                                    ),
+                                )
+                                if candidate is None:
+                                    if (
+                                        protected_budget_enabled
+                                        and attempted_count == before_directional_attempts
+                                        and correctness_attempted_count >= correctness_reserve
+                                    ):
+                                        return DirectionalEvaluation(
+                                            False,
+                                            rejection_reason=(
+                                                "Protected directional-correctness reserve exhausted before this value could be evaluated."
+                                            ),
+                                            feasibility_kind="budget",
+                                        )
+                                    _clean, row_key = prepared_structure(row)
+                                    rejection = dict(rejection_payload_by_key.get(row_key, {}) or {})
+                                    error_text = str(
+                                        rejection.get("error")
+                                        or "Centreline directional candidate was not feasible/evaluable."
+                                    )
+                                    error_lower = error_text.lower()
+                                    feasibility_kind = (
+                                        "electrical"
+                                        if (
+                                            "electrical limit" in error_lower
+                                            or "bounded current setting satisfies" in error_lower
+                                            or "current density" in error_lower
+                                            or "copper loss" in error_lower
+                                            or "resistive voltage" in error_lower
+                                        )
+                                        else "evaluation"
+                                    )
+                                    return DirectionalEvaluation(
+                                        False,
+                                        rejection_reason=error_text,
+                                        feasibility_kind=feasibility_kind,
+                                    )
+                                axis_candidates.append(candidate)
+                                return DirectionalEvaluation(
+                                    True,
+                                    objective_key=self._optimizer_tuning_objective_key(
+                                        candidate.get("metrics", {}), objective
+                                    ),
+                                    payload=candidate,
+                                )
+
+                            active_entry = directional_entries.get(variable_id)
+                            conditional_context = {
+                                str(structural_variables[index].get("id", "")): float(axis_anchor[index])
+                                for index in directional_columns
+                                if index != column and str(structural_variables[index].get("id", ""))
+                            }
+                            if active_entry is not None:
+                                optimizer_directional_set_conditional_context(
+                                    active_entry, conditional_context
+                                )
+                            evidence_stage = (
+                                "fast_centreline_coupled_directional_revisit"
+                                if revisit else "fast_centreline_directional_closure"
+                            )
+                            search_result = optimizer_directional_search_with_feasibility_recovery(
+                                variable,
+                                evaluate_directional_value,
+                                incumbent_value=float(axis_anchor[column]),
+                                closure_entry=active_entry,
+                                evidence_stage=evidence_stage,
+                                max_evaluations=axis_limit,
+                            )
+                            actual = int(attempted_count - before)
+                            design_space_map["fast_directional_evaluations"] += actual
+                            if bool(search_result.get("feasibility_recovery_used", False)):
+                                design_space_map["fast_directional_feasibility_boundary_axis_count"] += 1
+                                design_space_map["fast_directional_feasibility_boundary_evaluations"] += int(
+                                    search_result.get("feasibility_boundary_evaluations", 0) or 0
+                                )
+                            # Preserve the historical relation-work counter so older
+                            # progress/reporting code still reflects the cost of this
+                            # engineering-search family during the transition.
+                            design_space_map["fast_engineering_relation_evaluations"] += actual
+                            design_space_map["fast_directional_axes"].append({
+                                "variable_id": variable_id,
+                                "label": str(variable.get("label", variable_id)),
+                                "cycle_index": int(cycle_index),
+                                "component_id": component_id,
+                                "revisit": bool(revisit),
+                                "kind": str(variable.get("kind", "")),
+                                "evaluation_count": int(search_result.get("evaluation_count", 0) or 0),
+                                "new_evaluations": actual,
+                                "closed": bool(search_result.get("closed", False)),
+                                "closure_reason": search_result.get("closure_reason"),
+                                "closure_bound": search_result.get("closure_bound"),
+                                "best_value": search_result.get("best_value"),
+                                "trend_direction": search_result.get("trend_direction"),
+                                "budget_exhausted": bool(search_result.get("budget_exhausted", False)),
+                                "needs_feasibility_boundary": bool(
+                                    search_result.get("needs_feasibility_boundary", False)
+                                ),
+                                "feasibility_recovery_used": bool(
+                                    search_result.get("feasibility_recovery_used", False)
+                                ),
+                                "feasibility_boundary_evaluations": int(
+                                    search_result.get("feasibility_boundary_evaluations", 0) or 0
+                                ),
+                                "feasibility_boundaries": copy.deepcopy(
+                                    search_result.get("feasibility_boundaries", {}) or {}
+                                ),
+                                "endpoint_status": copy.deepcopy(
+                                    search_result.get("endpoint_status", {}) or {}
+                                ),
+                            })
+                            best_payload = search_result.get("best_payload")
+                            if isinstance(best_payload, dict):
+                                funnel_incumbent = best_payload
+                                funnel_anchor = candidate_row(best_payload)
+                            elif axis_candidates:
+                                funnel_incumbent = min(
+                                    axis_candidates + ([funnel_incumbent] if funnel_incumbent is not None else []),
+                                    key=lambda item: self._optimizer_tuning_objective_key(
+                                        item.get("metrics", {}), objective
+                                    ),
+                                )
+                                funnel_anchor = candidate_row(funnel_incumbent)
+                            priority_relation_candidates.extend(axis_candidates)
+                            return search_result
+
+                        # Initial conditional pass.  This establishes one closed
+                        # slice per axis, but those proofs are conditional on the
+                        # coordinates held fixed at the moment each axis ran.
+                        for column in directional_columns:
+                            funnel_directional_axis(column)
+
+                        # Phase 4: cycle connected coupling families until a whole
+                        # family is stable.  If pair spacing moves after path geometry
+                        # was closed, the geometry proof is stale; archive/reopen it
+                        # and search again at the new spacing.  Same-family dimensions
+                        # are coupled too (for example racetrack end diameter and
+                        # straight length), so the rule is topology-independent.
+                        column_by_id = {
+                            str(structural_variables[column].get("id", "")): column
+                            for column in directional_columns
+                            if str(structural_variables[column].get("id", ""))
+                        }
+                        coupling_plan = optimizer_directional_coupling_components(
+                            [structural_variables[column] for column in directional_columns],
+                            eligible_ids=column_by_id,
+                        )
+                        coupled_components = [
+                            item for item in list(coupling_plan.get("components", []) or [])
+                            if bool(item.get("coupled", False))
+                        ]
+                        design_space_map["fast_coupled_directional_used"] = bool(coupled_components)
+                        design_space_map["fast_coupled_directional_component_count"] = int(
+                            len(coupled_components)
+                        )
+                        max_coupled_cycles = max(
+                            1,
+                            int(raw_settings.get("_optimizer_fast_coupled_directional_cycles", 6)),
+                        )
+                        value_tolerance = 1.0e-12
+                        for component in coupled_components:
+                            component_id = str(component.get("component_id", "coupled"))
+                            component_ids = [
+                                str(value) for value in list(component.get("variable_ids", []) or [])
+                                if str(value) in column_by_id
+                            ]
+                            component_columns = [column_by_id[value] for value in component_ids]
+                            component_record: dict[str, Any] = {
+                                "component_id": component_id,
+                                "variable_ids": component_ids,
+                                "families": copy.deepcopy(component.get("families", []) or []),
+                                "cycles": [],
+                                "stable": False,
+                                "budget_exhausted": False,
+                            }
+                            for cycle_index in range(1, max_coupled_cycles + 1):
+                                if (
+                                    attempted_count >= budget
+                                    or (
+                                        protected_budget_enabled
+                                        and correctness_attempted_count >= correctness_reserve
+                                    )
+                                ):
+                                    component_record["budget_exhausted"] = True
+                                    correctness_budget_exhausted = bool(protected_budget_enabled)
+                                    break
+                                cycle_start = {
+                                    variable_id: float(funnel_anchor[column_by_id[variable_id]])
+                                    for variable_id in component_ids
+                                }
+                                cycle_before = attempted_count
+                                for variable_id in component_ids:
+                                    if (
+                                        attempted_count >= budget
+                                        or (
+                                            protected_budget_enabled
+                                            and correctness_attempted_count >= correctness_reserve
+                                        )
+                                    ):
+                                        component_record["budget_exhausted"] = True
+                                        correctness_budget_exhausted = bool(protected_budget_enabled)
+                                        break
+                                    column = column_by_id[variable_id]
+                                    entry = directional_entries.get(variable_id)
+                                    if entry is not None:
+                                        current_context = {
+                                            other_id: float(funnel_anchor[column_by_id[other_id]])
+                                            for other_id in component_ids
+                                            if other_id != variable_id
+                                        }
+                                        optimizer_directional_reopen(
+                                            entry,
+                                            reason="coupled_coordinate_revisit",
+                                            triggered_by_variable_id=None,
+                                            evidence_stage="fast_centreline_coupled_directional_cycle",
+                                            new_context=current_context,
+                                        )
+                                    funnel_directional_axis(
+                                        column,
+                                        cycle_index=cycle_index,
+                                        component_id=component_id,
+                                        revisit=True,
+                                    )
+                                cycle_end = {
+                                    variable_id: float(funnel_anchor[column_by_id[variable_id]])
+                                    for variable_id in component_ids
+                                }
+                                moved_ids = [
+                                    variable_id
+                                    for variable_id in component_ids
+                                    if not math.isclose(
+                                        cycle_start[variable_id], cycle_end[variable_id],
+                                        rel_tol=0.0, abs_tol=value_tolerance,
+                                    )
+                                ]
+                                all_closed = all(
+                                    bool((directional_entries.get(variable_id, {}).get("closure") or {}).get("closed", False))
+                                    for variable_id in component_ids
+                                )
+                                new_evaluations = int(attempted_count - cycle_before)
+                                design_space_map["fast_coupled_directional_cycle_count"] += 1
+                                design_space_map["fast_coupled_directional_evaluations"] += new_evaluations
+                                component_record["cycles"].append({
+                                    "cycle_index": int(cycle_index),
+                                    "start_values": cycle_start,
+                                    "end_values": cycle_end,
+                                    "moved_variable_ids": moved_ids,
+                                    "new_evaluations": new_evaluations,
+                                    "all_closed": bool(all_closed),
+                                })
+                                if not moved_ids and all_closed:
+                                    component_record["stable"] = True
+                                    break
+                            if bool(component_record.get("stable", False)):
+                                design_space_map["fast_coupled_directional_stable_component_count"] += 1
+                            else:
+                                design_space_map["fast_coupled_directional_unresolved_component_count"] += 1
+                            design_space_map["fast_coupled_directional_components"].append(component_record)
+
+                        # Report unique-axis closure state after the final coupled
+                        # cycle rather than accumulating pass-by-pass counts.
+                        design_space_map["fast_directional_closed_axis_count"] = sum(
+                            1
+                            for column in directional_columns
+                            if bool((directional_entries.get(
+                                str(structural_variables[column].get("id", "")), {}
+                            ).get("closure") or {}).get("closed", False))
+                        )
+                        design_space_map["fast_directional_unresolved_axis_count"] = int(
+                            len(directional_columns)
+                            - design_space_map["fast_directional_closed_axis_count"]
+                        )
+
+                        design_space_map["budget_contract"] = optimizer_budget_contract or "shared"
+                        design_space_map["correctness_reserve"] = int(correctness_reserve)
+                        design_space_map["discretionary_allowance"] = int(discretionary_allowance)
+                        design_space_map["correctness_evaluations"] = int(correctness_attempted_count)
+                        design_space_map["discretionary_evaluations"] = int(discretionary_attempted_count)
+                        design_space_map["unclassified_evaluations"] = int(unclassified_attempted_count)
+                        design_space_map["correctness_budget_exhausted"] = bool(
+                            correctness_budget_exhausted
+                        )
+                        design_space_map["discretionary_budget_exhausted"] = bool(
+                            discretionary_budget_exhausted
+                        )
+                        optimizer_directional_refresh_summary(directional_closure)
+                        multi_fidelity["directional_closure"] = copy.deepcopy(
+                            directional_closure
+                        )
+
+                        # One tiny final coordinate pass still catches quantization in
+                        # target-informed orientation/placement. Do not move a directionally
+                        # closed scalar geometry freedom after recording its evidence;
+                        # Phase 4 owns the coupled revisit cycle.
+                        final_columns = orientation_columns + placement_columns
                         for column in list(dict.fromkeys(final_columns)):
                             variable = structural_variables[column]
                             centre = float(funnel_anchor[column])
@@ -31658,14 +35065,19 @@ class StudioAdapter:
                     convergence_reason = (
                         "No DRC-clear structural anchor was found. The source scene and every retained field-good "
                         "landmark intersected, and the bounded geometry-only rescue survey also found no clear setting "
-                        "inside the permitted freedoms. No exploratory full-model search was launched; broaden the "
-                        "structural bounds or inspect the DRC exclusions."
+                        "inside the permitted freedoms. Physical refinement cannot begin without a feasible anchor; broaden "
+                        "the structural bounds or inspect the DRC exclusions."
                     )
                 else:
+                    refine_count = int(multi_fidelity.get("physical_refinement_evaluations", 0) or 0)
                     convergence_reason = (
-                        "No authoritative finalist survived the cheap-first map and final reality vet. The optimizer did not "
-                        "launch an exploratory full-model search. See rejection diagnostics for DRC/electrical/full-model "
-                        "reasons, then broaden the permitted freedoms or increase cheap-map effort if appropriate."
+                        "No authoritative finalist survived the staged optimizer pipeline. "
+                        + (
+                            f"Capable-physics refinement evaluated {refine_count} setting(s) before authority. "
+                            if refine_count > 0
+                            else "No movable capable-physics refinement produced a surviving candidate for authority. "
+                        )
+                        + "See rejection diagnostics for DRC/electrical/model-fidelity reasons, then broaden the permitted freedoms or limits if appropriate."
                     )
             else:
                 convergence_reason = (
@@ -31847,6 +35259,35 @@ class StudioAdapter:
             strategy["exposure_registration"] = copy.deepcopy(
                 combined_exposure_registration_diagnostics()
             )
+        # Directional closure is mutated by the real search stages, whereas the
+        # initial multi-fidelity payload is intentionally a snapshot. Refresh the
+        # plan-level counts and publish the latest evidence before every normal
+        # optimizer return so recursive scouts can hand it back to their parent.
+        optimizer_directional_refresh_summary(directional_closure)
+        multi_fidelity["directional_closure"] = copy.deepcopy(directional_closure)
+        # Publish protected-lane accounting for every recursive scout profile, not
+        # only the recognized Fast engineering funnel.  Phase 7 keeps these raw
+        # counters separate so later reporting can show exactly what was spent on
+        # correctness versus optional exploration.
+        if protected_budget_enabled:
+            design_space_map["budget_contract"] = optimizer_budget_contract
+            design_space_map["correctness_reserve"] = int(correctness_reserve)
+            design_space_map["discretionary_allowance"] = int(discretionary_allowance)
+            design_space_map["correctness_evaluations"] = int(
+                correctness_attempted_count
+            )
+            design_space_map["discretionary_evaluations"] = int(
+                discretionary_attempted_count
+            )
+            design_space_map["unclassified_evaluations"] = int(
+                unclassified_attempted_count
+            )
+            design_space_map["correctness_budget_exhausted"] = bool(
+                correctness_budget_exhausted
+            )
+            design_space_map["discretionary_budget_exhausted"] = bool(
+                discretionary_budget_exhausted
+            )
         effective_settings = copy.deepcopy(raw_settings)
         effective_settings["worker_count"] = int(worker_count)
         return {
@@ -31879,6 +35320,14 @@ class StudioAdapter:
                 "fast_budget_completed": bool(fast_budget_completed),
                 "fast_cache_accepted": bool(fast_map_accepted),
                 "cheap_first_completed": bool(cheap_first_vetted),
+                "effort_contract_complete": bool(
+                    (multi_fidelity.get("effort_completion", {}) or {}).get(
+                        "complete", True
+                    )
+                ),
+                "effort_contract": copy.deepcopy(
+                    multi_fidelity.get("effort_completion", {}) or {}
+                ),
                 "primary_goal_saturated": bool(
                     candidates
                     and self._optimizer_tuning_primary_saturated(
@@ -33826,7 +37275,7 @@ class StudioAdapter:
 
         outer_phrase = str(outer_search).replace("_", " ").strip()
         if outer_search == "cheap_first_map_finalist_validation":
-            outer_phrase = "cheap-first Centreline/vector-field map with authoritative finalist validation"
+            outer_phrase = "Centreline reconnaissance with capable-physics refinement as required and authoritative validation"
         elif outer_search == "cache_first_validated":
             outer_phrase = "cache-first Centreline/vector-field atlas with full-model validation"
         if outer_count == 1 and structural and outer_search != "cheap_first_map_finalist_validation":
@@ -33862,14 +37311,26 @@ class StudioAdapter:
         strategy_text = "; ".join(value for value in (outer_phrase, current_phrase) if value)
         effective_text: str | None = None
         if outer_search == "cheap_first_map_finalist_validation":
-            effective_text = (
-                "Optimizer 2.2 cheap-first policy: simplified Centreline/reduced-target physics and reusable vector "
-                "caches perform the exploration; geometry-only DRC constrains the map; expensive segmented sources can "
-                "receive a reduced-target physical promotion screen; the requested expensive coil model is then used only "
-                "for a small progressive final vet of the strongest diverse candidates. Fast exploits recognized target/assembly "
-                "structure first and uses a small skeptic challenge; Balanced broadens that cheap challenge, while Full reserves "
-                "the widest cheap global search for unexpected answers rather than adding exploratory full-model refinement."
-            )
+            effort = str(result.get("settings", {}).get("search_effort", "full")).strip().lower()
+            if effort == "fast":
+                effective_text = (
+                    "Optimizer 2.4 Fast policy: simplified Centreline/reduced-target physics performs rapid reconnaissance, "
+                    "but every scout-visible bounded structural freedom must satisfy the directional correctness floor: legal "
+                    "endpoints, bracketing/coupled revisits, and feasibility-boundary recovery. Discretionary global exploration "
+                    "is secondary; scout-invisible physical freedoms may remain explicitly limited."
+                )
+            elif effort == "balanced":
+                effective_text = (
+                    "Optimizer 2.4 Balanced policy: Centreline supplies broad basin reconnaissance; capable physics then "
+                    "directionally closes each Centreline capability gap together with its activated coupled family, including "
+                    "scout-visible coordinates in that family. Protected correctness capacity cannot be consumed by discretionary exploration."
+                )
+            else:
+                effective_text = (
+                    "Optimizer 2.4 Full policy: Centreline supplies broad multi-basin reconnaissance; capable physics then reopens "
+                    "every selected structural freedom and must directionally close the complete coupled search. Full may report "
+                    "convergence only when every freedom is physically closed, analytically solved, or explicitly proven redundant."
+                )
         elif outer_search == "cache_first_validated":
             effective_text = (
                 "Legacy Fast cache-first route: broad exploration is performed in the Centreline/vector-field cache; "
@@ -33883,6 +37344,260 @@ class StudioAdapter:
         elif outer_count == 0 and current_mode in {"direct_basis_search", "inner_solve"}:
             effective_text = "current-only solve; no structural exploration is required."
         return strategy_text, effective_text
+
+    @staticmethod
+    def _optimizer_report_fidelity_contract_lines(result: dict[str, Any]) -> list[str]:
+        """Return staged fidelity, budget, coverage, and directional-closure evidence."""
+        fidelity = dict(result.get("multi_fidelity", {}) or {})
+        if not fidelity:
+            return []
+
+        variables = list(result.get("variables", []) or [])
+        variable_by_id = {
+            str(item.get("id", "")): item
+            for item in variables
+            if str(item.get("id", ""))
+        }
+        variable_labels = {
+            variable_id: str(item.get("label") or item.get("kind") or variable_id or "freedom")
+            for variable_id, item in variable_by_id.items()
+        }
+
+        def human(value: Any) -> str:
+            text = str(value or "").strip()
+            return text.replace("_", " ") if text else "—"
+
+        def model_label(value: Any) -> str:
+            key = str(value or "").strip().lower()
+            if not key:
+                return "—"
+            return COIL_MODELING_LABELS.get(key, key.replace("_", " ").title())
+
+        def number(value: Any) -> str:
+            try:
+                return f"{float(value):.7g}"
+            except (TypeError, ValueError):
+                return "—"
+
+        lines: list[str] = ["SEARCH / FIDELITY CONTRACT"]
+        stage_plan = dict(fidelity.get("search_stage_plan", {}) or {})
+        stages = dict(stage_plan.get("stages", {}) or {})
+        accounting = dict(fidelity.get("search_stage_accounting", {}) or {})
+        stage_specs = (
+            ("reconnaissance", "Reconnaissance"),
+            ("physical_refinement", "Physical refinement"),
+            ("authoritative_validation", "Authoritative validation"),
+        )
+        for key, label in stage_specs:
+            stage = dict(stages.get(key, {}) or {})
+            if not stage:
+                continue
+            ceiling = int(stage.get("evaluation_ceiling", 0) or 0)
+            status = str(stage.get("execution_status", "planned") or "planned")
+            model = model_label(stage.get("model"))
+            observed = dict(accounting.get(key, {}) or {})
+            evaluated = observed.get("evaluated")
+            evaluated_text = ""
+            if evaluated is not None:
+                try:
+                    evaluated_text = f"; evaluated {int(evaluated)}"
+                except (TypeError, ValueError):
+                    pass
+            scope = str(stage.get("effort_scope", "") or "").strip()
+            scope_text = f"; scope {human(scope)}" if scope else ""
+            reserve = stage.get("correctness_reserve")
+            discretionary = stage.get("discretionary_allowance")
+            budget_text = ""
+            if reserve is not None or discretionary is not None:
+                reserve_i = int(reserve or 0)
+                discretionary_i = int(discretionary or 0)
+                used_correctness = int(observed.get("correctness_evaluated", 0) or 0)
+                used_discretionary = int(observed.get("discretionary_evaluated", 0) or 0)
+                exhausted_bits: list[str] = []
+                if bool(observed.get("correctness_budget_exhausted", False)):
+                    exhausted_bits.append("correctness exhausted")
+                if bool(observed.get("discretionary_budget_exhausted", False)):
+                    exhausted_bits.append("discretionary exhausted")
+                exhaustion = f"; {', '.join(exhausted_bits)}" if exhausted_bits else ""
+                budget_text = (
+                    f"; protected budget correctness {used_correctness}/{reserve_i}, "
+                    f"discretionary {used_discretionary}/{discretionary_i}{exhaustion}"
+                )
+            lines.append(
+                f"- {label}: {model}; ceiling {ceiling}{evaluated_text}{budget_text}; "
+                f"{human(status)}{scope_text}."
+            )
+
+        effort_completion = dict(fidelity.get("effort_completion", {}) or {})
+        if effort_completion:
+            verdict = "SATISFIED" if bool(effort_completion.get("complete", False)) else "INCOMPLETE"
+            lines.append(
+                f"- Effort contract: {verdict} — {str(effort_completion.get('message', '')).strip()}"
+            )
+            unresolved = list(effort_completion.get("unresolved_variable_ids", []) or [])
+            limited = list(effort_completion.get("limited_variable_ids", []) or [])
+            if unresolved:
+                lines.append(
+                    "  Unresolved freedoms: "
+                    + ", ".join(variable_labels.get(str(value), str(value)) for value in unresolved)
+                    + "."
+                )
+            if limited:
+                lines.append(
+                    "  Limited by selected effort: "
+                    + ", ".join(variable_labels.get(str(value), str(value)) for value in limited)
+                    + "."
+                )
+
+        coverage = list(fidelity.get("freedom_coverage", []) or [])
+        if coverage:
+            lines.extend(["", "FREEDOM COVERAGE"])
+            lines.append(
+                "Each row states what the cheap scout could represent and whether the freedom was genuinely varied under capable physical physics."
+            )
+            for entry in coverage:
+                if not isinstance(entry, dict):
+                    continue
+                variable_id = str(entry.get("id", ""))
+                label = str(entry.get("label") or variable_labels.get(variable_id) or entry.get("kind") or variable_id or "freedom")
+                scout = dict(entry.get("scout", {}) or {})
+                physical = dict(entry.get("physical_search", {}) or {})
+                authoritative = dict(entry.get("authoritative", {}) or {})
+                scout_model = model_label(scout.get("model") or "centreline")
+                scout_visibility = human(scout.get("visibility"))
+                scout_status = human(scout.get("status"))
+                omission = str(scout.get("omission_reason", "") or "").strip()
+                scout_text = f"{scout_model} {scout_visibility}; {scout_status}"
+                if omission:
+                    scout_text += f" ({human(omission)})"
+
+                physical_model = model_label(physical.get("model"))
+                physical_status = human(physical.get("status"))
+                required = bool(physical.get("required_for_complete_coverage", False))
+                try:
+                    distinct = int(physical.get("distinct_value_count", 0) or 0)
+                except (TypeError, ValueError):
+                    distinct = 0
+                physical_bits = [physical_status]
+                if distinct:
+                    physical_bits.append(f"{distinct} distinct values")
+                if physical.get("directional_closed") is True:
+                    physical_bits.append(
+                        f"directionally closed ({human(physical.get('directional_closure_reason'))})"
+                    )
+                elif physical.get("directional_closed") is False:
+                    physical_bits.append("directional closure open")
+                if required:
+                    physical_bits.append("required for complete coverage")
+                physical_text = f"{physical_model}; " + ", ".join(physical_bits)
+
+                authority_model = model_label(authoritative.get("requested_model"))
+                authority_visibility = human(authoritative.get("visibility"))
+                completion = human(entry.get("completion_status"))
+                lines.append(
+                    f"- {label}: scout [{scout_text}] | physical [{physical_text}] | "
+                    f"authority [{authority_model} {authority_visibility}] | completion [{completion}]."
+                )
+
+        def closure_section(
+            title: str,
+            plan: Any,
+            *,
+            model: str | None = None,
+            context_note: str | None = None,
+        ) -> list[str]:
+            payload = dict(plan or {}) if isinstance(plan, dict) else {}
+            entries = [item for item in list(payload.get("entries", []) or []) if isinstance(item, dict)]
+            if not entries:
+                return []
+            summary = dict(payload.get("summary", {}) or {})
+            section = ["", title]
+            if context_note:
+                section.append(str(context_note))
+            prefix = f"Model: {model_label(model)}. " if model else ""
+            section.append(
+                prefix
+                + f"Closed {int(summary.get('closed_count', 0) or 0)}/{int(summary.get('structural_freedom_count', len(entries)) or len(entries))}; "
+                + f"unresolved {int(summary.get('unresolved_count', 0) or 0)}. "
+                + "A direction is closed only by turnover, a tested best bound, a measured feasibility boundary, saturation, redundancy, or a fixed range."
+            )
+            for entry in entries:
+                variable_id = str(entry.get("id", ""))
+                label = str(entry.get("label") or variable_labels.get(variable_id) or variable_id or "freedom")
+                variable = variable_by_id.get(variable_id, {})
+                unit = str(variable.get("unit", entry.get("unit", "")) or "").strip()
+                suffix = f" {unit}" if unit else ""
+                bounds = dict(entry.get("bounds", {}) or {})
+                closure = dict(entry.get("closure", {}) or {})
+                observations = dict(entry.get("observations", {}) or {})
+                trend = dict(entry.get("trend", {}) or {})
+                best = dict(entry.get("best_observation", {}) or {}) if isinstance(entry.get("best_observation"), dict) else {}
+                low_endpoint = dict((entry.get("endpoints", {}) or {}).get("lower", {}) or {})
+                high_endpoint = dict((entry.get("endpoints", {}) or {}).get("upper", {}) or {})
+                lower_state = "tested" if low_endpoint.get("tested") else "untested"
+                upper_state = "tested" if high_endpoint.get("tested") else "untested"
+                if low_endpoint.get("tested") and low_endpoint.get("feasible") is False:
+                    lower_state += "/infeasible"
+                if high_endpoint.get("tested") and high_endpoint.get("feasible") is False:
+                    upper_state += "/infeasible"
+                status = "CLOSED" if bool(closure.get("closed", False)) else "OPEN"
+                reason = human(closure.get("reason"))
+                best_text = "—"
+                if best.get("value") is not None:
+                    best_text = f"{number(best.get('value'))}{suffix}"
+                bound_text = ""
+                if closure.get("bound"):
+                    bound_text = f"; limiting side {human(closure.get('bound'))}"
+                tested_count = int(observations.get("distinct_value_count", 0) or 0)
+                reopen_count = int(entry.get("reopen_count", 0) or 0)
+                section.append(
+                    f"- {label}: {status} — {reason}; best {best_text}; "
+                    f"bounds {number(bounds.get('effective_min'))}..{number(bounds.get('effective_max'))}{suffix} "
+                    f"[{lower_state}/{upper_state}]; {tested_count} distinct values; "
+                    f"trend {human(trend.get('direction'))}{bound_text}; reopened {reopen_count} time(s)."
+                )
+                feasibility = dict(entry.get("feasibility_boundaries", {}) or {})
+                boundary_bits: list[str] = []
+                for side in ("lower", "upper"):
+                    item = feasibility.get(side)
+                    if not isinstance(item, dict):
+                        continue
+                    boundary_bits.append(
+                        f"{side} safe {number(item.get('feasible_value'))}{suffix} / "
+                        f"blocked {number(item.get('infeasible_value'))}{suffix} ({human(item.get('feasibility_kind'))})"
+                    )
+                if boundary_bits:
+                    section.append("  Feasibility boundary: " + "; ".join(boundary_bits) + ".")
+            return section
+
+        effort_key = str(result.get("settings", {}).get("search_effort", "full")).strip().lower()
+        if effort_key == "fast":
+            scout_closure_note = (
+                "Required correctness evidence for scout-visible bounded freedoms in Fast; scout-invisible physical freedoms may remain open by policy."
+            )
+        elif effort_key == "balanced":
+            scout_closure_note = (
+                "Diagnostic only for Balanced: Centreline is used for basin reconnaissance; required directional closure is established under capable physics for the activated coupling family below."
+            )
+        else:
+            scout_closure_note = (
+                "Diagnostic only for Full: Centreline is used for broad basin reconnaissance; required directional closure is established under capable physics for every selected structural freedom below."
+            )
+        lines.extend(closure_section(
+            "DIRECTIONAL CLOSURE — CENTRELINE RECONNAISSANCE",
+            fidelity.get("directional_closure"),
+            model="centreline",
+            context_note=scout_closure_note,
+        ))
+        physical_plan = fidelity.get("physical_directional_closure")
+        if isinstance(physical_plan, dict) and list(physical_plan.get("entries", []) or []):
+            model_policy = dict(fidelity.get("model_policy", {}) or {})
+            lines.extend(closure_section(
+                "DIRECTIONAL CLOSURE — CAPABLE PHYSICS",
+                physical_plan,
+                model=model_policy.get("physical_search_model"),
+            ))
+        return lines
 
     @staticmethod
     def _optimizer_report_turn_current_realization(
@@ -34222,7 +37937,8 @@ class StudioAdapter:
         lines = [
             "FIDELITY AUDIT",
             "Important registry solutions are shown at every available physics/sample fidelity. "
-            "Ranking uses the highest trustworthy fidelity; lower-fidelity rows remain here to reveal scout optimism or model disagreement.",
+            "Ranking uses the highest trustworthy fidelity; lower-fidelity rows remain here to reveal scout optimism or model disagreement. "
+            "The Physical row may be a movable physical-refinement observation or a fixed-coordinate promotion screen.",
         ]
         for candidate_id in ordered_ids:
             record = by_id[candidate_id]
@@ -34244,7 +37960,7 @@ class StudioAdapter:
             promotion = tier_eval(record, "promotion")
             authoritative = tier_eval(record, "authoritative")
             lines.append(evaluation_text("Scout", scout))
-            lines.append(evaluation_text("Promotion", promotion))
+            lines.append(evaluation_text("Physical", promotion))
             lines.append(evaluation_text("Authoritative", authoritative))
             delta = delta_text(scout, authoritative)
             if delta:
@@ -34375,6 +38091,9 @@ class StudioAdapter:
             lines.append(f"Search strategy: {strategy_text}")
         if effective_search_text:
             lines.append(f"Effective search: {effective_search_text}")
+        fidelity_contract_lines = StudioAdapter._optimizer_report_fidelity_contract_lines(result)
+        if fidelity_contract_lines:
+            lines.extend(["", *fidelity_contract_lines])
         exposure_registration = strategy.get("exposure_registration", {}) or {}
         if bool(exposure_registration.get("enabled", False)):
             exposure_evaluations = int(exposure_registration.get("evaluations", 0) or 0)
@@ -34637,12 +38356,20 @@ class StudioAdapter:
             validation_evaluations = int(fidelity.get("physical_validation_evaluations", 0) or 0)
             refine_seeds = int(fidelity.get("physical_refinement_seed_count", 0) or 0)
             refine_evaluations = int(fidelity.get("physical_refinement_evaluations", 0) or 0)
-            lines.append(
-                "Optimizer 2.2 cheap-first pipeline: simplified Centreline/vector-cache mapping "
-                f"({scout_samples}/{full_samples} target samples, {scout_coordinates or raw_coordinates} mapped structural coordinates) "
-                "→ physics/relationship/symmetry skeptic coverage where applicable → geometry-only DRC feasibility overlay "
-                "→ cost-aware intermediate physical promotion when worthwhile → authoritative full-model finalist vet."
-            )
+            if refine_evaluations > 0:
+                lines.append(
+                    "Optimizer 2.4 staged pipeline: simplified Centreline/vector-cache reconnaissance "
+                    f"({scout_samples}/{full_samples} target samples, {scout_coordinates or raw_coordinates} mapped structural coordinates) "
+                    "→ geometry-only DRC feasibility overlay → movable capable-physics basin refinement "
+                    "→ authoritative full-model finalist vet."
+                )
+            else:
+                lines.append(
+                    "Optimizer 2.4 staged pipeline: simplified Centreline/vector-cache reconnaissance "
+                    f"({scout_samples}/{full_samples} target samples, {scout_coordinates or raw_coordinates} mapped structural coordinates) "
+                    "→ geometry-only DRC feasibility overlay → authoritative full-model finalist vet. "
+                    "No movable capable-physics refinement evaluations were performed in this run."
+                )
             if search_effort == "Fast":
                 if fast_funnel_used:
                     if bool(exposure_registration.get("enabled", False)):
@@ -34667,16 +38394,85 @@ class StudioAdapter:
                     )
             elif search_effort == "Balanced":
                 lines.append(
-                    "Balanced cheap-first policy: broader Centreline/vector-cache mapping preserves raw/collective bounds, "
+                    "Balanced hybrid policy: broader Centreline/vector-cache reconnaissance preserves raw/collective bounds, "
                     "target alignment, known relations, symmetry breaking, Sobol skeptic coverage and adaptive subdivision; "
-                    "geometry-only DRC is overlaid before a moderate diverse authoritative finalist vet."
+                    "after geometry-only DRC, every Centreline capability-gap freedom must be actively varied with capable "
+                    "physical physics together with its declared coupled coordinates before the run can report convergence."
                 )
             else:
                 lines.append(
-                    "Full cheap-first policy: the densest canonical/relation/symmetry/Sobol/adaptive map and widest cheap "
-                    "skeptic coverage are used before geometry-only DRC and the largest diverse authoritative finalist vet; "
-                    "the expensive model remains a final verifier rather than an exploratory search engine."
+                    "Full dimensional policy: the densest canonical/relation/symmetry/Sobol/adaptive reconnaissance is used to "
+                    "find diverse basins before geometry-only DRC; every selected structural freedom is then reopened across its "
+                    "permitted range under capable physical physics. Full cannot report convergence until every selected freedom "
+                    "is physically explored, analytically solved, or explicitly proven redundant."
                 )
+            model_policy = dict(fidelity.get("model_policy", {}) or {})
+            if model_policy:
+                requested_model = str(model_policy.get("requested_model", "auto"))
+                physical_model = model_policy.get("physical_search_model")
+                authoritative_model = str(
+                    model_policy.get("authoritative_model", requested_model)
+                )
+                requested_label = COIL_MODELING_LABELS.get(
+                    requested_model, requested_model.replace("_", " ").title()
+                )
+                authority_label = COIL_MODELING_LABELS.get(
+                    authoritative_model, authoritative_model.replace("_", " ").title()
+                )
+                if physical_model is None:
+                    physical_text = "no movable physical-refinement model required by this effort"
+                else:
+                    physical_key = str(physical_model)
+                    physical_label = COIL_MODELING_LABELS.get(
+                        physical_key, physical_key.replace("_", " ").title()
+                    )
+                    physical_text = (
+                        f"{physical_label} ({str(model_policy.get('physical_search_reason', '')).replace('_', ' ')})"
+                    )
+                authority_suffix = (
+                    " (dynamic Auto authority)"
+                    if str(model_policy.get("authoritative_mode", "")) == "dynamic_auto"
+                    else " (fixed requested-model authority; silent Centreline fallback is not accepted for participating coils)"
+                )
+                lines.append(
+                    "Model fidelity policy: Preferences requested "
+                    f"{requested_label}; reconnaissance uses Centreline; physical refinement uses {physical_text}; "
+                    f"authoritative validation uses {authority_label}{authority_suffix}."
+                )
+            effort_completion = dict(fidelity.get("effort_completion", {}) or {})
+            if effort_completion:
+                variable_labels = {
+                    str(item.get("id", "")): str(
+                        item.get("label", item.get("id", "freedom"))
+                    )
+                    for item in variables
+                    if str(item.get("id", ""))
+                }
+                unresolved_ids = list(
+                    effort_completion.get("unresolved_variable_ids", []) or []
+                )
+                limited_ids = list(
+                    effort_completion.get("limited_variable_ids", []) or []
+                )
+                if bool(effort_completion.get("complete", False)):
+                    effort_line = "Effort completion: satisfied. " + str(
+                        effort_completion.get("message", "")
+                    )
+                else:
+                    effort_line = "Effort completion: INCOMPLETE. " + str(
+                        effort_completion.get("message", "")
+                    )
+                if unresolved_ids:
+                    effort_line += " Unresolved: " + ", ".join(
+                        variable_labels.get(str(value), str(value))
+                        for value in unresolved_ids
+                    ) + "."
+                if limited_ids:
+                    effort_line += " Limited by effort policy: " + ", ".join(
+                        variable_labels.get(str(value), str(value))
+                        for value in limited_ids
+                    ) + "."
+                lines.append(effort_line)
             if bool(fidelity.get("source_full_field_deferred", False)):
                 lines.append(
                     "Source-scene magnetic anchor: deferred. The source assembly was checked for geometry/DRC feasibility "
@@ -34746,8 +38542,8 @@ class StudioAdapter:
                 )
             if bool(fidelity.get("scout_map_unsaturated_landmarks_retained", False)):
                 lines.append(
-                    "Primary saturation was not reached; the best continuous cheap-map rankings were retained anyway "
-                    "for DRC and authoritative finalist vetting."
+                    "Primary saturation was not reached; the best continuous reconnaissance rankings were retained anyway "
+                    "for DRC, capable-physics refinement where required, and authoritative validation."
                 )
             if bool(fidelity.get("scout_field_stamp_enabled", False)):
                 stamp_mode = str(fidelity.get("scout_field_stamp_mode") or "grid_stamp")
@@ -35158,6 +38954,47 @@ class StudioAdapter:
                 validation_limit = int(fidelity.get("exact_finalist_validation_limit", validation_evaluations) or 0)
                 neighbour_count = int(fidelity.get("low_dimensional_vet_neighbour_count", 0) or 0)
                 physical_probe_count = int(fidelity.get("physical_only_probe_count", 0) or 0)
+                if int(fidelity.get("physical_refinement_evaluations", 0) or 0) > 0:
+                    refinement_model = str(
+                        fidelity.get("physical_refinement_model") or "physical"
+                    )
+                    refinement_label = COIL_MODELING_LABELS.get(
+                        refinement_model, refinement_model
+                    )
+                    refinement_seeds = int(
+                        fidelity.get("physical_refinement_seed_count", 0) or 0
+                    )
+                    refinement_evaluations = int(
+                        fidelity.get("physical_refinement_evaluations", 0) or 0
+                    )
+                    refinement_feasible = int(
+                        fidelity.get("physical_refinement_feasible_count", 0) or 0
+                    )
+                    refinement_local = int(
+                        fidelity.get("physical_refinement_local_evaluations", 0) or 0
+                    )
+                    refinement_samples = int(
+                        fidelity.get("physical_refinement_sample_count", 0) or 0
+                    )
+                    refinement_workers = int(
+                        fidelity.get("physical_refinement_worker_count", 0) or 0
+                    )
+                    active_ids = list(
+                        fidelity.get("physical_refinement_active_variable_ids", []) or []
+                    )
+                    lines.append(
+                        f"Physical basin refinement: {refinement_seeds} retained scout basin(s) were allowed to move "
+                        f"across {len(active_ids)} coupled structural coordinate(s) with {refinement_label} on "
+                        f"{refinement_samples} target samples; {refinement_evaluations} setting(s) were evaluated "
+                        f"using up to {refinement_workers} worker{'s' if refinement_workers != 1 else ''}, "
+                        f"{refinement_feasible} were feasible, and {refinement_local} evaluation(s) belonged to "
+                        "local physical adaptation."
+                    )
+                elif fidelity.get("physical_refinement_reason"):
+                    lines.append(
+                        "Physical basin refinement not used: "
+                        + str(fidelity.get("physical_refinement_reason"))
+                    )
                 if bool(fidelity.get("intermediate_enabled", False)):
                     intermediate_model = str(fidelity.get("intermediate_model") or "intermediate")
                     intermediate_label = COIL_MODELING_LABELS.get(intermediate_model, intermediate_model)
@@ -35194,14 +39031,22 @@ class StudioAdapter:
                     fidelity.get("authoritative_initial_validation_limit", validation_evaluations) or 0
                 )
                 progressive_extra = int(fidelity.get("authoritative_progressive_extra_count", 0) or 0)
-                lines.append(
-                    f"Authoritative finalist vet: {physical_feasible} structurally distinct feasible survivor(s); "
-                    f"{validation_evaluations} full-model validation evaluation(s) from a progressive ceiling of {validation_limit} "
-                    f"({initial_validation_limit} opened initially, {progressive_extra} additional slot(s) used). "
-                    f"The cheap-map vet pool also included {neighbour_count} low-dimensional neighbour probe(s) and "
-                    f"{physical_probe_count} physical-only bound probe(s). No exploratory full-model sweep, active-set search, "
-                    "boundary convergence, or local full-model adaptation followed the map."
-                )
+                if int(fidelity.get("physical_refinement_evaluations", 0) or 0) > 0:
+                    lines.append(
+                        f"Authoritative finalist vet: {physical_feasible} structurally distinct feasible survivor(s); "
+                        f"{validation_evaluations} full-model validation evaluation(s) from a progressive ceiling of {validation_limit} "
+                        f"({initial_validation_limit} opened initially, {progressive_extra} additional slot(s) used). "
+                        f"The authoritative queue included candidates generated by the movable physical-refinement stage, plus "
+                        f"{neighbour_count} low-dimensional neighbour probe(s) and {physical_probe_count} physical-only bound probe(s)."
+                    )
+                else:
+                    lines.append(
+                        f"Authoritative finalist vet: {physical_feasible} structurally distinct feasible survivor(s); "
+                        f"{validation_evaluations} full-model validation evaluation(s) from a progressive ceiling of {validation_limit} "
+                        f"({initial_validation_limit} opened initially, {progressive_extra} additional slot(s) used). "
+                        f"The cheap-map vet pool also included {neighbour_count} low-dimensional neighbour probe(s) and "
+                        f"{physical_probe_count} physical-only bound probe(s)."
+                    )
             elif bool(fidelity.get("fast_map_early_accept", False)):
                 lines.append(
                     f"Engineering promotion: {physical_feasible} structurally distinct full-model feasible seeds; "
@@ -35261,14 +39106,22 @@ class StudioAdapter:
             if fidelity.get("fallback_reason"):
                 lines.append(
                     "Cheap-map fallback: " + str(fidelity.get("fallback_reason"))
-                    + " Automatic Optimizer 2.2 does not convert this into an exploratory authoritative-model search."
+                    + " Optimizer 2.4 preserves the selected effort/fidelity and directional-closure contracts; any required capable-physics coverage must still be satisfied before convergence is reported."
                 )
         convergence = result.get("convergence", {}) or {}
         if convergence:
-            if convergence.get("cheap_first_completed"):
-                verdict = "cheap-first map + authoritative finalist vet completed"
-            elif convergence.get("converged"):
-                verdict = "converged"
+            effort_name = str(result.get("settings", {}).get("search_effort", "full") or "full").strip().title()
+            effort_contract_complete = bool(convergence.get("effort_contract_complete", True))
+            physical_work = int(fidelity.get("physical_refinement_evaluations", 0) or 0) if isinstance(fidelity, dict) else 0
+            if convergence.get("converged") and effort_contract_complete:
+                if physical_work > 0:
+                    verdict = f"{effort_name} staged search contract completed"
+                elif convergence.get("cheap_first_completed"):
+                    verdict = f"{effort_name} reconnaissance/verification contract completed"
+                else:
+                    verdict = "converged"
+            elif not effort_contract_complete:
+                verdict = f"{effort_name} effort contract incomplete"
             elif convergence.get("fast_cache_accepted"):
                 verdict = "Fast cache-first search completed"
             elif convergence.get("fast_budget_completed"):
@@ -37999,6 +41852,29 @@ class StudioAdapter:
                     source, default=defaults[key]
                 )
             mesh["surface_region_settings"] = normalized
+        elif method == "set_surface_region_analysis_settings":
+            if self.surface_region_properties(str(mesh["id"])) is None:
+                raise StudioOperationError(
+                    "Surface-region analysis settings are not available for this object."
+                )
+            current = self.surface_region_analysis_properties(str(mesh["id"]))
+            if "depth_mm" in params:
+                current["depth_mm"] = params["depth_mm"]
+            try:
+                depth_mm = float(current["depth_mm"])
+            except (TypeError, ValueError) as error:
+                raise StudioOperationError(
+                    "Surface-region sampling depth must be numeric."
+                ) from error
+            if (
+                not math.isfinite(depth_mm)
+                or not MINIMUM_SURFACE_DEPTH_MM <= depth_mm <= MAXIMUM_SURFACE_DEPTH_MM
+            ):
+                raise StudioOperationError(
+                    "Surface-region sampling depth must be between "
+                    f"{MINIMUM_SURFACE_DEPTH_MM:g} and {MAXIMUM_SURFACE_DEPTH_MM:g} mm."
+                )
+            mesh["surface_region_analysis"] = {"depth_mm": depth_mm}
         elif method == "set_measurement_settings":
             capabilities = self.geometry_capabilities(str(mesh["id"]))
             if not capabilities["measurement"]:
@@ -39167,34 +43043,50 @@ class StudioAdapter:
         }
         return [ring_trace, marker_trace]
 
+    def _geometry_mesh_traces(
+        self,
+        mesh: dict[str, Any],
+        *,
+        respect_visibility: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Return the canonical Model Editor traces for one Workbench mesh.
+
+        Exposure Analysis compact previews deliberately call this same helper,
+        rather than reconstructing a second Mesh3d interpretation.  Keeping the
+        trace source shared means colour, opacity, flat/smooth shading, transforms
+        and any object-specific display overlays stay identical to Scene View.
+        """
+        if respect_visibility and not self._geometry_effectively_visible(mesh):
+            return []
+        vertices, faces = self._mesh_world_vertices_faces(mesh)
+        if len(vertices) == 0 or len(faces) == 0:
+            return []
+        role = mesh.get("role", "visual")
+        traces = [
+            {
+                "type": "mesh3d",
+                "x": vertices[:, 0].tolist(),
+                "y": vertices[:, 1].tolist(),
+                "z": vertices[:, 2].tolist(),
+                "i": faces[:, 0].tolist(),
+                "j": faces[:, 1].tolist(),
+                "k": faces[:, 2].tolist(),
+                "color": mesh.get("colour", self._role_colour(role)),
+                "opacity": float(mesh.get("opacity", 0.28)),
+                "flatshading": True,
+                "name": f"{mesh.get('label', mesh['id'])} ({role})",
+                "hovertemplate": f"{mesh.get('label', mesh['id'])}<br>Role: {role}<extra></extra>",
+                "meta": {"field_workbench_object_id": mesh["id"]},
+                "showlegend": True,
+            }
+        ]
+        traces.extend(self._well_plate_overlay_traces(mesh))
+        return traces
+
     def _geometry_traces(self) -> list[dict[str, Any]]:
         traces: list[dict[str, Any]] = []
         for mesh in self.geometry:
-            if not self._geometry_effectively_visible(mesh):
-                continue
-            vertices, faces = self._mesh_world_vertices_faces(mesh)
-            if len(vertices) == 0 or len(faces) == 0:
-                continue
-            role = mesh.get("role", "visual")
-            traces.append(
-                {
-                    "type": "mesh3d",
-                    "x": vertices[:, 0].tolist(),
-                    "y": vertices[:, 1].tolist(),
-                    "z": vertices[:, 2].tolist(),
-                    "i": faces[:, 0].tolist(),
-                    "j": faces[:, 1].tolist(),
-                    "k": faces[:, 2].tolist(),
-                    "color": mesh.get("colour", self._role_colour(role)),
-                    "opacity": float(mesh.get("opacity", 0.28)),
-                    "flatshading": True,
-                    "name": f"{mesh.get('label', mesh['id'])} ({role})",
-                    "hovertemplate": f"{mesh.get('label', mesh['id'])}<br>Role: {role}<extra></extra>",
-                    "meta": {"field_workbench_object_id": mesh["id"]},
-                    "showlegend": True,
-                }
-            )
-            traces.extend(self._well_plate_overlay_traces(mesh))
+            traces.extend(self._geometry_mesh_traces(mesh, respect_visibility=True))
         return traces
 
     def _surface_region_trace(

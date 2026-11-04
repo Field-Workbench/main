@@ -53,9 +53,10 @@ When the build succeeds, exercise the release-candidate paths in the frozen exec
 - **Maps → Static:** render at least one 2D and one 3D map and create/reopen a Measurement-volume
   snapshot.
 - **Maps → Scripted:** render a saved exposure in 2D, 3D, and Brain View. Confirm Scripted 2D/3D
-  has no Measurement-volume snapshot panel, Brain shows its Brain Areas panel, audio starts off,
+  can show the optional Live measurement analysis panel when enabled before generation,
+  exposes no Static Measurement snapshot action, Brain shows its Brain Areas panel, audio starts off,
   and a short video exports with the bundled encoder.
-- **Exposure Analysis:** from Exposure Editor run **Analyze exposure…**, create a fresh analysis,
+- **Exposure Analysis:** open **Project Manager → Maps / Analysis → Exposure Analysis** (or use **Analyze exposure…** as a shortcut from Exposure Editor), create a fresh analysis,
   and exercise at least one uncached derived calculation (or **Calculate all uncached analyses**).
   Confirm the analysis window is taskbar-visible, the single-worker queue never runs two derived jobs
   at once, and Pause/Run/Cancel behave normally. Close/reopen the resource from Saved Results and
@@ -65,6 +66,11 @@ When the build succeeds, exercise the release-candidate paths in the frozen exec
 - Save and reopen the project to confirm datasets, calibration links, waveforms, exposures, saved
   maps/snapshots, and Exposure Analysis caches persist. Open the updated Help Topics from the
   frozen application.
+
+Before approving agent access, follow the **Windows executable and separate client**
+setup in [Agent access](docs/AGENT_ACCESS.md) and the packaged acceptance checklist
+in [TESTING.md](TESTING.md). The startup smoke test above does not exercise the
+listener, client, MCP, numerical jobs, or new measurement playback features.
 
 Then ZIP the complete `dist\FieldWorkbench` directory. Do not remove `_internal`,
 `licenses`, Qt resources, or the three top-level notice files.

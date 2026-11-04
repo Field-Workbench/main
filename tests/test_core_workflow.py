@@ -52,6 +52,11 @@ from fieldworkbench.getdp_export import (
     getdp_export_plan,
     render_getdp_project,
 )
+from fieldworkbench.optimizer_search_plan import (
+    optimizer_authoritative_validation_ceiling,
+    optimizer_reconnaissance_budget,
+    optimizer_reconnaissance_budget_split,
+)
 from fieldworkbench.studio_adapter import (
     FIELD_HEAT_COLOURSCALE,
     FIELD_SIGNED_COLOURSCALE,
@@ -161,7 +166,7 @@ class CoreWorkflowTests(unittest.TestCase):
         )
         metadata = self.adapter.document()["field_workbench"]
         self.assertEqual(metadata["exposure_analyses"][0]["id"], analysis_id)
-        self.assertEqual(metadata["exposure_analyses"][0]["format_version"], 3)
+        self.assertEqual(metadata["exposure_analyses"][0]["format_version"], 5)
         self.assertNotIn("statistics_scope", metadata["exposure_analyses"][0])
         self.assertNotIn("statistics_duration_s", metadata["exposure_analyses"][0])
         self.assertIn("cache_b64", metadata["exposure_analyses"][0])
@@ -175,7 +180,38 @@ class CoreWorkflowTests(unittest.TestCase):
 
         restored = self.adapter.exposure_analysis(analysis_id)
         self.assertEqual(restored["status"], "stale")
-        self.assertEqual(restored["payload"], payload)
+        # v5 preparations enrich the persisted context with the generic regional
+        # engine/provider description and layered cache identities.  Preserve the
+        # caller-supplied preparation verbatim apart from those authoritative
+        # provenance fields rather than expecting the pre-v5 payload shape.
+        restored_payload = copy.deepcopy(restored["payload"])
+        restored_context = restored_payload["exposure_analysis_context"]
+        self.assertEqual(restored_context["analysis_engine"], "regional_analysis_v2")
+        self.assertGreaterEqual(restored_context["regional_schema_version"], 1)
+        self.assertEqual(restored_context["region_set"]["key"], "sri24.lpba40")
+        self.assertEqual(restored_context["region_set"]["kind"], "atlas_volume")
+        self.assertEqual(
+            restored_context["geometry_cache_identity"],
+            restored["geometry_cache_identity"],
+        )
+        self.assertEqual(
+            restored_context["exposure_data_identity"],
+            restored["exposure_data_identity"],
+        )
+        self.assertEqual(
+            restored_context["preparation_identity"],
+            restored["preparation_identity"],
+        )
+        for key in (
+            "analysis_engine",
+            "regional_schema_version",
+            "region_set",
+            "geometry_cache_identity",
+            "exposure_data_identity",
+            "preparation_identity",
+        ):
+            restored_context.pop(key, None)
+        self.assertEqual(restored_payload, payload)
         self.assertEqual(restored["analysis_cache"], cache)
 
         updated_cache = dict(cache)
@@ -334,7 +370,7 @@ class CoreWorkflowTests(unittest.TestCase):
         self.adapter.save_exposure_analysis_resource(payload, name="Disposable cache")
         scene_ids = [item["id"] for item in self.adapter.list_objects()]
         document = self.adapter.document()
-        document["field_workbench"]["exposure_analyses"][0]["format_version"] = 2
+        document["field_workbench"]["exposure_analyses"][0]["format_version"] = 4
 
         reopened = StudioAdapter(document)
         self.assertEqual([item["id"] for item in reopened.list_objects()], scene_ids)
@@ -2036,7 +2072,7 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertIn("Mismatch: ΔZ Position Group A: expected 0.5 mm, returned 0 mm (canonical 0.5 vs 0)", report)
         self.assertIn("candidate_000140: worker error", report)
         self.assertIn("Worker error: int() argument must be a string", report)
-        self.assertIn("Optimizer 2.2 cheap-first pipeline", report)
+        self.assertIn("Optimizer 2.4 staged pipeline", report)
         self.assertIn("256/1791 target samples", report)
         self.assertIn("3072 simplified evaluations", report)
         self.assertIn("2200 pre-adaptive atlas evaluations", report)
@@ -2691,8 +2727,12 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertIn("outer_dimensions >= 1", source)
         self.assertIn('design_map_mode = bool(raw_settings.get("_optimizer_design_map", False)) and outer_dimensions >= 2', source)
         self.assertIn('if outer_dimensions == 2 and not design_map_mode:', source)
-        self.assertIn('scout_budget_default = {"fast": 96, "balanced": 128, "full": 192}[search_effort]', source)
-        self.assertIn('scout_budget_default = {"fast": 320, "balanced": 640, "full": 1280}[search_effort]', source)
+        self.assertIn('directional_closure = optimizer_directional_closure_plan(structural_variables)', source)
+        self.assertIn('search_stage_plan = optimizer_search_stage_plan(', source)
+        self.assertIn('optimizer_stage_budget_component(', source)
+        self.assertIn('scout_settings["_optimizer_correctness_reserve"]', source)
+        self.assertIn('scout_settings["_optimizer_discretionary_allowance"]', source)
+        self.assertIn('"protected_correctness_plus_discretionary"', source)
         self.assertIn('scout_settings["_optimizer_use_field_stamps"] = True', source)
         self.assertIn('scout_adapter.set_coil_modeling_method("centreline")', source)
         self.assertIn('fallback_settings["_optimizer_design_map"] = False', source)
@@ -2708,25 +2748,69 @@ class CoreWorkflowTests(unittest.TestCase):
         self.assertNotIn('refine_limit = {"fast": 0, "balanced": 2, "full": 5}', source)
 
     def test_optimizer_effort_spends_extra_budget_on_cheap_map_and_small_finalist_vet(self):
+        # Optimizer 2.4 owns effort budgets in optimizer_search_plan rather than
+        # embedding scout constants in the StudioAdapter search body.  Verify the
+        # effort scaling and the protected correctness/discretionary partition as
+        # behavior, not brittle source-code strings.
+        fast_1d, fast_1d_floor, _ = optimizer_reconnaissance_budget(
+            search_effort="fast", scout_coordinate_count=1
+        )
+        balanced_1d, _balanced_1d_floor, _ = optimizer_reconnaissance_budget(
+            search_effort="balanced", scout_coordinate_count=1
+        )
+        full_1d, _full_1d_floor, _ = optimizer_reconnaissance_budget(
+            search_effort="full", scout_coordinate_count=1
+        )
+        self.assertEqual((fast_1d, fast_1d_floor), (96, 64))
+        self.assertEqual(balanced_1d, 128)
+        self.assertEqual(full_1d, 192)
+
+        fast_nd, _fast_nd_floor, _ = optimizer_reconnaissance_budget(
+            search_effort="fast", scout_coordinate_count=4
+        )
+        balanced_nd, _balanced_nd_floor, _ = optimizer_reconnaissance_budget(
+            search_effort="balanced", scout_coordinate_count=4
+        )
+        full_nd, _full_nd_floor, _ = optimizer_reconnaissance_budget(
+            search_effort="full", scout_coordinate_count=4
+        )
+        self.assertEqual(fast_nd, 640)
+        self.assertEqual(balanced_nd, 2560)
+        self.assertEqual(full_nd, 4096)
+        self.assertLess(fast_nd, balanced_nd)
+        self.assertLess(balanced_nd, full_nd)
+
+        split = optimizer_reconnaissance_budget_split(
+            search_effort="fast", scout_coordinate_count=4, total_ceiling=fast_nd
+        )
+        self.assertGreater(split["correctness_reserve"], 0)
+        self.assertGreater(split["discretionary_allowance"], 0)
+        self.assertEqual(
+            split["correctness_reserve"] + split["discretionary_allowance"],
+            fast_nd,
+        )
+
+        fast_authority, _ = optimizer_authoritative_validation_ceiling(
+            search_effort="fast", finalist_count=1
+        )
+        balanced_authority, _ = optimizer_authoritative_validation_ceiling(
+            search_effort="balanced", finalist_count=1
+        )
+        full_authority, _ = optimizer_authoritative_validation_ceiling(
+            search_effort="full", finalist_count=1
+        )
+        self.assertEqual(fast_authority, 6)
+        self.assertEqual(balanced_authority, 10)
+        self.assertEqual(full_authority, 14)
+
         source = inspect.getsource(StudioAdapter.run_optimizer_tuning)
-        self.assertIn('default_cap = min(8, max(6, requested_finalists))', source)
-        self.assertIn('default_cap = min(14, max(10, requested_finalists + 4))', source)
-        self.assertIn('default_cap = min(24, max(14, 2 * requested_finalists + 2))', source)
-        self.assertIn('scout_budget_default = min(1024, max(640, 96 * max(4, scout_coordinate_count)))', source)
-        self.assertIn('scout_budget_default = min(4096, max(2560, 192 * max(4, scout_coordinate_count)))', source)
-        self.assertIn('max(4096, 768 * max(4, scout_coordinate_count))', source)
         self.assertIn('"fast": min(3, max(2, finalist_count))', source)
         self.assertIn('"balanced": min(5, max(3, finalist_count))', source)
         self.assertIn('"full": min(8, max(5, finalist_count + 2))', source)
-        self.assertIn('intermediate_model = "bundled"', source)
-        self.assertIn('"fast": 96, "balanced": 160, "full": 256', source)
         self.assertIn('authoritative_initial_validation_limit', source)
         self.assertIn('authoritative_progressive_extra_count', source)
-        self.assertIn('"physical_refinement_seed_count": 0', source)
-        self.assertIn('"physical_refinement_evaluations": 0', source)
         self.assertIn('low_dimensional_vet_neighbour_count', source)
         self.assertIn('physical_only_probe_count', source)
-        self.assertIn('No exploratory full-model sweep, active-set search', source)
 
     def test_optimizer_report_marks_fast_budget_completion_and_lists_family_realizations(self):
         variables = [

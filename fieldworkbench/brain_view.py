@@ -52,6 +52,15 @@ from .brain_mesh import (
     LPBA40_MESH_CACHE_STRIDE,
     load_lpba40_region_meshes,
 )
+from .lpba40_display import (
+    LPBA40_DIVISION_COLOURS,
+    LPBA40_REGION_OPACITY,
+    LPBA40_SELECTED_REGION_COLOUR,
+    LPBA40_SELECTED_REGION_OPACITY,
+    build_lpba40_region_trace,
+    lpba40_division_key_by_label,
+    lpba40_region_style,
+)
 from .dialogs import (
     _BackgroundFieldRenderMixin,
     CollapsibleSection,
@@ -87,19 +96,6 @@ LPBA40_VISUAL_MESH_STRIDE = LPBA40_MESH_CACHE_STRIDE
 BRAIN_FIELD_RENDER_MODE = "volume"
 BRAIN_FIELD_RENDER_RESOLUTION = 33
 BRAIN_FIELD_RENDER_SLICE_COUNT = 9
-LPBA40_REGION_OPACITY = 0.34
-LPBA40_SELECTED_REGION_OPACITY = 0.92
-LPBA40_SELECTED_REGION_COLOUR = "#facc15"
-LPBA40_DIVISION_COLOURS: dict[str, str] = {
-    "frontal": "#4e79a7",
-    "parietal": "#59a14f",
-    "occipital": "#76b7b2",
-    "temporal": "#b07aa1",
-    "insula": "#edc948",
-    "limbic": "#f28e2b",
-    "deep_gray": "#e15759",
-    "hindbrain": "#9c755f",
-}
 from .exposure_panel import (
     REGION_KEY_ROLE,
     REGION_LABEL_IDS_ROLE,
@@ -168,11 +164,9 @@ class BrainViewDialog(
         self.brain_object_label = str(brain_object.get("label", "SRI24 brain"))
         self.parcellation: SRI24Parcellation = load_sri24_parcellation("lpba40")
         self.region_hierarchy = lpba40_region_hierarchy(self.parcellation)
-        self._division_key_by_label: dict[int, str] = {
-            int(label_id): division.key
-            for division in self.region_hierarchy.children
-            for label_id in division.label_ids
-        }
+        self._division_key_by_label = lpba40_division_key_by_label(
+            self.region_hierarchy
+        )
         mesh = self.adapter._mesh(self.brain_object_id)
         position_m, rotation = self.adapter._mesh_world_transform(mesh)
         scale_xyz = self.adapter._mesh_scale_xyz(mesh)
@@ -1760,61 +1754,29 @@ class BrainViewDialog(
         self, label_id: int, *, selected: bool
     ) -> dict[str, Any]:
         mesh = self.region_meshes.regions[int(label_id)]
-        vertices = mesh.vertices_mm
-        triangles = mesh.triangles
-        division_key = self._division_key_by_label.get(int(label_id), "")
-        colour = (
-            LPBA40_SELECTED_REGION_COLOUR
-            if selected
-            else LPBA40_DIVISION_COLOURS.get(division_key, "#9ca3af")
-        )
-        opacity = (
-            LPBA40_SELECTED_REGION_OPACITY if selected else LPBA40_REGION_OPACITY
-        )
         definition = self.parcellation.labels[int(label_id)]
         display_name = definition.name.replace("_", " ")
-        return {
-            "type": "mesh3d",
-            "x": vertices[:, 0].tolist(),
-            "y": vertices[:, 1].tolist(),
-            "z": vertices[:, 2].tolist(),
-            "i": triangles[:, 0].tolist(),
-            "j": triangles[:, 1].tolist(),
-            "k": triangles[:, 2].tolist(),
-            "color": colour,
-            "opacity": opacity,
-            "flatshading": False,
-            "lighting": {
-                "ambient": 0.58,
-                "diffuse": 0.72,
-                "specular": 0.16,
-                "roughness": 0.78,
-                "fresnel": 0.08,
-            },
-            "name": display_name,
-            "hovertemplate": display_name + "<extra></extra>",
-            "showlegend": False,
-            "uid": f"brain-view-region-{int(label_id)}",
-            "meta": {
+        return build_lpba40_region_trace(
+            label_id=int(label_id),
+            vertices_mm=mesh.vertices_mm,
+            triangles=mesh.triangles,
+            display_name=display_name,
+            division_key_by_label=self._division_key_by_label,
+            selected=selected,
+            uid=f"brain-view-region-{int(label_id)}",
+            meta={
                 "field_workbench_object_id": f"brain-region:{int(label_id)}",
                 "brain_region_label_id": int(label_id),
             },
-        }
+            interactive=True,
+        )
 
     def _region_shell_style(self, label_id: int, *, selected: bool) -> dict[str, Any]:
-        division_key = self._division_key_by_label.get(int(label_id), "")
-        return {
-            "color": (
-                LPBA40_SELECTED_REGION_COLOUR
-                if selected
-                else LPBA40_DIVISION_COLOURS.get(division_key, "#9ca3af")
-            ),
-            "opacity": (
-                LPBA40_SELECTED_REGION_OPACITY
-                if selected
-                else LPBA40_REGION_OPACITY
-            ),
-        }
+        return lpba40_region_style(
+            int(label_id),
+            division_key_by_label=self._division_key_by_label,
+            selected=selected,
+        )
 
     def _selector_title(
         self, selected_name: str, selected_label_ids: set[int]

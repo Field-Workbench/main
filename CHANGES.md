@@ -1,5 +1,503 @@
 # Field Workbench changes
 
+## Unreleased — Measurement playback and local agent access
+
+The source version remains 0.14.0.313. The following changes are not a claim of
+Windows packaged or manual release acceptance.
+
+- Added optional projected sensor placements and well rims to newly generated static and scripted 2D maps. Well rims use built-in plate geometry and follow the plate transform; they are independent of object outlines.
+- Added optional Live measurement analysis to Scripted 2D/3D maps. The panel follows playback and scrubbing, using defined well points or configured measurement sampling.
+- Added expandable individual-point rows for explicitly defined samples, including well labels, selection highlighting, and draggable metric columns. Point child rows are limited to 2,000 per object; aggregate statistics retain all numerical samples.
+- Updated the existing 4D-box example.
+
+### Shared local CLI/MCP command system
+
+- Added one command registry and live dispatcher for project/model operations, resource discovery, notes, calculations, and optimizer jobs. CLI help and MCP tool schemas are derived from that registry.
+- Added opt-in `--automation` startup, authenticated per-user instance discovery, main-thread command dispatch, bounded request replay protection, atomic exports, and explicit project revision checks.
+- Added frozen-model background jobs with progress, cooperative cancellation, retained numerical results, provenance exports, and undoable measurement-snapshot/optimizer-finalist application.
+- Added `fwb.py`, a lightweight source CLI, an optional pinned MCP stdio bridge dependency, automated end-to-end coverage, and `docs/AGENT_ACCESS.md`. User acceptance and packaged-release testing are deferred.
+
+## 0.14.0.313 — Physical-refinement coordinate propagation and report cleanup
+
+- Fixed capable-physics candidate reconstruction so every structural coordinate supplied by a candidate is restored, including scout-invisible freedoms such as axial winding length. Previously `parent_row_from_values()` copied only Centreline-visible structural variables, which could reset a physically optimized axial winding length to the source value between directional axes and before authoritative finalist vetting.
+- Kept the fix generic rather than special-casing axial width: future structural freedoms omitted from the Centreline scout now survive physical directional/coupled refinement whenever the capable-physics candidate carries them.
+- Corrected Optimizer 2.4 Balanced/Full report wording. Centreline is described as basin reconnaissance for these efforts; required directional closure is established under capable physics for the activated coupling family (Balanced) or every selected structural freedom (Full).
+- Added an effort-specific note above the Centreline directional-closure audit so an intentionally open diagnostic scout table in Balanced/Full is not misrepresented as a failed effort contract. Fast continues to identify Centreline closure as required correctness evidence for scout-visible freedoms.
+- Added regression guards for scout-invisible physical-coordinate preservation and the corrected Balanced reporting semantics. Dependency-light optimizer/candidate/policy/packaging gate passes 133/133 tests in this environment.
+
+## 0.14.0.312 — Optimizer 2.4 unit-test and source-capability cleanup
+
+- Fixed Auto model-policy handling for turn-count freedoms on legacy/coils without enabled physical winding geometry. The generic turns descriptor remains conservative, but source-specific capability context now recognizes that no winding-cross-section magnetic effect exists when physical winding geometry is disabled; Centreline can therefore represent the active magnetic turns effect instead of incorrectly requiring a Bundled distributed-winding floor.
+- Preserved strict model promises: turns on coils with enabled physical winding geometry still require distributed-winding capable refinement where the effort contract demands it, and explicit Current Sheet/Bundled/Exact authority continues to reject unsupported sources rather than silently falling back.
+- Updated stale Optimizer 2.2 report assertions to Optimizer 2.4 staged-pipeline wording.
+- Reworked brittle source-string budget tests to validate the current `optimizer_search_plan` behavior: effort-scaled reconnaissance ceilings, protected correctness/discretionary partitioning, and authoritative validation ceilings.
+- Added pure policy regressions for turns with and without enabled physical winding geometry. Dependency-light optimizer/candidate/policy/packaging gate passes 131/131 tests in this environment; full StudioAdapter/UI coverage still requires the pinned Magpylib/PySide6 runtime on the normal development machine.
+
+## 0.14.0.311 — Optimizer 2.4 directional-search completion (Phase 8)
+
+- Completed the Optimizer 2.4 user-facing transparency pass. Optimization reports now show protected correctness versus discretionary stage consumption and add separate **Directional Closure — Centreline Reconnaissance** and **Directional Closure — Capable Physics** audits with effective bounds, endpoint state, best scalar value, closure reason, trend, reopen count, and measured feasibility-boundary pairs.
+- Updated Search Trace to present the actual 2.4 strategy: mandatory bounds/directional closure and coupled feasibility recovery are correctness work; relation/symmetry extras, Sobol/global skeptics, adaptive basin challenges, and alternate physical anchors are discretionary. Physical refinement now displays bounded/coupled directional closure separately from the global skeptic.
+- Updated Optimizer Help and TESTING guidance around the correctness-first invariant: Fast saves time by reducing discretionary exploration, not by leaving an improving scout-visible direction open; a best value at a user bound is explicitly bound-limited rather than implied to be an unconstrained optimum.
+- Updated deferred Optimizer 2.3 policy tests for the 2.4 Balanced contract: once an axial winding capability gap activates the racetrack geometry/spacing family under capable physics, every active member must close directionally before Balanced may report completion.
+- Added `test_optimizer_24_directional.py` with regressions for monotonic improvement to both bounds, interior turnover/bracketing, source-anchored increment lattices, DRC feasibility-boundary recovery, rejection of solver failures as physical boundaries, racetrack shape/spacing coupling, protected budget partitioning, reporting/UI integration, and a dependency-light large-range microbenchmark.
+- Dependency-light optimizer/candidate/packaging gate passes 129/129 tests. Full discovery reaches 393 tests with no assertion failures; 16 modules remain unavailable in this container solely because the pinned runtime dependencies Magpylib/Magpylib Studio, PySide6, and PyGeomag are not installed (one unrelated test is skipped). The complete source tree compiles successfully.
+- Directional microbenchmarks in this environment: monotonic 1–1000 closes at the upper bound in 12 evaluations, an interior optimum at 823 closes in 21, monotonic 70–85 mm racetrack geometry closes at 85 mm in 7, and a DRC-limited 83.0/83.5 mm safe/blocked boundary closes in 14 total evaluations. These are algorithmic sanity measurements, not hardware/runtime SLAs.
+
+## 0.14.0.310 — Optimizer 2.4 protected correctness budgets (Phase 7)
+
+- Split reconnaissance and capable-physics stage budgets into a protected correctness reserve plus a separate discretionary exploration allowance. Optional relation-atlas, Sobol, adaptive-basin, alternate-anchor, and skeptic work can no longer consume capacity reserved for mandatory bound/directional/coupled/feasibility closure.
+- Added stage-plan schema v3 fields for `correctness_reserve`, `discretionary_allowance`, correctness/discretionary scopes, and the `protected_correctness_plus_discretionary` contract.
+- Centreline recursive scouts now charge generic atlas/global/adaptive work to the discretionary lane while raw bound evidence and bounded directional/coupled/feasibility recovery consume the correctness lane. Cache reuse remains free.
+- Fast directional/coupled search stops with unresolved closure rather than borrowing from discretionary capacity when its protected correctness reserve is exhausted. Fast may still leave scout-invisible physical freedoms explicitly limited, but it can no longer report convergence with an open scout-visible direction it promised to close.
+- Capable-physics refinement now uses the same protected split: one mandatory physical anchor plus directional/coupled/feasibility closure are correctness work; alternate basin anchors and the post-closure global skeptic are discretionary.
+- A skeptic-discovered physical basin may still become the best candidate, but it must have remaining correctness capacity for its own closure pass; otherwise the physical effort contract remains unresolved rather than inheriting closure evidence from another basin.
+- Search-stage accounting now records planned and consumed correctness/discretionary capacity independently, including exhaustion flags and `correctness_incomplete` execution status when mandatory closure is left open.
+- Balanced physical budgeting reserves against the full structural family when a Centreline capability gap may activate coupled freedoms, rather than sizing the protected reserve from the gap coordinate alone.
+- Phase 7 intentionally does not run the comprehensive optimizer regression/integration suite; that remains deferred to the final planned testing/reporting phase. Source compilation/package sanity only.
+
+## 0.14.0.309 — Optimizer 2.4 capable-physics directional closure (Phase 6)
+
+- Replaced the capable-physics stage's min/mid/max + Sobol + local-trust-region refinement as the primary search strategy with the same bounded directional-closure engine used by the Fast Centreline correctness floor.
+- Balanced now treats every activated capable-physics coupling coordinate (the Centreline capability gap plus its declared coupled freedoms) as a directional-closure obligation; Full applies that obligation to every selected structural freedom. Distinct physical values alone are no longer sufficient completion evidence.
+- Physical refinement now evaluates several retained scout basins at capable physics, chooses the best physical anchor, and performs mandatory legal-endpoint/bracket search on each active coordinate using the optimizer's existing lexicographic objective.
+- Added capable-physics coupled cycling: when one physical coordinate moves, earlier conditional closures in the same coupling component are archived/reopened and re-searched until a complete cycle is stable or the stage budget is exhausted.
+- Reused Phase-5 feasibility-boundary recovery under capable physics. Geometry-only DRC is probed before an expensive field solve, measured DRC/electrical boundaries can close a direction, and model/evaluation failures cannot masquerade as physical limits.
+- Reframed the physical Sobol cloud as a post-closure global skeptic. If it discovers a better basin, that challenger must undergo its own directional-closure pass; if budget exhaustion prevents that pass, the winning basin is deliberately marked directionally unresolved instead of inheriting closure evidence from another basin.
+- Added separate `physical_directional_closure`, pass history, directional evaluation counts, global-skeptic counts, and feasibility-boundary counts to multi-fidelity optimizer telemetry while preserving the flat candidate registry and authoritative queue.
+- Phase 6 intentionally leaves correctness-budget formalization, user-facing closure reporting, and the comprehensive integration/regression suite to the remaining planned phases. Source compile/package sanity only; no full test run was performed.
+
+## 0.14.0.308 — Optimizer 2.4 feasibility-boundary closure (Phase 5)
+
+- Integrated the existing prepared geometry-only DRC probe directly into Fast bounded directional search, so physical feasibility is part of directional closure rather than a later post-search veto.
+- Added `optimizer_feasibility_boundary.py`: when a legal user endpoint is rejected by a measured hard constraint, the optimizer bisects on the actual increment lattice (or continuous interval) to locate the nearest safe-side feasible boundary and scores that real boundary candidate.
+- Added explicit constraint classification to directional observations. DRC/electrical failures may define a feasibility boundary; solver/model/evaluation failures never masquerade as physical boundary evidence.
+- A direction whose best legal point lies on a measured hard boundary now closes as `feasibility_boundary` instead of being labelled an arbitrary interior optimum or left silently unresolved. Interior optima can also close normally once a measured feasibility boundary supplies the previously missing side of the bracket.
+- Feasibility-boundary evidence is stored per lower/upper side in the directional-closure record and survives into reopen history when a coupled coordinate later invalidates the conditional slice.
+- Coupled Phase-4 cycles naturally repolish the other dimensions around a recovered feasibility-boundary incumbent, then reopen/recheck the constrained axis if the coupled geometry moves.
+- Added rejection-payload caching so active electrical-limit failures can be distinguished from generic evaluation failures when directional search is running with electrical enforcement enabled.
+- Added Fast/scout telemetry for feasibility-boundary axes, boundary evaluations, safe/infeasible values, and recovery use. Boundary recovery is treated as correctness-floor work; Phase 7 will formalize its separate non-discretionary budget reserve.
+- Integration/regression testing remains intentionally deferred until the final Optimizer 2.4 phase; this phase received compile/package and dependency-light helper sanity only.
+
+## 0.14.0.307 — Optimizer 2.4 coupled directional closure (Phase 4)
+
+- Added coupling topology derived from optimizer capability metadata instead of geometry-kind whitelists.
+- Fast directional closure now revisits connected structural freedoms cyclically until the whole coupled family is stable or its current search budget is exhausted.
+- Conditional 1-D closure is explicitly reopened when a coupled coordinate moves; prior slice evidence is archived instead of being treated as globally valid.
+- Same-family geometry dimensions are coupled automatically, so racetrack end diameter and straight length are revisited together with pair spacing.
+- Added coupled-cycle telemetry to the design-space map and propagated it through the multi-fidelity scout result for later reporting/convergence policy.
+- This phase intentionally does not add the final regression/integration suite; testing remains deferred to the planned final phase.
+
+## 0.14.0.306 — Optimizer 2.4 Fast directional-closure integration (Phase 3)
+
+- Wired the Phase-2 bounded directional-search engine into the recognized Fast linked-coil engineering funnel. Scout-visible scalar geometry freedoms are now derived from the actual structural-variable list rather than a hard-coded relation whitelist.
+- Fixed the racetrack omission that motivated Optimizer 2.4: `racetrack_end_diameter` and `racetrack_straight_length` now receive the same mandatory bounded directional search as other scout-visible dimensions, with path shape searched before pair spacing.
+- Restored unconditional raw lower/upper endpoint insurance in the Fast design map. Recognizing a two-coil assembly no longer suppresses generic endpoint evidence; cached duplicates are naturally reused by the later directional pass.
+- Each directional axis now evaluates the real optimizer objective through the existing candidate cache, carries the best candidate payload forward as the next funnel incumbent, records bound/turnover/trend evidence in `multi_fidelity.directional_closure`, and exposes per-axis diagnostics in the design-space map.
+- Directional axes are capability/variable driven rather than topology-whitelisted. Orientation and shared translation retain their existing target-informed Fast stages in this phase; Phase 4 will add coupled revisit cycles so later shape/spacing changes cannot leave earlier closure evidence stale.
+- Recursive Centreline scout directional evidence is propagated back into the parent optimizer contract, while scout-invisible freedoms remain unresolved for later capable-physics stages.
+- Added Fast directional accounting fields (axis count, closed/unresolved count, evaluation count and per-axis summaries) and synchronized the latest directional-closure plan before optimizer returns.
+- Integration/regression testing remains intentionally deferred until the final Optimizer 2.4 implementation phase; this phase received compile/package sanity only.
+
+## 0.14.0.305 — Optimizer 2.4 bounded directional search primitive (Phase 2)
+
+- Added a reusable objective-agnostic bounded 1-D search engine for structural freedoms.
+- Legal lower/upper endpoints, source value, and incumbent are mandatory observations before directional closure is possible.
+- Interior optima are adaptively bracketed/subdivided to the increment lattice (or continuous tolerance) instead of being accepted from a local polish.
+- Bound-winning searches close explicitly as lower/upper bound limited; infeasible endpoints remain unresolved for the later feasibility-boundary phase.
+- Directional-closure records now retain scalar observation history, tested values, best observation, and the Phase-2 search policy.
+- Search execution remains intentionally unwired from the Fast/Balanced/Full funnel until Phase 3.
+
+## 0.14.0.304 — Optimizer 2.4 directional-closure foundation (Phase 1)
+
+- Added `optimizer_directional_closure.py`, a dependency-light Optimizer 2.4 bookkeeping layer that separates **search correctness/closure** from the existing model-fidelity/observability contract. A freedom can now be fully visible to Centreline while still remaining explicitly unresolved because its improving direction has not been closed.
+- Every bounded structural optimizer freedom now receives a directional-closure record containing requested/effective bounds, increment lattice, source value, lower/upper endpoint evidence, observation summary, best-observation placeholder, trend state, bracket state, and an explicit closure reason.
+- New structural freedoms default to `unresolved`; local polish, Sobol sampling, or an interior incumbent do not imply closure. Accepted future closure reasons are interior turnover, lower/upper bound best, measured feasibility boundary, objective saturation, proven redundancy, or a genuinely fixed range.
+- Added lattice-aware bound handling matching the optimizer's source-anchored increment convention, so future bound closure refers to the actual legal endpoint on a 0.5 mm / integer / other requested search lattice rather than an unreachable numeric limit.
+- Added pure helpers for recording tested endpoints, storing directional trend evidence, explicitly closing a coordinate, and recomputing plan-level unresolved/bound-limited/feasibility-limited summaries. These are intentionally not yet wired into the search algorithm; Phase 2 will provide the real bounded one-dimensional directional search.
+- `StudioAdapter` now initializes and carries `multi_fidelity.directional_closure` beside `freedom_coverage`. No Fast/Balanced/Full search behavior or convergence decision is changed in this phase; integration/regression testing is deferred until the final implementation phase as planned.
+
+## 0.14.0.303 — Optimizer authoritative ranking/early-stop fix
+
+- Fixed a Fast-search regression where the Current Sheet promotion stage could correctly rank a better candidate first, then the protected source-baseline/natural-clear insurance pass moved those protected rows back ahead of the physical leader before authoritative validation. With a decisive promotion rank, Fast could therefore validate only the baseline and stop early even when a better physically screened candidate was already known.
+- Protected authoritative candidates are now treated as insurance rather than ranking overrides: after a capable physical ranking exists, its leader remains in authoritative slot 0, protected/source/boundary champions are inserted immediately behind it, and the remaining ranked queue keeps its established order. The historical protected-first behavior is retained when no higher-fidelity ranking exists.
+- Tightened progressive authoritative stopping so a decisive middle-fidelity result may stop early only after the actual higher-fidelity leader survives authoritative validation. A surviving insurance candidate cannot end the vet if the ranked leader failed or was not tested.
+- Added `optimizer_authoritative_policy.py` with dependency-light queue-ordering and progressive-stop helpers, plus regressions reproducing the observed 75%-coverage promoted candidate versus 66.7%-coverage protected baseline case.
+- Validation in the packaging environment: the optimizer/candidate-registry Optimizer 2.3 gate and packaging/static gate pass (117 dependency-light tests total), and the complete Python source tree compiles. Live Current Sheet execution still requires the pinned Magpylib/PySide6 runtime.
+
+## 0.14.0.302 — Optimizer explicit-model telemetry fix
+
+- Fixed a Phase-5 fidelity-guard regression that falsely rejected valid Current Sheet/Bundled/Exact optimizer candidates when current was solved through temporary zero/basis adapters. The parent candidate adapter had no direct field-model report, so valid physical evaluations were misdiagnosed as silent Centreline fallback.
+- Current-basis construction now preserves the `coil_modeling` reports emitted by the actual zero-current and per-current-group basis field solves and carries that evidence with the solved candidate.
+- Strict optimizer model validation now checks the aggregated reports from the field solves that actually contributed to the candidate instead of relying on the parent adapter's last report. A missing report remains a hard failure, and any genuine requested-model fallback in any contributing solve is still rejected.
+- Added dependency-light regressions for successful multi-report Current Sheet evidence, true fallback rejection, and missing-evidence rejection, plus static integration guards confirming solved candidates pass their collected telemetry into the strict fidelity check.
+- Validation in the packaging environment: 112 dependency-light optimizer/candidate-registry/packaging tests pass and the complete Python source tree compiles. Full runtime optimizer execution still requires the pinned Magpylib/PySide6 environment.
+
+## 0.14.0.301 — Optimizer 2.3 regression/validation pass (Phase 7)
+
+- Added `tests/test_optimizer_23_policy.py`, a dependency-light Optimizer 2.3 regression suite covering the capability table, effort contracts, model-resolution policy, independent stage budgets, candidate-registry fidelity ordering, report/help integration, and the exact racetrack freedom pattern that exposed the Optimizer 2.2 axial-width blind spot.
+- Locked the racetrack contract: Centreline must report axial winding length as unobservable; Balanced expands that capability gap to pair spacing and racetrack path geometry while requiring real physical variation of axial width; Full reopens axial width, pair spacing, end diameter and straight length across their permitted physical-search spans.
+- Added completion-invariant regressions proving Balanced cannot complete with an unvaried capability-gap freedom and Full cannot complete while any structural freedom (for example pair spacing) has fewer than two distinct capable-physics values. Fast remains allowed to finish with physical-only freedoms explicitly marked limited.
+- Added model-policy regressions for Current Sheet racetrack refinement/authority, Exact→Bundled→Exact staging, Auto's stable Bundled distributed-winding floor, Centreline rejection for Balanced/Full winding-distribution gaps, and Current Sheet rejection of unsupported Circle participants instead of silent Centreline fallback.
+- Added search-plan and registry regressions proving Fast reserves no movable physical-search budget, Balanced/Full reserve independent physical budgets, Full's completion set contains every structural freedom, and `physical_refinement` fidelity ranks above fixed promotion but below authoritative validation.
+- Updated the deferred Qt Search Trace progress regression from the retired Optimizer 2.2 `reality.*` node names to the Optimizer 2.3 `drc.*` / `authority.*` stages.
+- Expanded `TESTING.md` with a focused Optimizer 2.3 gate and a release-candidate racetrack acceptance check that verifies Full/current-sheet runs actually vary axial width and spacing and report a satisfied freedom-coverage contract.
+- Validation in the packaging environment: the dependency-light optimizer/candidate-registry/packaging gates pass and the complete source tree compiles. The full application suite still requires the pinned Magpylib/PySide6/PyGeomag runtime described in `requirements.txt`; environments without those packages will report import errors rather than application-test failures.
+
+## 0.14.0.300 — Optimizer 2.3 user-facing fidelity transparency (Phase 6)
+
+- Reworked the Optimizer Limits-page **Fast / Balanced / Full** descriptions to match the new effort contracts. The selected Preferences coil model is now named directly in the effort hint, and the Review page states the staged fidelity route before a run begins.
+- Rebuilt **Search Trace** around the actual Optimizer 2.3 pipeline: freeze/validate → Centreline reconnaissance → geometry/DRC feasibility → capable-physics refinement when required → authoritative validation. Physical and authoritative stages display their resolved coil models instead of the old combined “promotion/final vet” stage.
+- Search Trace now derives its pre-run stage ceilings from the same capability, effort, model-policy and search-plan helpers used by the optimizer itself, and completed-run telemetry is reconciled back into the new DRC/physical/authority trace nodes.
+- Physical-refinement progress now distinguishes retained-basin anchors, multi-basin physical exploration and local physical adaptation/convergence rather than reporting the entire movable search as one opaque stage.
+- Added a prominent **SEARCH / FIDELITY CONTRACT** section to copied optimizer reports showing the planned/executed reconnaissance, physical-refinement and authoritative stages, their models, ceilings and effort scope.
+- Added a per-parameter **FREEDOM COVERAGE** report section. Every selected freedom now reports Centreline scout visibility/status, physical-search model/status and distinct-value count, authoritative-model visibility, and final completion state. This makes limited or unresolved freedoms visible without inferring them from scout counts.
+- Updated Fidelity Audit wording so the middle-fidelity row is labelled **Physical** and may represent movable physical refinement or the fallback fixed-coordinate promotion screen.
+- Updated convergence/failure wording so runs that actually performed capable-physics refinement no longer describe themselves as a cheap map followed only by a final reality vet, and incomplete effort contracts are identified explicitly.
+- Rewrote the Optimizer Help topic for the three-stage fidelity architecture, effort-mode guarantees, Preferences model resolution, winding-distribution capability gaps, Search Trace, and report audits. Added an explicit note that **Skip wizard / Full control** is separate from **Full search effort**.
+- Phase 6 remains behavior-focused UI/report/help work; the full optimizer regression, deterministic-worker checks and benchmark tuning remain deferred to Phase 7. All Python modules were compile-checked after the changes.
+
+## 0.14.0.299 — Optimizer 2.3 Preferences/model fidelity policy (Phase 5)
+
+- Added `optimizer_model_policy.py` to resolve the Preferences coil-model choice into explicit **Centreline reconnaissance / capable physical refinement / authoritative validation** models before expensive search work begins.
+- **Current Sheet** now remains Current Sheet for physical refinement and final authority when all optimizer-participating sources support the sheet representation; source support is checked explicitly because the current implementation supports closed Polyline coils rather than Circle sources.
+- **Exact turns** now uses **Bundled** as the bounded-cost multidimensional physical-search surrogate while preserving Exact turns as final authority. Candidate-specific Exact fallback is treated as rejection rather than silently accepting Centreline physics.
+- **Auto** remains dynamic for authoritative validation, but movable physical refinement receives a deterministic capability floor: Bundled whenever winding-distribution effects must be represented, Bundled when available for Full physical refinement of ordinary geometry, otherwise Centreline only when Centreline fully represents the active freedoms.
+- **Centreline** remains valid when it actually represents all freedoms being searched, but Balanced/Full now reject the run up front when a required capability-gap freedom (for example axial winding length) needs winding-distribution physics that Centreline cannot represent. Fast may still intentionally leave such freedoms limited under its effort contract.
+- Added source-aware optimizer model support metadata covering physical-winding availability, Current Sheet path eligibility, Exact turn-source limits, and per-model reasons for unsupported coils. Explicit requested models may no longer silently fall back to Centreline on participating optimizer coils and still be described as authoritative.
+- Added strict candidate-level fidelity checks for physical-refinement, fixed-coordinate promotion, and authoritative validation. If candidate geometry causes a requested explicit model to fall back, that candidate is rejected instead of being scored with different physics.
+- Search-stage plans now carry the resolved physical model/reason and authoritative mode, and optimizer reports include a concise model-fidelity-policy line alongside the effort contract.
+- Phase 5 keeps UI/help wording cleanup for Phase 6 and the full optimizer regression/benchmark suite for Phase 7. All Python modules were compile-checked and the pure model-policy scenarios were smoke-checked; the container does not provide Magpylib, so runtime StudioAdapter smoke execution was not available here.
+
+## 0.14.0.298 — Optimizer 2.3 effort contracts and Full-search completeness (Phase 4)
+
+- Added `optimizer_effort_policy.py` to make **Fast / Balanced / Full** materially different search contracts instead of only different cheap-map budgets.
+- **Fast** now explicitly remains reconnaissance + authoritative verification: it reserves no movable physical-refinement budget and may finish with Centreline-invisible freedoms marked **limited**, rather than implying they were fully optimized.
+- **Balanced** now requires every Centreline capability-gap freedom to be actively varied under capable physical physics before the run may report convergence. Declared coupled coordinates are allowed to move with those gaps, while fully Centreline-represented freedoms do not independently require physical reopening.
+- **Full** now reopens **every selected structural freedom** in the capable-physics stage. All structural freedoms receive min/mid/max insurance and full-bound low-discrepancy physical exploration across retained scout basins instead of treating the Centreline optimum as fixed context.
+- Added a hard effort-completion invariant based on actual per-freedom physical distinct-value counts. Full cannot report `converged=True` unless every selected freedom is physically explored, analytically inner-solved, or explicitly proven redundant; Balanced applies the same rule to its capability-gap freedoms.
+- Authoritative finalists are still returned when an effort contract is incomplete, but the run is marked non-converged and names the unresolved freedom IDs instead of silently claiming completion.
+- Added effort-scope/completion metadata to `multi_fidelity`, `search_stage_plan`, and the returned `convergence` payload, including active/full-span/required physical freedoms, limited freedoms, unresolved freedoms, and completion status.
+- Fixed a Phase-3 accounting bug where the authoritative-vet cleanup block reset `physical_refinement_seed_count` and `physical_refinement_evaluations` to zero after movable physical refinement had already run.
+- Updated optimizer report/search-strategy wording to describe the new Fast reconnaissance, Balanced hybrid, and Full dimensional policies and to surface whether the effort contract was satisfied.
+- Phase 4 intentionally leaves final Preferences/model-resolution policy for Phase 5; only syntax/import/helper smoke checks were run, with the full regression suite still deferred until the implementation phases are complete.
+
+## 0.14.0.297 — Optimizer 2.3 capable-physics refinement engine (Phase 3)
+
+- Added a real **movable physical-refinement stage** between Centreline reconnaissance/DRC mapping and authoritative validation. Unlike the old promotion screen, this stage generates new structural settings instead of only re-ranking fixed scout coordinates.
+- Added `optimizer_physical_refinement.py` to resolve a provisional capable search model, expand scout-invisible/partial freedoms into their declared coupled structural coordinates, and size the retained multi-basin seed set.
+- Physical refinement now evaluates several DRC-feasible scout basins with the existing fixed-candidate worker pool, preserving the bounded inner current solve, physical coil model, DRC, electrical gates, cancellation/pause behavior, and flat candidate registry.
+- Capability-gap freedoms receive explicit min/mid/max physical coverage across retained basins, followed by a low-discrepancy Sobol cloud. Missing-physics coordinates span their full user bounds while coupled scout-visible coordinates are allowed to move in a local trust region.
+- Added multi-basin local coordinate adaptation under physical physics after the initial cloud. The best physically refined candidates are merged ahead of the original DRC-survivor queue for authoritative validation while the original candidates remain as fallback insurance.
+- Physical-refinement observations now use the dedicated `physical_refinement` candidate-registry fidelity tier and record per-freedom **distinct physical value counts**, so Phase 4 can distinguish genuine variation from a fixed-value physical check when enforcing Full-search completeness.
+- The older fixed-coordinate intermediate promotion stage remains as a fallback when movable physical refinement is unavailable; it is skipped when the new physical stage succeeds.
+- Added stage accounting/report fields for physical model, active/required freedoms, seeds, generated/evaluated/feasible settings, local-adaptation work, sample count, workers, elapsed time, and execution status.
+- Updated optimizer convergence/report wording so a run that used movable physical refinement no longer claims that the expensive physics served only as a final verifier.
+- Phase 3 intentionally does **not** yet impose the final Fast/Balanced/Full completion semantics; Phase 4 will use the new coverage evidence to make those guarantees explicit.
+
+## 0.14.0.296 — Optimizer 2.3 staged search architecture (Phase 2)
+
+- Split optimizer work into explicit **reconnaissance**, **physical refinement**, and **authoritative validation** stages with independent evaluation ceilings instead of overloading one parent `budget` value.
+- Added `optimizer_search_plan.py` to centralize effort-dependent scout budgets, authoritative validation ceilings, and a reserved capable-physics refinement budget for the Phase-3 executor.
+- Rewired the automatic cheap-first path to obtain its Centreline reconnaissance budget from the shared stage plan after capability filtering determines the actual scout dimensionality.
+- Preserved saved/programmatic `evaluation_budget` compatibility by treating it as the authoritative/legacy exact ceiling; reconnaissance capacity no longer shares or consumes that allowance.
+- Added `multi_fidelity.search_stage_plan` and `search_stage_accounting` so optimizer results can distinguish planned/evaluated work by stage. Phase 2 intentionally reserves but does not yet execute physical refinement.
+- Kept the older exact-search `budget` alias temporarily for legacy branches so the architectural split can land before Phase 3 extracts/reuses the physical search machinery.
+
+## 0.14.0.295 — Optimizer 2.3 capability foundation (Phase 1)
+
+- Added an explicit optimizer freedom/fidelity capability layer describing which magnetic effects each freedom can change, whether it affects DRC/electrical constraints, and which coil field models can represent it.
+- Replaced the Centreline scout's hard-coded axial-winding exclusion with capability-driven observability. Existing Optimizer 2.2 search behavior is intentionally preserved in this phase, but every omitted freedom now carries an explicit reason.
+- Classify **axial winding length** as invisible to Centreline and **turn count** as only partially represented: Centreline sees ampere-turn scaling but not turn-dependent winding-pack redistribution. Existing turns/current redundancy detection is retained as a dynamic run-specific annotation rather than being confused with full physical observability.
+- Added per-freedom `multi_fidelity.freedom_coverage` and a compact fidelity-capability summary to optimizer results, providing the bookkeeping later phases will use to require real physical refinement before Full can report convergence.
+- Reserved `physical_search` / `physical_refinement` candidate-registry fidelity tiers above fixed-coordinate physical promotion and below authoritative validation.
+
+## 0.14.0.294 — Exposure Summary sortable-column spacing
+
+- Widened the default **Exposure summary** columns slightly so every header has room for the active sort arrow without clipping or crowding the label.
+
+## 0.14.0.293 — Duplicate preparation confirmation
+
+- Added a confirmation prompt when **Create new analysis** is pressed and a **Current** cached analysis already exists for the same exposure and target. Choosing **No** leaves the existing cache untouched; choosing **Yes** proceeds with a fresh preparation as before.
+- Stale/historical analyses do not trigger the confirmation, since they are not reusable current preparations.
+- Updated Exposure Analysis help and regression coverage for the duplicate-preparation safeguard.
+
+## 0.14.0.292 — Exposure Analysis header control row
+
+- Moved **Hide/Show analysis info** and **Open region viewer…** into the shared header's top row, immediately to the right of the page title, giving every Exposure Analysis page the same `<navigation>  Title  [analysis info]  [region viewer]` layout.
+- Refined the collapsed state so the complete top row stays visible—including the page title and Region Viewer launcher—while only the detailed target/exposure information and compact preview are hidden.
+- Updated Exposure Analysis Help and source-contract coverage for the shared top-row layout.
+
+## 0.14.0.291 — Collapsible Exposure Analysis banner
+
+- Added a shared **Hide analysis info** / **Show analysis info** control to `ExposureAnalysisHeaderPanel`, placed immediately to the left of **Open region viewer…** while expanded.
+- Collapsing the shared header now hides the page heading/explanation, target/exposure details, preparation controls/statistics, Region Viewer launcher, and the entire target preview, leaving only the applicable Analysis targets/Home navigation plus the restore control. The outer vertical splitter is resized so the current analysis page receives the reclaimed space.
+- Hidden compact previews are now paused/released through the shared header state instead of continuing to hold an active WebGL render; expanding restores the owner's previous preview-active state. The same behavior is available in target selection and every prepared-analysis page.
+
+## 0.14.0.290 — Exposure Summary text and tooltip cleanup
+
+- Removed the remaining **Rows combine…** explanatory paragraph from **Exposure summary**, leaving the exposure/source summary line and table controls to carry the page context.
+- Replaced the statistics table's native metric-header tooltip handling with an explicitly wrapped tooltip popup so long descriptions remain fully readable instead of being clipped to a narrow header section on some Linux Qt styles.
+
+## 0.14.0.289 — Exposure Summary layout cleanup
+
+- Reworked **Exposure summary** so the regional statistics table now uses the full lower workspace width instead of sharing a side-by-side layout with filters.
+- Added a **Show/hide filters** button beside the tree-expansion controls; the **Filters / highlights** editor now appears beneath the main table and starts hidden by default.
+- Removed the redundant explanatory note that said the regional statistics table lived in its own panel on the right, and updated the Help/source-contract text to match the new arrangement.
+
+## 0.14.0.288 — Exposure Analysis source-test cleanup
+
+- Updated the static Exposure Analysis navigation contract to follow the shared `ExposureAnalysisHeaderPanel`, which now owns the **← Analysis targets** button, while retaining the prepared-analysis busy-state check in `exposure_actions.py`.
+
+## 0.14.0.287 — Exposure Analysis header text cleanup
+
+- Reduced the **Exposure target selection** surface-region summary by removing the duplicate sampling-depth text; the editable depth control remains directly below it.
+- Removed the explanatory geometric-sampling note and the redundant saved-analysis count/status line from the chooser header, leaving the saved-analysis table as the single source of that information.
+- Removed the routine live-geometry note beneath the prepared-analysis preview for current/in-memory analyses while retaining the warning when a saved preparation is stale.
+
+## 0.14.0.286 — Shared Exposure Analysis context header
+
+- Added a reusable `ExposureAnalysisHeaderPanel` used by both **Exposure target selection** and the prepared **Exposure analysis home**/method views. The shared template owns page navigation/headline, explanation text, prominent Target/Exposure identity, compact statistics/controls, Region Viewer launcher, and the whole-target 3-D preview.
+- Changed target selection to start at roughly one-third context header / two-thirds target-and-saved-analysis browsing while retaining draggable splitters. The shared header itself starts at the established two-thirds information / one-third preview proportion.
+- Prepared analysis views now use the same upper-third layout and visual hierarchy as target selection. Home starts with **← Analysis targets** plus a short “choose an analysis” explanation; method pages reuse the same header with page-specific titles/explanations and **← Analysis home** navigation.
+- Kept the existing preparation metadata available inside the shared information area, including current/stale state, region/sample counts, surface depth where applicable, and preparation time, while preserving the persistent live target preview and Region Viewer behavior.
+
+## 0.14.0.285 — Exposure Analysis landing-page wording
+
+- Rename the target-selection heading from **Create exposure analysis** to **Exposure analysis** and replace the introductory copy with a concise explanation of target selection, base preparation, statistical calculations, and automatic caching.
+- Promote the selected exposure name to the same heading style as the target name and remove the smaller duplicate exposure/duration summary line.
+
+## 0.14.0.284 — Region Viewer turntable default
+
+- Make Plotly Turntable the default 3-D rotation mode in the full Exposure Analysis Region Viewer as well as the compact target previews. Orbit remains available from the native in-viewer Plotly toolbar.
+
+## 0.14.0.283 — Exposure Analysis selection and preview controls
+
+- Selected LPBA40 brain regions now render at full opacity so the active anatomy is easier to distinguish in both Brain View and the Exposure Analysis Region Viewer.
+- Compact Exposure Analysis previews now include Plotly's native reset-camera/Home control alongside Orbit and Turntable.
+- Compact previews now start in Plotly Turntable rotation mode while the full Region Viewer retains its existing 3-D interaction defaults.
+- Fullscreen PlotView clones preserve the configured default 3-D drag mode.
+
+## 0.14.0.282 — Exposure Analysis 3D controls (Phase 2)
+
+- Enabled Plotly's native in-viewer 3-D rotation controls on compact Exposure Analysis previews. Compact previews use the reduced `rotation` modebar profile, exposing Orbit and Turntable without adding external Qt camera buttons or PNG/export clutter.
+- Gave the modeless Region Viewer the full native 3-D Plotly modebar plus the shared Workbench `SCENE VIEW` command strip: Export image, Home, Fullscreen, and Front/Right/Top. Fullscreen preserves the same native control profile and rendering contract.
+- Removed the Region Viewer's separate Fit object/Fit region buttons and double-click-to-fit behavior so the viewer now uses the same camera/control vocabulary as Model Editor and other 3-D Workbench views.
+- Added a shared `PlotView.save_png_with_dialog()` path so `SceneViewControls` can provide Export image without viewer-specific file-save plumbing. Updated Exposure Analysis Help text and regression contracts for the unified controls.
+
+## 0.14.0.281 — Shared 3D viewer controls (Phase 1)
+
+- Added named native Plotly 3-D modebar profiles to `PlotView`. The existing `standard` profile remains the default, `full_3d` explicitly requests the normal 3-D control set, and the new `rotation` profile is ready for compact anatomy previews that should expose only Plotly's native Orbit/Turntable interaction modes. Native PNG modebar export can now be enabled/disabled independently per viewer.
+- Fullscreen `PlotView` clones now inherit the source viewer's modebar visibility/profile, native image-save choice, selection-event policy, live-view publishing policy, and WebGL pixel ratio so fullscreen never silently changes the interaction contract.
+- Extracted the Model Editor's `SCENE VIEW` command strip into reusable `SceneViewControls`, preserving Export image, Home, Fullscreen, and Front/Right/Top behaviors while keeping those Workbench commands separate from Plotly's in-viewer native tools. Model Editor now consumes the shared control directly while preserving its existing public button attributes.
+- Added source-contract coverage for the shared command bar and native modebar profiles. Phase 2 will apply these shared controls to Exposure Analysis compact previews and the modeless Region Viewer.
+
+## 0.14.0.280 — Region display architecture cleanup (Phase 3)
+
+- Completed the Exposure Analysis display-path cleanup so compact previews and regional anatomy viewers now have explicit, non-overlapping responsibilities. Compact previews require the canonical Model Editor target figure from `StudioAdapter.analysis_target_preview_figure()`; the obsolete custom object-mesh fallback and anatomy-specific vertex-welding/shading path were removed entirely.
+- Built-in Region Viewer targets now preserve complete display topology. Authored Surface-region busts and ordinary Measurement targets render every labelled source face regardless of any supplied generic budget, while LPBA40 continues to render all 206,080 atlas-shell triangles through the shared Brain View renderer. Optional deterministic face sampling remains available only for explicit future custom/unknown region providers.
+- Removed the old embedded/Region Viewer triangle-budget constants from the normal UI path. The modeless Region Viewer now requests full regional geometry directly; no built-in anatomy target is perforated by individual-face sampling.
+- Strengthened renderer regression contracts: Model Editor and Exposure Analysis compact previews share the same `_geometry_mesh_traces()` source for colour, opacity and flat-shading; LPBA40 Maps/Exposure views share the same trace/style helper; Bust and Measurement Region Viewer tests assert full triangle preservation; built-in display branches no longer depend on the generic face sampler.
+
+## 0.14.0.279 — LPBA40 Region Viewer renderer unification (Phase 2)
+
+- Extracted the established LPBA40 atlas-shell presentation from Maps → Brain into a shared dependency-light `lpba40_display` module. Brain View and Exposure Analysis now use the same region trace builder, major-division colour palette, normal/selected opacity values, yellow selection colour, smooth-shading mode, and lighting settings.
+- Exposure Analysis no longer applies its generic 60,000-triangle face budget to SRI24/LPBA40 Region Viewer anatomy. The Region Viewer now renders the complete bundled atlas shell set (206,080 triangles across 56 labels), matching the topology used by the Maps Brain selector instead of dropping individual faces.
+- LPBA40 Region Viewer selection now follows the Maps Brain selector semantics: selected labels use the shared yellow highlight while non-selected shells retain their normal major-division colours and 0.34 opacity rather than being heavily faded.
+- Added regression coverage ensuring LPBA40 bypasses generic face sampling, retains every source triangle, and shares display constants/trace construction with Brain View. Updated the packaging contract to follow the shared LPBA40 display module.
+
+## 0.14.0.278 — Exposure Analysis preview renderer unification (Phase 1)
+
+- Replaced the compact Exposure Analysis target preview's custom anatomical Mesh3d reconstruction with the same canonical Workbench mesh-trace builder used by Model Editor Scene View. Compact previews now inherit the exact scene-object colour, opacity, world transform, flat-shading mode, and object-specific display overlays from the normal scene renderer.
+- Added `StudioAdapter.analysis_target_preview_figure()` to produce a target-only Scene View figure and apply only preview presentation cleanup: axes/grid and legend hidden, hover/picking disabled, tight margins, and target-focused camera fitting. Scene visibility does not suppress an analysis-target preview.
+- Refactored Model Editor mesh rendering through a shared `_geometry_mesh_traces()` helper so Scene View and Exposure Analysis cannot silently drift into separate mesh presentation implementations.
+- Updated both Create Exposure Analysis and prepared-analysis header previews to request the canonical target figure alongside the numerical region scene. The previous custom object renderer remains only as a defensive fallback for external callers and is no longer used by the normal Exposure Analysis workflow.
+
+## 0.14.0.277 — Region viewer presentation cleanup
+
+- Render authored bust Surface regions fully opaque in the Region Viewer during the normal whole-object view; explicit region selection still subdues the non-selected regions for visual focus.
+- Replace technical WebGL/resource-release wording in paused Exposure Analysis previews with user-facing status text, including "Preview is disabled while the Region Viewer is active." when appropriate.
+- Update the Exposure Analysis Help smoke expectation to its promoted **Maps / Analysis** Help category.
+
+## 0.14.0.276 — Exposure Analysis launcher artwork
+
+- Replaced the temporary Project Manager Exposure Analysis bar-chart placeholder with the supplied final `exposure_analysis.svg` artwork. The existing launcher resource name and Project Manager wiring are unchanged.
+
+## 0.14.0.275 — Exposure Analysis promoted in Project Manager
+
+- Promoted **Exposure Analysis** to a first-class Project Manager application under **Maps / Analysis**, beside Map Creator, with the description **Analyze field exposure over time and across spatial regions.** The existing **Analyze exposure…** action in Exposure Editor remains a contextual shortcut to the same workspace.
+- Added direct Project Manager launch behavior: projects with one saved exposure open it immediately; projects with several exposures ask which one to analyze; projects with none direct the user to create/save an exposure first. Project-launched Exposure Analysis windows remain project-scoped and close with their project.
+- Renamed the former **Datasets** dashboard component to **Data / Results** and moved **Saved Results** there beside Dataset Manager. Maps / Analysis now summarizes saved maps and Exposure Analysis preparations, while Data / Results summarizes datasets/calibrations plus the total saved-result catalogue.
+- Added Exposure Analysis to the Project menu and updated the suite Help, README, testing/build documentation, component shortcuts, accessibility labels, and dashboard regression contracts for the revised application hierarchy.
+- Added a temporary bundled `exposure_analysis.svg` launcher icon (simple bar-chart placeholder) so the new application card is visually complete until final project artwork replaces it.
+
+## 0.14.0.274
+
+- Reworked the **Create exposure analysis** chooser to the balanced dashboard layout established during workflow testing. The upper and lower work areas start at an approximately 50/50 vertical split while remaining user-resizable.
+- The upper section now starts at a 2:1 split: target/exposure information, sampling-depth controls and saved-analysis status stay entirely in the left panel, while the unsegmented interactive target preview receives the full right panel height. The **Open region viewer…** action moved to the bottom-right of the information panel so it no longer consumes preview space.
+- The lower section now starts at a 1:2 split between **Available analysis targets** and **Saved analyses for selected target**, matching the relative amount of information in those tables while retaining their existing action buttons.
+- The chooser preview hides its built-in Region Viewer button because the chooser now owns that action explicitly; prepared-analysis header previews retain their existing button and behavior.
+
+## 0.14.0.273
+
+- Fixed the remaining patchy/faceted appearance of compact Exposure Analysis previews. The bundled SRI24 brain and Generic bust STL files repeat vertices independently per triangle, so smooth Plotly shading could not interpolate normals even when the complete surface was rendered. Compact anatomical previews now weld coincident display vertices before rendering, preserving every triangle while creating shared normals and reducing the WebGL vertex payload. Ordinary Measurement objects retain hard-edged scene shading.
+- Restored the Create Exposure Analysis target preview to a compact top-banner footprint. The chooser now caps the target overview/preview height (with accessibility-font scaling) so the 3D WebEngine size hint cannot consume most of the window and push the target/saved-analysis tables to the bottom.
+
+## 0.14.0.272
+
+- Fixed the faceted/perforated appearance of compact Exposure Analysis target previews. The preview had been enforcing the 20,000-triangle regional display budget by selecting individual faces from the object's connected outer shell; omitted faces therefore appeared as holes and made the brain/bust look noisy even though smooth Mesh3d shading was enabled.
+- Compact previews now render the complete ordinary object surface, matching the geometry shown by the Model Editor. The display-only triangle budget remains in place for the dedicated Region Viewer, where the much heavier per-region anatomy scene benefits from decimation. Numerical Exposure Analysis geometry is unchanged.
+
+## 0.14.0.271
+
+- Simplified Exposure Analysis anatomy previews: compact previews now show the target's ordinary unsegmented outer scene surface using its normal object colour/opacity. Authored Surface-region colours and LPBA40 region shells are reserved for the dedicated Region Viewer, where they are useful for browsing/highlighting.
+- Removed the Plotly 3D grid/axes from both compact anatomy previews and the Region Viewer, including Home/Fit operations that previously re-enabled axis visibility after the initial axes-free figure was created.
+- Extended `AnalysisRegionScene` with a separate object-surface representation. Surface-region and Measurement targets reuse their normal object mesh; SRI24/LPBA40 targets use the actual transformed SRI24 brain outer shell for compact previews while retaining the per-region atlas shells for Region Viewer selection.
+- Fixed the Saved Results live-refresh regression introduced by the polling removal. Discrete saved-result catalogue changes now refresh an already-open Saved Results manager immediately, while broader model/exposure/waveform/dataset edits remain event-driven and debounced; periodic idle polling is still absent.
+
+## 0.14.0.270
+
+- Fixed high idle CPU usage and rhythmic UI stalls in **Saved results**. The manager no longer polls every two seconds and recomputes live Exposure Analysis dependency fingerprints on the GUI thread.
+- Saved Results refresh is now event-driven: model, exposure, waveform, dataset, map, snapshot, and analysis-cache changes schedule one coalesced refresh; the explicit **Refresh** button and refresh-on-open remain available.
+- Rapid project edits are debounced into a single Saved Results refresh, avoiding repeated tree rebuilds and expensive current/stale checks.
+
+## 0.14.0.269 — Region Viewer performance and WebGL resource cleanup
+
+- Optimized Exposure Analysis anatomy previews for sustained interactive use. The renderer no longer maintains Plotly Mesh3d hover/pick buffers for region geometry because browsing is tree-driven; per-triangle hover and 3D click picking are disabled while region highlighting remains available through the existing tree/analysis-selection path.
+- Disabled unnecessary live-camera publication and selection event plumbing in `AnalysisRegionPreview`. Orbit/zoom remains fully interactive inside Plotly, but camera motion is no longer serialized through QWebChannel/Python when no Workbench consumer uses it.
+- Added a preview-specific 1× WebGL pixel ratio to avoid rendering anatomy scenes at high-DPI framebuffer resolutions that multiply fill-rate cost without materially improving these small/contextual views. Existing PlotView users retain their previous defaults.
+- Reduced display-only triangle budgets from 30,000 to 20,000 for embedded previews and from 100,000 to 60,000 for the modeless Region Viewer. Deterministic per-region allocation still guarantees that every visible atomic region is represented; numerical Exposure Analysis geometry is unchanged.
+- Added explicit WebGL suspension for inactive embedded previews. Hidden chooser/saved-analysis pages now purge their Plotly scene instead of retaining GPU buffers, and the active compact preview is temporarily released while the larger Region Viewer is open. Closing the Region Viewer restores only the currently visible embedded preview.
+- Added `PlotView.release_rendered_figure()` for reusable browser surfaces that need to free GL resources without destroying their QWebEngineView, plus source-contract coverage for the lightweight interaction path and preview lifetime/resource rules.
+
+## 0.14.0.268 — Region Viewer synchronization and polish
+
+- Completed the final Region Viewer/preview synchronization pass. Exposure Analysis method-page region changes now flow one way into the persistent header preview and any already-open Region Viewer, while Region Viewer tree browsing remains visual-only and never changes the numerical analysis selection or starts calculations. Returning to Exposure Analysis Home restores the whole-object visual presentation.
+- Added explicit reusable selection control to the modeless Region Viewer. Reopening the same unchanged target updates the selected/highlighted region without rebuilding the WebGL scene or discarding the current camera; a changed mesh/transform/region scene is detected through the deterministic display-scene identity and is refreshed normally.
+- Made explicit Region Viewer opens resolve current live model geometry rather than blindly trusting an older compact-preview scene. If the target was edited, the viewer refreshes; if it was deleted or is otherwise unavailable, the viewer clears stale display geometry and reports that the saved numerical analysis remains readable even though live display geometry is unavailable.
+- Clarified live-versus-frozen provenance for saved preparations. Prepared-analysis headers now identify the preview as live model geometry, and stale saved preparations visibly warn that the current display may differ from the geometry used for their frozen numerical results. The same context appears in the modeless Region Viewer.
+- Kept viewer exploration and analysis control intentionally separate: analysis selection can synchronize the viewer, but viewer tree clicks have no callback into Exposure Analysis. This prevents anatomical browsing from accidentally queuing analyses or changing the result being examined.
+- Tightened compact-preview sizing for enlarged accessibility fonts while retaining Qt 6 device-independent scaling, and retained application-wide Light/Dark theme forwarding through the shared `AnalysisRegionPreview`/`PlotView` path. Updated Exposure Analysis Help for synchronization, stale/deleted-target behavior, live-geometry provenance, and unchanged-target camera reuse.
+- Added Phase 6 source-contract coverage and updated the earlier Region Viewer contract test for the extended context-aware open API.
+
+## 0.14.0.267 — Modeless Exposure Analysis Region Viewer
+
+- Added a modeless **Region viewer** shared by Exposure Analysis previews. It presents the analysis target/region hierarchy in a tree on the left and a larger interactive 3D view on the right; selecting a hierarchy row highlights the exact same atomic region labels used by the numerical regional-analysis backend while leaving the rest of the object visible but subdued.
+- Reused the existing `AnalysisRegionPreview`/`analysis_region_render` stack at the dedicated 100,000-triangle Region Viewer budget rather than introducing a second rendering path. Brain, authored Surface-region, and ordinary Measurement targets therefore keep the same colours, region ownership, decimation and whole-object geometry in compact previews and the larger viewer.
+- Added **Fit object** and **Fit region** controls. `PlotView.fit_3d_traces()` fits axis bounds to the selected region traces while preserving the user's current camera direction and leaving the full target rendered; double-clicking a tree row performs the same region fit.
+- Added display-only region metadata for the selected tree row: region kind, atomic-region count where applicable, display triangle count, display surface area, display bounds, atlas name, and Surface-region sampling depth. These values explicitly describe visible geometry and remain separate from authoritative exposure sample/volume statistics.
+- Wired both the Create Analysis target preview and the persistent prepared-analysis header preview to the Region Viewer. One viewer instance is reused for an entire Exposure Analysis workspace, so switching targets does not spawn duplicate windows; standalone reopened saved analyses likewise own only one viewer. Closing the viewer hides it for session reuse, while closing its owning Exposure Analysis workspace explicitly retires the WebEngine renderer.
+
+## 0.14.0.266 — Persistent Exposure Analysis target preview
+
+- Embedded one reusable `AnalysisRegionPreview` in the prepared-analysis information banner that sits above the Exposure Analysis page stack. The whole Brain, Surface-region object, or Measurement object therefore remains visible on Analysis home and on Summary, Spectrum/FFT, Timing, Threshold, and frequency-weighted pages without creating page-specific renderers.
+- Resolved the prepared target scene once from the saved preparation's `target_id` through `StudioAdapter.analysis_region_scene()`. Scene loading is deferred by one event-loop turn so the banner can paint its loading state first; preview failures stay visual-only and cannot block cached/saved analysis browsing.
+- Kept numerical and visual lifetimes separate: the persistent preview renders only display geometry, does not regenerate surface shells or exposure field samples, and survives normal page navigation while the page stack changes underneath it.
+- Added explicit cleanup/invalidation for the browser-backed header preview when the prepared target view closes, updated Exposure Analysis Help for the persistent visual context, and added source-contract coverage for the Phase 4 integration. The **Open region viewer…** request remains reserved for the Phase 5 modeless Region Viewer.
+
+## 0.14.0.265 — Exposure Analysis target-preview integration
+
+- Embedded the reusable `AnalysisRegionPreview` on the **Create exposure analysis** target-selection page. The selected Brain, Surface-region, or Measurement target is shown as an interactive whole-object 3D preview beside its identity and sampling details before any field preparation is started.
+- The target preview resolves through `StudioAdapter.analysis_region_scene()`, so chooser visualization uses the exact same renderer-agnostic region-scene provider already reserved for the later modeless Region Viewer; no target-specific duplicate rendering path was introduced.
+- Added a deferred one-event-loop preview refresh with a serial selection guard. This lets the loading state paint before scene construction and prevents a queued older target selection from overwriting a newer selection when users move quickly through the target tree. Preview failures are contained to the visual panel and never block saved-analysis browsing or creation.
+- Kept display rendering independent of numerical preparation. Changing the near-surface sampling depth updates analysis provenance but does not rebuild the unchanged authored-surface preview, while selecting another target resolves and auto-fits that target's display scene.
+- Added cleanup of the chooser's browser-backed preview when the Exposure Analysis workspace closes, updated Help for the new visual confirmation step, and added source-contract coverage for target-selection integration. The **Open region viewer…** signal remains intentionally unwired until the modeless Region Viewer phase.
+
+## 0.14.0.264 — Reusable Exposure Analysis region preview
+
+- Added a shared dependency-light `analysis_region_render` layer that converts `AnalysisRegionScene` geometry into deterministic Plotly Mesh3d traces. The renderer is intentionally shared by the compact preview and the future modeless Region Viewer so region colours, ownership, hover names, highlight semantics, and display decimation cannot drift between the two UIs.
+- Added deterministic per-region display decimation with a 30,000-triangle compact-preview budget and a 100,000-triangle Region Viewer default budget. Every visible atomic region retains geometry even under decimation; source analysis geometry and numerical sampling are never modified. This keeps the approximately 206k-triangle LPBA40 visual scene practical in embedded previews.
+- Added `AnalysisRegionPreview`, a reusable QWidget backed by one lifetime `PlotView`. It supports whole-object rendering, automatic Home fitting, orbit/zoom interaction, loading/empty states, theme forwarding, optional region highlighting through incremental scalar restyles, and an **Open region viewer…** request signal without creating the Phase 5 window prematurely.
+- Extended `PlotView` with an opt-in `display_modebar` setting while retaining its existing default behavior. Compact analysis previews disable the Plotly modebar and fullscreen controls so the small surface stays visually quiet.
+- Added dependency-light renderer regression tests and source-contract coverage for the preview widget. This phase deliberately does not place the preview on Exposure Analysis pages; Create Analysis integration remains Phase 3.
+
+## 0.14.0.263 — Exposure Analysis region-viewer foundation
+
+- Added a dependency-light `AnalysisRegionScene` contract for Exposure Analysis visualization. It carries one world-space triangle mesh, per-face atomic analysis-region labels, the existing `AnalysisRegionNode` hierarchy, object display metadata, bounds, and deterministic geometry identity without depending on Qt, Plotly, WebGL, or the numerical exposure result pages.
+- Added a generic scene resolver for all current Exposure Analysis target providers. LPBA40 brains use the bundled placed per-label display shells; authored Surface-region objects use their real transformed object mesh and authored face ownership; ordinary Measurement volumes use the transformed object surface as a single region.
+- Region-scene hierarchy keys and integer label ids intentionally match the numerical Exposure Analysis providers, so future compact previews and the modeless Region Viewer can highlight the exact same Face/Scalp/brain/Measurement selection without a second region-mapping system. Authored surface geometry is used for display rather than pretending the inward voxel shell is a literal anatomical solid.
+- Added per-label presentation colours for LPBA40 and authored Surface regions, plus region lookup and triangle-mask helpers that the shared preview/viewer renderer can consume directly.
+- Added `StudioAdapter.analysis_region_scene()` as the UI-facing provider boundary and dependency-light regression coverage for hierarchy selection, display-geometry identity, Measurement surfaces, LPBA40 shells, and Surface-region precedence. No preview widget or Region Viewer UI is introduced in this phase.
+
+## 0.14.0.262 — Surface-region target semantics
+
+- Made authored Surface regions intrinsic Exposure Analysis region sets regardless of the object's Model Editor scene role. Assigning the Generic bust (or another eligible region-aware mesh) the Measurement role no longer replaces its Face/Scalp/etc. Exposure Analysis target with whole-object Measurement-volume sampling.
+- Removed scene role from the Surface-region Exposure Analysis geometry identity, so changing only the object's role does not make an otherwise-current prepared Surface-region analysis stale. Ordinary Measurement-role objects without authored eligible regions continue to use the established whole-volume provider.
+- Updated Exposure Analysis Help text to make the distinction between scene Measurement role and authored Surface-region analysis geometry explicit.
+
+## 0.14.0.261 — Surface-region Exposure Analysis validation and cleanup
+
+- Completed the Phase 7 validation/cleanup pass for inward Surface-region Exposure Analysis. The surface-volume lattice now snaps dimension/spacing ratios that differ from an exact integer only by floating-point roundoff before applying `ceil`, preventing rigid object translations from spuriously adding an extra lattice cell and changing represented shell volume.
+- Advanced the surface-volume provider identity to version 2 so geometry caches produced by the earlier translation-sensitive lattice rule are not silently reused. The generic regional cache schema remains unchanged; affected saved preparations become stale through their normal geometry/preparation identity checks.
+- Bounded the user-facing inward sampling depth to **0.01–30 mm** in the numerical provider, Studio adapter, Model Editor inspector, and Exposure Analysis chooser. The default remains 2 mm. This keeps the feature in its intended near-surface/deeper-head use range while avoiding pathological very-deep cold builds.
+- Benchmarked the packaged Generic bust cold shell build in the dependency-light environment: approximately 12 s at 2 mm, 22.5 s at 20 mm, and 29.5 s at the new 30 mm maximum. Existing progress/cancellation reporting remains active during those cache-miss builds; matching shared geometry caches avoid rebuilding the shell.
+- Expanded numerical validation with rigid-translation invariance, rotation tolerance, uniform scaling, deterministic repeatability, root/child volume conservation, real progress/cancellation interruption, an analytic curved-shell sphere check, a uniform synthetic field check, and a known spatial-gradient check across opposite surface regions.
+- Updated surface-region source documentation and Help to describe the implemented provider rather than the old phased/future wording, and documented the supported depth range.
+
+## 0.14.0.260 — Exposure Analysis persistence test cleanup
+
+- Updated the core Exposure Analysis round-trip regression to reflect the v5 preparation contract introduced by the layered regional cache work. Saved preparations intentionally enrich `exposure_analysis_context` with the generic regional engine/provider description plus geometry, exposure-data, and preparation identities; the test now verifies those fields and confirms the original caller-supplied payload remains otherwise unchanged.
+- No runtime Exposure Analysis or cache behavior changed in this patch.
+
+## 0.14.0.259 — Surface-region Exposure Analysis UI and workflow
+
+- Finished the Phase 6 user-facing workflow for near-surface Exposure Analysis. Region-aware geometry now exposes a persistent **Exposure sampling depth** control directly in the Model Editor Surface regions inspector, with explicit wording that the inward layer is a geometric field-sampling volume rather than a tissue-thickness or biological-dose model.
+- Added the same near-surface depth control to the Exposure Analysis target chooser so users can change the selected bust/surface target without leaving the analysis workflow. Applying a new depth updates the geometry object through normal undoable project operations; earlier saved preparations remain readable but become Stale because their geometry identity no longer matches.
+- Reorganized the Exposure Analysis chooser into **Region sets** and **Measurement volumes**, with Brain regions and Surface regions identified separately. Brain and bust/surface targets continue to use the same regional analysis tools rather than separate numerical workflows.
+- Added **← Analysis targets** navigation inside analyses opened from Exposure Editor. Users can move directly between complementary near-surface and SRI24 brain preparations in the same Exposure Analysis workspace without closing/reopening the workflow; target switching is disabled while an analysis job is active.
+- Exposed prepared near-surface geometry provenance in the region browser. Surface-region tooltips and the active-region summary now report inward depth, sampled volume, surface area, source-voxel population, and retained field-sample count where available.
+- Added a **Volume** column to Surface-region Exposure Summary while leaving the column hidden for the existing Brain and Measurement summary layouts. The volume comes from the authoritative weighted shell geometry and is descriptive geometry metadata, not an exposure/dose metric.
+- Expanded the surface-region root metadata to carry total sampled volume, total authored surface area, source-voxel count, and retained-sample count so whole-shell rows have the same provenance as individual Face/Scalp/Ear/etc. rows.
+- Updated Generic bust, custom surface-region, and Exposure Analysis Help topics for the depth setting, stale-preparation behavior, target switching, region provenance, and surface-summary volume display. Added dependency-light Phase 6 UI contract coverage.
+
+## 0.14.0.258 — Surface-region Exposure Analysis integration
+
+- Integrated the Phase 3 inward surface-region volume provider as a first-class Exposure Analysis target. Closed, unambiguous meshes with authored surface regions (including the Generic bust in its normal Visual role) now appear alongside SRI24 Brain Areas and explicit Measurement-role volumes.
+- Preserved the established whole-object Measurement workflow: assigning a region-aware mesh the Measurement role deliberately analyses the complete object volume, while a non-Measurement region-aware mesh uses its authored inward surface regions.
+- Routed surface-region targets through the same generic prepared-field basis and downstream Summary, Spectrum/FFT, Timing & transitions, Threshold & duration, and Frequency-weighted screening machinery used by the other regional providers. No parallel bust-specific numerical analysis path was introduced.
+- Added a generic hierarchy snapshot to prepared Exposure Analysis context so saved/reopened analyses can reconstruct authored surface-region trees without LPBA40 assumptions. Surface rows use the shared weighted regional metrics and retain their source-shell voxel / retained-field-sample provenance.
+- Connected Phase 5 cache provenance to the native Phase 3 surface-volume identity. Surface depth, transformed mesh, authored ownership, provider version, and sampling controls now identify the shared geometry layer before it is combined with the physical exposure-data identity.
+- Added persistent per-object surface-analysis depth metadata (default 2 mm) and an adapter operation for changing it. The full user-facing depth editor remains Phase 6 UI work; changing the stored depth already produces distinct geometry/preparation identities.
+- Threaded Exposure Analysis progress/cancellation through surface-shell generation so a geometry-cache miss reports work instead of leaving the preparation apparently stalled.
+- Updated target browsing, saved-analysis reconstruction, regional summary presentation, and Saved Results sample wording for near-surface regions. Added dependency-light hierarchy/integration regression coverage.
+
+## 0.14.0.257 — Layered regional-analysis cache identities
+
+- Added a project-level shared regional-geometry cache for resolved `AnalysisRegionSet` data. Geometry/sample membership is persisted independently of any exposure or derived analysis page, uses compact binary ndarray storage, and can be explicitly listed or removed without invalidating already prepared Exposure Analysis field bases.
+- Added cache serialization/round-trip validation for generic region hierarchies, weighted sample sets, provider metadata, authoritative per-label volumes, and source/retained sample counts. Cached geometry carries both a request identity and a content identity so stale/corrupt membership cannot be reused silently.
+- Surface-region inward volumes now compute a pre-build cache identity from transformed geometry, authored ownership, sampling depth, provider versions, and lattice/sample controls. `StudioAdapter.surface_region_volume_set()` reuses a matching shared geometry cache before rebuilding the expensive shell lattice.
+- Existing LPBA40 and Measurement regional providers now use the same shared geometry-cache layer, allowing their resolved spatial sample sets to be reused across different exposures while keeping target display metadata refreshable.
+- Split Exposure Analysis provenance into independent geometry, physical exposure-data, and combined preparation identities. Derived Summary/Spectrum/FFT/Timing/Threshold/frequency-weighted cache keys remain scoped beneath the immutable preparation identity.
+- Advanced saved Exposure Analysis to format v5 (`FWBEA5`). Derived-result cache blobs now carry the preparation identity they belong to and are rejected if attached to a different preparation. Previous v4 Exposure Analysis caches are intentionally discarded on load; project/model data is unaffected.
+- Added explicit adapter APIs for listing/deleting shared regional-geometry caches as future cache-manager integration points, and advanced Workbench metadata to v26 for the new project-level cache collection.
+
+## 0.14.0.256 — Inward surface-region volume sampling
+
+- Added a generic `surface_region_volume` provider that converts any closed, unambiguous authored surface-region mesh into deterministic inward volumetric analysis regions at a configurable sampling depth. The normal end-user control is the depth; source-lattice density and retained field-sample limits are bounded internal sampling controls.
+- Near-surface membership is evaluated with an interior-only voxel-centre integration lattice. Each accepted source voxel must lie inside/on the closed mesh and within the requested distance of the surface; ownership comes from the exact nearest authored surface triangle, so neighbouring surface regions form one non-overlapping volume partition rather than independent extrusions.
+- Added deterministic per-region downsampling for field calculations while preserving source-voxel physical volume through `AnalysisSampleSet` weights and authoritative label volumes, mirroring the existing LPBA40 weighted-sampling strategy. Unclassified surface ownership remains explicitly excluded and its represented volume is reported separately.
+- Added per-region metadata for surface area, sampling depth, represented volume, source voxel count and retained field-sample count, plus whole-provider geometry/sampling metadata for later UI and cache inspection.
+- Added a transformed-geometry + authored-region fingerprint and a derived-volume identity that includes sampling depth and resolved lattice settings. Changing depth, object placement/scale, region ownership, or sampling resolution therefore produces a distinct derived geometry before Phase 4 cache integration.
+- Added `StudioAdapter.surface_region_volume_set()` as the provider boundary for region-aware triangle objects. Exposure Analysis does not consume this provider yet; that integration remains Phase 4.
+- Added dependency-light regression coverage for analytic shell volume, inward-only membership, volume-preserving downsampling, depth identity changes, unclassified-surface exclusion, and region metadata.
+
+## 0.14.0.255 — Region-aware surface geometry provider
+
+- Added a dependency-light `surface_region_geometry` provider that converts authored named-face mesh regions into deterministic geometric queries suitable for future derived volumetric analyses. The provider is generic and works with arbitrary region-aware triangle meshes, not only the bundled Generic bust.
+- Added exact nearest-triangle distance/closest-point lookup accelerated by a bounding-volume hierarchy. Equidistant seam cases use the lowest original triangle index as a stable tie-break, preserving deterministic surface-region ownership.
+- Added certified inside/outside classification for closed manifold meshes using orientation-independent ray parity, plus signed surface depth (positive inward, negative outward) so the next phase can form inward-only sampling shells without depending on triangle-normal direction.
+- Surface ownership now keeps unassigned triangles explicitly unclassified, while overlapping authored assignments are marked ambiguous and block derived-volume generation instead of silently choosing a region. Open/non-manifold meshes remain usable for nearest-surface queries but cannot claim interior volume membership.
+- Added per-region surface-area metadata, compact readiness diagnostics, and a transient `StudioAdapter.surface_region_geometry()` boundary that resolves the same transformed world-space mesh used by the rest of Field Workbench.
+- Added dependency-light regressions covering analytic cube distance/containment, seam tie-breaking, unclassified and overlapping faces, open meshes, on-surface behavior, and the packaged 38k-face Generic bust. The bundled bust validates as a closed, complete five-region partition ready for Phase 3 volume generation.
+
+## 0.14.0.254 — Generic spatial-region analysis core
+
+- Refactored regional field/exposure calculations into a source-agnostic `spatial_analysis` core shared by atlas regions, measurement volumes, and future derived-region providers such as near-surface bust shells. LPBA40/Brain View keeps compatibility wrappers while the numerical engine no longer depends on brain-specific types or function names.
+- Added explicit `AnalysisRegionNode`, `AnalysisSampleSet`, and `AnalysisRegionSet` contracts so region providers resolve geometry/sampling once and downstream frame/playback statistics consume the same weighted representation regardless of source.
+- Measurement-role objects now use the generic regional types directly and carry authoritative physical region-volume metadata independently of sample density, while preserving the existing arbitrary-object measurement workflow.
+- Exposure Analysis preparations now record the regional engine/schema and region-provider identity in their context and dependency fingerprint, separating target geometry from the provider that turns it into analysis regions.
+- Deliberately advanced the saved Exposure Analysis preparation/cache format to v4 (`FWBEA4`) so pre-refactor regional caches are discarded rather than interpreted under the new contract; project/model data remains unaffected.
+- Added dependency-light regression coverage for generic-region volume handling, LPBA40 compatibility wrappers, and region-provider identity, and updated packaging/cache-version checks for the new schema.
+
 ## 0.14.0.253 — Exposure Analysis cache/queue consolidation
 
 - Finished the four-phase saved-analysis cache update with a cleanup/regression pass across selective cache management, frequency-weighted reference queueing, and compact weighted-result persistence.

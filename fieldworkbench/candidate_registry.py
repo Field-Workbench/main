@@ -1,7 +1,7 @@
 """Persistent flat optimizer solution registry.
 
 The optimizer sees the same physical setting at several stages and fidelities:
-cheap magnetic reconnaissance, geometry-only DRC, optional physical promotion,
+cheap magnetic reconnaissance, geometry-only DRC, physical promotion/refinement,
 and authoritative full-model validation.  This module keeps one durable record
 per *canonical structural solution* and attaches observations/provenance to that
 record instead of building a parent/child candidate tree or passing disposable
@@ -36,6 +36,11 @@ _FIDELITY_PRIORITY = {
     "physical_promotion": 30,
     "promotion": 30,
     "intermediate": 30,
+    # Optimizer 2.3 uses a distinct tier for candidates that have actually moved
+    # under capable physical physics rather than merely being re-ranked at fixed
+    # scout coordinates.
+    "physical_search": 35,
+    "physical_refinement": 35,
     "authoritative": 40,
 }
 
@@ -82,6 +87,8 @@ def _fidelity_rank(name: Any) -> int:
         return _FIDELITY_PRIORITY[text]
     if "authoritative" in text or "full" in text:
         return 40
+    if "refinement" in text or "physical_search" in text:
+        return 35
     if "physical" in text or "promotion" in text or "bundled" in text:
         return 30
     if "fine" in text:

@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
 
 import fieldworkbench.main_window as main_window_module
 
-from fieldworkbench.exposure_panel import ExposureRegionPanel
+from fieldworkbench.exposure_panel import ExposureRegionPanel, ExposureResultTab
 from fieldworkbench.main_window import (
     UnifiedFieldWorkspaceDialog,
     MainWindow,
@@ -2080,7 +2080,10 @@ class UiSmokeTests(unittest.TestCase):
         # and exposes the compact Scripted-source selector.
         maps.mode_buttons["playback"].click()
         self.assertEqual(maps.mode, "playback")
-        self.assertFalse(maps._measurement_panel_visible)
+        # Scripted results have their own open-by-default live-analysis
+        # preference; this does not expose the Static snapshot panel.
+        self.assertTrue(maps._measurement_panel_visible)
+        self.assertTrue(maps._measurement_panel_visibility_by_view["playback:3d"])
         self.assertFalse(maps._measurement_panel_visibility_by_view["3d"])
         self.assertTrue(maps.workspace_regions_button.isHidden())
         self.assertTrue(maps.measurement_panel_host.isHidden())
@@ -2116,7 +2119,42 @@ class UiSmokeTests(unittest.TestCase):
         retained_scripted.setProperty("fieldWorkspaceOwnerView", "3d")
         scripted_result_index = maps.shared_tabs.addTab(retained_scripted, "3D\\Sine - 1")
         maps.shared_tabs.setCurrentIndex(scripted_result_index)
+        # Ordinary Scripted maps still have no region panel or toggle.
+        self.assertTrue(maps.workspace_regions_button.isHidden())
+        self.assertTrue(maps.measurement_panel_host.isHidden())
+
+        # A live-analysis result owns an embedded panel, not the outer Static
+        # snapshot host. Its toggle must not change either Static preference.
+        measurement_viewer = QWidget()
+        measurement_viewer.cleanup = mock.Mock()
+        measurement_result = ExposureResultTab(measurement_viewer, QWidget())
+        measurement_result.setProperty("fieldWorkspaceOwnerMode", "playback")
+        measurement_result.setProperty("fieldWorkspaceOwnerView", "3d")
+        measurement_index = maps.shared_tabs.addTab(measurement_result, "3D live analysis")
+        maps.shared_tabs.setCurrentIndex(measurement_index)
+        self.assertFalse(maps.workspace_regions_button.isHidden())
+        self.assertEqual(maps.workspace_regions_button.text(), "Hide measurements")
+        self.assertTrue(maps.measurement_panel_host.isHidden())
+        self.assertGreater(measurement_result.splitter.sizes()[1], 0)
+        maps.workspace_regions_button.click()
+        self.assertFalse(maps._measurement_panel_visibility_by_view["playback:3d"])
+        self.assertEqual(measurement_result.splitter.sizes()[1], 0)
+        self.assertFalse(maps._measurement_panel_visibility_by_view["3d"])
+        self.assertTrue(maps._measurement_panel_visibility_by_view["2d"])
+        maps.mode_buttons["static"].click()
+        self.assertFalse(maps._measurement_panel_visible)
+        self.assertFalse(maps.measurement_panel_host.isHidden())
+        maps.shared_tabs.setCurrentIndex(measurement_index)
+        self.assertEqual(maps.mode, "playback")
+        self.assertFalse(maps._measurement_panel_visible)
+        self.assertEqual(maps.workspace_regions_button.text(), "Show measurements")
+        self.assertEqual(measurement_result.splitter.sizes()[1], 0)
+        maps.workspace_regions_button.click()
+        self.assertTrue(maps._measurement_panel_visibility_by_view["playback:3d"])
+        self.assertGreater(measurement_result.splitter.sizes()[1], 0)
         maps.shared_tabs.setCurrentIndex(static_result_index)
+        self.assertTrue(maps._measurement_panel_visible)
+        self.assertEqual(maps.workspace_regions_button.text(), "Hide measurements")
         self.assertEqual(maps.mode, "static")
         self.assertEqual(maps.current_view_key, "2d")
         self.assertEqual(maps.shared_tabs.currentIndex(), static_result_index)
@@ -2200,7 +2238,7 @@ class UiSmokeTests(unittest.TestCase):
             "model": (1, 0, 1, 3),
             "maps": (2, 0, 2, 3),
             "exposures": (4, 0, 2, 3),
-            "datasets": (6, 0, 1, 3),
+            "data_results": (6, 0, 2, 3),
         }
         for key, expected in expected_positions.items():
             frame = page.project_summary_frames[key]
@@ -2227,10 +2265,11 @@ class UiSmokeTests(unittest.TestCase):
             [
                 "Model Editor",
                 "Map Creator",
-                "Saved Results",
+                "Exposure Analysis",
                 "Exposure Editor",
                 "Waveform Editor",
                 "Dataset Manager",
+                "Saved Results",
             ],
         )
 
@@ -2240,21 +2279,26 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIs(page.app_cards[2].parentWidget(), page.project_summary_frames["maps"])
         self.assertIs(page.app_cards[3].parentWidget(), page.project_summary_frames["exposures"])
         self.assertIs(page.app_cards[4].parentWidget(), page.project_summary_frames["exposures"])
+        self.assertIs(page.app_cards[5].parentWidget(), page.project_summary_frames["data_results"])
+        self.assertIs(page.app_cards[6].parentWidget(), page.project_summary_frames["data_results"])
 
         self.assertIn("object", page.project_summary_labels["model"].text())
-        self.assertIn("saved result", page.project_summary_labels["maps"].text())
+        self.assertIn("map", page.project_summary_labels["maps"].text())
+        self.assertIn("exposure analys", page.project_summary_labels["maps"].text())
         self.assertIn("exposure", page.project_summary_labels["exposures"].text())
-        self.assertIn("dataset", page.project_summary_labels["datasets"].text())
-        self.assertEqual(len(page.project_connector_labels), 6)
+        self.assertIn("dataset", page.project_summary_labels["data_results"].text())
+        self.assertIn("saved result", page.project_summary_labels["data_results"].text())
+        self.assertEqual(len(page.project_connector_labels), 7)
         self.assertEqual(
             [label.accessibleName() for label in page.project_connector_labels],
             [
                 "Model → Model Editor",
                 "Maps / Analysis → Map Creator",
-                "Maps / Analysis → Saved Results",
+                "Maps / Analysis → Exposure Analysis",
                 "Exposures → Exposure Editor",
                 "Exposures → Waveform Editor",
-                "Datasets → Dataset Manager",
+                "Data / Results → Dataset Manager",
+                "Data / Results → Saved Results",
             ],
         )
         self.assertEqual(
@@ -2263,7 +2307,7 @@ class UiSmokeTests(unittest.TestCase):
                 "model": "Open Model Editor",
                 "maps": "Open Map Creator",
                 "exposures": "Open Exposure Editor",
-                "datasets": "Open Dataset Manager",
+                "data_results": "Open Dataset Manager",
             },
         )
         self.assertEqual(
@@ -2272,7 +2316,7 @@ class UiSmokeTests(unittest.TestCase):
                 "model": "Open Model Editor",
                 "maps": "Open Map Creator",
                 "exposures": "Open Exposure Editor",
-                "datasets": "Open Dataset Manager",
+                "data_results": "Open Dataset Manager",
             },
         )
         self.assertIn("Status:", page.project_status_label.text())
@@ -2300,7 +2344,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIsNotNone(page.record.exposure_window)
         page.record.exposure_window.close()
 
-        page.project_component_title_labels["datasets"].clicked.emit()
+        page.project_component_title_labels["data_results"].clicked.emit()
         self.application.processEvents()
         self.assertIsNotNone(page.record.dataset_window)
         page.record.dataset_window.close()
@@ -4705,7 +4749,8 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIn("QLabel#resultValue", QApplication.instance().styleSheet())
         self.assertIn("QMainWindow, QDialog { background: #f5f7fa; }", QApplication.instance().styleSheet())
         self.assertEqual(dialog.refresh_button.text(), "Refresh")
-        self.assertTrue(dialog.refresh_timer.isActive())
+        self.assertTrue(dialog._deferred_refresh_timer.isSingleShot())
+        self.assertFalse(dialog._deferred_refresh_timer.isActive())
         self.assertEqual(dialog.import_button.text(), "Import from scene…")
         self.assertEqual(dialog.tree.topLevelItemCount(), 2)
         self.assertEqual(dialog.result_tabs.tabText(0), "Static maps (0)")
@@ -5564,21 +5609,20 @@ class UiSmokeTests(unittest.TestCase):
         )
         weighted._optimizer_trace_nodes["prepare"]["status"] = "complete"
         weighted._optimizer_trace_nodes["map"]["status"] = "complete"
-        weighted._optimizer_trace_nodes["reality"]["status"] = "active"
-        drc = weighted._optimizer_trace_nodes["reality.drc"]
+        weighted._optimizer_trace_nodes["drc"]["status"] = "active"
+        drc = weighted._optimizer_trace_nodes["drc.map"]
         drc["status"] = "active"
         drc["count"] = 0
         drc["total"] = 140
-        weighted._optimizer_trace_active_leaf = "reality.drc"
+        weighted._optimizer_trace_active_leaf = "drc.map"
         weighted._refresh_optimizer_determinate_progress_bar()
         self.assertLess(weighted.progress_bar.value(), 500)
         weighted.deleteLater()
 
-        # A high-dimensional Balanced run now ends in the cheap-first reality
-        # stage, whose authoritative full-model work is the progressive finalist
-        # validation leaf.  Completing the earlier reality leaves must not make
-        # the global bar claim completion while that validation ceiling is still
-        # being consumed.
+        # A high-dimensional Balanced run keeps DRC and authoritative validation
+        # as independent top-level stages. Completing reconnaissance/DRC must not
+        # make the global bar claim completion while the authoritative validation
+        # ceiling is still being consumed.
         balanced = OptimizerDialog(window.adapter, window)
         balanced._initialize_optimizer_trace_plan(
             {
@@ -5596,19 +5640,18 @@ class UiSmokeTests(unittest.TestCase):
                 ],
             }
         )
-        for stage_id in ("prepare", "map"):
+        for stage_id in ("prepare", "map", "drc"):
             balanced._optimizer_trace_nodes[stage_id]["status"] = "complete"
-        reality = balanced._optimizer_trace_nodes["reality"]
-        reality["status"] = "active"
-        balanced._optimizer_trace_nodes["reality.drc"]["status"] = "complete"
-        balanced._optimizer_trace_nodes["reality.promote"]["status"] = "complete"
+        authority = balanced._optimizer_trace_nodes["authority"]
+        authority["status"] = "active"
+        balanced._optimizer_trace_nodes["authority.promote"]["status"] = "complete"
 
-        validation = balanced._optimizer_trace_nodes["reality.validate"]
+        validation = balanced._optimizer_trace_nodes["authority.validate"]
         validation["status"] = "active"
         validation_total = int(validation["total"] or 0)
         self.assertGreater(validation_total, 1)
         validation["count"] = validation_total - 1
-        balanced._optimizer_trace_active_leaf = "reality.validate"
+        balanced._optimizer_trace_active_leaf = "authority.validate"
         balanced._optimizer_progress_fraction = 0.0
         balanced._refresh_optimizer_determinate_progress_bar()
         self.assertLess(balanced.progress_bar.value(), 1000)
@@ -6373,7 +6416,7 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(HELP_TOPICS["saved_exposures"][0], "Exposures")
         self.assertIn("exposure_analysis", HELP_TOPICS)
         self.assertIn("Exposures", CATEGORY_ORDER)
-        self.assertEqual(HELP_TOPICS["exposure_analysis"][0], "Exposures")
+        self.assertEqual(HELP_TOPICS["exposure_analysis"][0], "Maps / Analysis")
         self.assertIn("Create new analysis", HELP_TOPICS["exposure_analysis"][2])
         self.assertIn("Analyze exposure…", HELP_TOPICS["exposure_analysis"][2])
         self.assertIn("spectrum_analysis", HELP_TOPICS)

@@ -1,7 +1,8 @@
-"""Shared playback region statistics from frozen field bases and physical time.
+"""Shared playback/exposure analysis for resolved spatial regions.
 
-The atlas engine already accepts an explicit hierarchy. Measurement forests use
-that same engine, with independent labels for overlapping objects.
+Region providers supply an explicit hierarchy and weighted sample set through
+the generic spatial-analysis contract. LPBA40, measurement volumes, and future
+derived region sources therefore share the same frozen-basis calculations.
 """
 from __future__ import annotations
 
@@ -10,15 +11,15 @@ import copy
 from dataclasses import dataclass
 import numpy as np
 
-from .brain_analysis import (
-    BrainRegionNode, BrainSampleSet, lpba40_frame_region_metrics,
-    lpba40_playback_region_metrics, lpba40_playback_region_metrics_streaming,
+from .spatial_analysis import (
+    AnalysisRegionNode, AnalysisSampleSet, frame_region_metrics,
+    playback_region_metrics, playback_region_metrics_streaming,
 )
 
 
 @dataclass(frozen=True)
 class MeasurementRegions:
-    children: tuple[BrainRegionNode, ...]
+    children: tuple[AnalysisRegionNode, ...]
     key: str = "measurement_volumes"
     name: str = "Measurement volumes"
     label_ids: tuple[int, ...] = ()
@@ -44,12 +45,12 @@ def _emit_analysis_progress(callback, message, completed=None, total=None):
 
 
 def _hierarchy_weighted_rms_moments(fixed, bases, samples, hierarchy):
-    """Build every hierarchy row from one pass over the atomic atlas labels.
+    """Build every hierarchy row from one pass over the atomic region labels.
 
     A regional RMS quadratic form is a weighted mean of per-point second
     moments.  Parent rows can therefore be assembled exactly from the same
     unnormalised label accumulators as their children.  The older implementation
-    rescanned the complete LPBA40 sample cloud once for *every* hierarchy row;
+    rescanned the complete regional sample cloud once for *every* hierarchy row;
     this version scans each field/sample term once and only combines the small
     per-label accumulators afterwards.
     """
@@ -378,7 +379,11 @@ def authoritative_analysis_packet_factory(payload):
 
 
 
-def measurement_playback_payload(adapter, timeline, drive_ids, controlled_ids, progress_callback=None, *, trace=None, waveform_metadata=None, sequence_steps=None, sequence_loop=False):
+def measurement_playback_payload(
+    adapter, timeline, drive_ids, controlled_ids, progress_callback=None, *,
+    trace=None, waveform_metadata=None, sequence_steps=None, sequence_loop=False,
+    frame_only=False,
+):
     # Local import avoids a waveform <-> region_analysis import cycle.
     from .waveform import (
         field_bases_for_drives, MAX_BRAIN_FRAME_METRIC_CACHE_BYTES,
@@ -407,6 +412,11 @@ def measurement_playback_payload(adapter, timeline, drive_ids, controlled_ids, p
             detail=f"Preparing samples for {len(measurement_entries):,} measurement volume(s).",
         )
 
+    point_indices = []
+    point_keys = []
+    used_keys = {str(entry["id"]) for entry in measurement_entries}
+    next_point_label = len(measurement_entries) + 1
+    point_offset = 0
     for measurement_index, entry in enumerate(measurement_entries, start=1):
         object_id = str(entry["id"])
         object_label = str(entry.get("label") or object_id)
@@ -426,7 +436,7 @@ def measurement_playback_payload(adapter, timeline, drive_ids, controlled_ids, p
         label = len(nodes) + 1
         user_points = sample["sampling_mode"] == "user_defined"
         name = str(sample["label"]) + (" [samples]" if user_points else "")
-        nodes.append(BrainRegionNode(str(entry["id"]), name, (label,), ()))
+        nodes.append(AnalysisRegionNode(str(entry["id"]), name, (label,), ()))
         points.append(positions)
         labels.extend([label] * len(positions))
         # Weights are equal within an object. Geometric volume is separately
@@ -438,6 +448,37 @@ def measurement_playback_payload(adapter, timeline, drive_ids, controlled_ids, p
                              "label_id": label, "sampling_mode": sample["sampling_mode"],
                              "quality": sample.get("quality"), "sample_count": len(positions),
                              "volume_cm3": volume})
+        if frame_only and user_points:
+            well = entry.get("well_plate") or {}
+            well_labels = well.get("well_labels", [])
+            well_positions = np.asarray(well.get("sample_points_mm", []), dtype=float)
+            local_mm = np.asarray(sample["local_points_m"]) * 1000
+            named_wells = (
+                len(well_labels) == len(positions)
+                and well_positions.shape == local_mm.shape
+                and np.allclose(well_positions, local_mm, rtol=0, atol=1e-9)
+            )
+            children = []
+            # Bound table size for large imported point sets. The aggregate
+            # still uses every point, including points with no individual row.
+            indices = np.linspace(0, len(positions) - 1, min(len(positions), 2000), dtype=int)
+            for index in indices:
+                key = f"{object_id}:point:{index + 1}"
+                while key in used_keys:
+                    key += ":point"
+                used_keys.add(key)
+                child = {
+                    "key": key,
+                    "name": str(well_labels[index]) if named_wells else f"Point {index + 1}",
+                    "label_id": next_point_label,
+                    "position_mm": (positions[index] * 1000).tolist(),
+                }
+                children.append(child)
+                point_indices.append(point_offset + index)
+                point_keys.append(key)
+                next_point_label += 1
+            descriptions[-1]["children"] = children
+        point_offset += len(positions)
     if not nodes:
         return {"objects": [], "metrics": None, "waveform": None}
     points = np.concatenate(points)
@@ -452,7 +493,14 @@ def measurement_playback_payload(adapter, timeline, drive_ids, controlled_ids, p
     )
     labels = np.asarray(labels, dtype=np.int32)
     counts = {int(label): int(np.sum(labels == label)) for label in range(1, len(nodes)+1)}
-    samples = BrainSampleSet(points, labels, np.asarray(weights), np.arange(len(points)), counts, counts, 1.0)
+    label_volumes_mm3 = {
+        int(index + 1): max(float(volume) * 1000.0, 1.0)
+        for index, volume in enumerate(volumes)
+    }
+    samples = AnalysisSampleSet(
+        points, labels, np.asarray(weights), np.arange(len(points)), counts, counts, 1.0,
+        label_volumes_mm3=label_volumes_mm3,
+    )
     hierarchy = MeasurementRegions(tuple(nodes))
     measurement_basis_progress = _render_task_progress_relay(
         progress_callback,
@@ -466,7 +514,7 @@ def measurement_playback_payload(adapter, timeline, drive_ids, controlled_ids, p
     if not np.isfinite(fixed).all() or not np.isfinite(bases).all():
         raise ValueError("Measurement samples contain non-finite magnetic fields; check source intersections.")
     source_count = len(timeline["frame_times"])
-    max_frames = max(2, MAX_BRAIN_FRAME_METRIC_CACHE_BYTES // max(1, len(nodes)*7*4))
+    max_frames = max(2, MAX_BRAIN_FRAME_METRIC_CACHE_BYTES // max(1, (len(nodes) + len(point_indices)) * 7 * 4))
     indices = np.unique(np.rint(np.linspace(0, source_count-1, min(source_count, max_frames))).astype(int))
 
     def frame_progress(completed, total):
@@ -480,11 +528,55 @@ def measurement_playback_payload(adapter, timeline, drive_ids, controlled_ids, p
             detail=f"Measurement playback frames {completed:,}/{total:,}",
         )
 
-    frames = lpba40_frame_region_metrics(
-        fixed, bases, np.asarray(timeline["frame_currents"])[indices], samples, hierarchy,
+    metric_currents = np.asarray(timeline["frame_currents"])[indices]
+    frames = frame_region_metrics(
+        fixed, bases, metric_currents, samples, hierarchy,
         progress_callback=frame_progress,
     )
     frames["values"][:, :, 6] = volumes
+    if point_indices:
+        point_fixed = fixed[point_indices]
+        point_bases = bases[:, point_indices]
+        values = np.full(
+            (len(indices), len(nodes) + len(point_indices), 7), np.nan, dtype=np.float32
+        )
+        values[:, :len(nodes)] = frames["values"]
+        for frame_index, current in enumerate(metric_currents):
+            vectors = point_fixed + np.einsum("c,cpk->pk", current, point_bases)
+            magnitude_uT = np.linalg.norm(vectors, axis=1) * 1e6
+            # RMS, mean, P95 and peak are all the point's field magnitude.
+            # Spatial uniformity, alignment and volume require a region.
+            values[frame_index, len(nodes):, :4] = magnitude_uT[:, None]
+        frames["values"] = values
+        frames["keys"].extend(point_keys)
+        frames["names"].extend(child["name"] for obj in descriptions for child in obj.get("children", []))
+        frames["sample_counts"].extend([1] * len(point_indices))
+        frames["voxel_counts"].extend([0] * len(point_indices))
+    metrics = {
+        "keys": frames["keys"],
+        "names": frames["names"],
+        "shape": list(frames["values"].shape),
+        "values_b64": encode(frames["values"], np.float32),
+        "sample_counts": frames["sample_counts"],
+        "voxel_counts": frames["voxel_counts"],
+        "source_frame_count": source_count,
+        "sampled_frame_indices_b64": encode(indices, np.int32),
+    }
+    # Retain at most 2000 highlight points per object; numerical samples are untouched.
+    highlights = []
+    for node in nodes:
+        selected = points[labels == node.label_ids[0]] * 1000
+        stride = max(1, int(np.ceil(len(selected)/2000)))
+        highlights.append({"label_id": node.label_ids[0], "positions": selected[::stride].tolist()})
+    highlights.extend(
+        {"label_id": child["label_id"], "positions": [child["position_mm"]]}
+        for obj in descriptions
+        for child in obj.get("children", [])
+    )
+    result = {"objects": descriptions, "metrics": metrics, "highlights": highlights}
+    if frame_only:
+        return result
+
     statistics_scope = str(timeline.get("statistics_scope", "full") or "full").strip().lower()
     statistics_label = "preview" if statistics_scope == "preview" else "full-exposure"
 
@@ -512,13 +604,13 @@ def measurement_playback_payload(adapter, timeline, drive_ids, controlled_ids, p
 
     if callable(timeline.get("analysis_packet_factory") or timeline.get("analysis_chunk_factory")):
         analysis_factory = timeline.get("analysis_packet_factory") or timeline["analysis_chunk_factory"]
-        summary = lpba40_playback_region_metrics_streaming(
+        summary = playback_region_metrics_streaming(
             fixed, bases, analysis_factory, samples, hierarchy,
             progress_callback=streaming_summary_progress,
             analysis_sample_count=int(timeline.get("analysis_sample_count_estimate", 0) or 0),
         )
     else:
-        summary = lpba40_playback_region_metrics(
+        summary = playback_region_metrics(
             fixed, bases, timeline["analysis_currents"], timeline["analysis_times"],
             frames, np.asarray(timeline["frame_times"])[indices], samples, hierarchy,
             full_timeline=False, progress_callback=region_summary_progress,
@@ -526,11 +618,7 @@ def measurement_playback_payload(adapter, timeline, drive_ids, controlled_ids, p
     rows = [summary[node.key] for node in nodes]
     summary_values = np.asarray([(r.playback_rms_uT, r.mean_uT, r.max_p95_uT, r.absolute_peak_uT,
                                   r.b_time_uT_s, r.b2_time_uT2_s, r.volume_cm3) for r in rows])
-    metrics = {"keys": frames["keys"], "names": frames["names"],
-               "shape": list(frames["values"].shape), "values_b64": encode(frames["values"], np.float32),
-               "sample_counts": frames["sample_counts"], "voxel_counts": frames["voxel_counts"],
-               "source_frame_count": source_count, "sampled_frame_indices_b64": encode(indices, np.int32),
-               "playback_summary": {"shape": list(summary_values.shape), "values_b64": encode(summary_values, np.float64),
+    metrics["playback_summary"] = {"shape": list(summary_values.shape), "values_b64": encode(summary_values, np.float64),
                     "peak_times_s_b64": encode([r.peak_time_s for r in rows], np.float64),
                     "playback": {"exposure_time_s": float(timeline.get("physical_duration_s", timeline["analysis_times"][-1]-timeline["analysis_times"][0])),
                                  "preview_duration_s": float(timeline.get("preview_duration_s", timeline["analysis_times"][-1]-timeline["analysis_times"][0])),
@@ -538,7 +626,7 @@ def measurement_playback_payload(adapter, timeline, drive_ids, controlled_ids, p
                                  "statistics_duration_s": float(timeline.get("statistics_duration_s", timeline["analysis_times"][-1]-timeline["analysis_times"][0])),
                                  "frame_count": source_count, "analysis_sample_count": int(timeline.get("analysis_sample_count_estimate", len(timeline["analysis_times"]))),
                                  "analysis_sample_count_estimated": callable(timeline.get("analysis_chunk_factory")),
-                                 "regional_frame_sample_count": len(indices), "atlas_sample_count": len(points)}}}
+                                 "regional_frame_sample_count": len(indices), "atlas_sample_count": len(points)}}
     if trace is not None:
         metrics["playback_summary"]["playback"] = _brain_playback_run_metadata(
             trace, frame_count=source_count, analysis_sample_count=int(timeline.get("analysis_sample_count_estimate", len(timeline["analysis_times"]))),
@@ -546,14 +634,8 @@ def measurement_playback_payload(adapter, timeline, drive_ids, controlled_ids, p
             analysis_sample_count_estimated=callable(timeline.get("analysis_chunk_factory")),
             waveform_metadata=waveform_metadata, sequence_steps=sequence_steps, sequence_loop=sequence_loop,
         )
-    # Retain at most 2000 highlight points per object; numerical samples are untouched.
-    highlights = []
-    for node in nodes:
-        selected = points[labels == node.label_ids[0]] * 1000
-        stride = max(1, int(np.ceil(len(selected)/2000)))
-        highlights.append({"label_id": node.label_ids[0], "positions": selected[::stride].tolist()})
-    return {"objects": descriptions, "metrics": metrics, "highlights": highlights,
-            "waveform": waveform_basis_payload(fixed, bases, samples, hierarchy, timeline, drive_ids)}
+    result["waveform"] = waveform_basis_payload(fixed, bases, samples, hierarchy, timeline, drive_ids)
+    return result
 
 
 MAX_RETAINED_INTERVALS = 2000

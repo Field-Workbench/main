@@ -26,10 +26,11 @@ Each open project has one shared project context. The Project Manager owns proje
 
 - **Model Editor** — build and inspect field sources, sensors, geometry, measurement volumes, coil construction, design-rule checks, and optimization.
 - **Map Creator** — create Static or Scripted 2D, 3D, and Brain visualizations, including saved-exposure playback.
-- **Saved Results** — reopen and manage cached Static/Scripted maps, Exposure Analysis resources, and quantitative Measurement-volume snapshots.
-- **Exposure Editor** — author physical-duration source/routing protocols and launch full-exposure analysis.
+- **Exposure Analysis** — analyze field exposure over time and across spatial regions; saved exposures can also launch the same workspace from Exposure Editor.
+- **Exposure Editor** — author physical-duration source/routing protocols.
 - **Waveform Editor** — create, import, edit, and export reusable Current/Voltage waveforms and encoded waveform formats.
 - **Dataset Manager** — manage measured datasets, calibration/composite fits, and coil-correction links.
+- **Saved Results** — reopen and manage cached Static/Scripted maps, Exposure Analysis resources, and quantitative Measurement-volume snapshots.
 
 Built-in **Help Topics** documents the current workflows, analysis definitions, limitations, and research/reference basis.
 
@@ -67,6 +68,32 @@ python app.py
 ```
 
 For Windows packaging, release validation, optional developer dependencies, and external solver acceptance, see [BUILDING_WINDOWS.md](BUILDING_WINDOWS.md) and [TESTING.md](TESTING.md).
+
+### Measurement playback
+
+In **Maps / Analysis → Scripted → 2D or 3D → Scene options**, enable
+**Live measurement analysis** before generating the map. The panel follows
+playback and scrubbing; expand a well plate to inspect its individual wells.
+Select a row to highlight its samples and drag metric headings to reorder them.
+Static 2D/3D remains the workflow for quantitative Measurement snapshots.
+
+For static or scripted 2D maps, **Show sensor placements** and **Show well rims**
+add projected overlays to newly generated maps. Select the well plates in
+**Objects**; well rims are independent of object outlines. The built-in plate is
+solid geometry with separate rim overlays, not a model of internal well walls.
+
+### Local agent access (CLI and MCP)
+
+Launch with `python app.py --automation` to enable access to the running instance.
+`python fwb.py instances` discovers live instances, and `python fwb.py commands`
+shows the shared command catalog. The CLI and optional MCP stdio bridge use the
+same project operations, revision checks, undo history, and background job system.
+For a Windows release candidate, start `FieldWorkbench.exe --automation`.
+The executable hosts the connection; the CLI/MCP client runs separately from the
+matching source with Python. The Windows ZIP does not supply a standalone client
+executable. Packaged agent acceptance remains pending; see the Windows setup in
+[Agent access](docs/AGENT_ACCESS.md) for architecture, setup,
+supported commands, units, and deferred user/release acceptance testing.
 
 ## 5. Tutorials and Demonstrations
 

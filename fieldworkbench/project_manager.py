@@ -2,8 +2,9 @@
 
 Each ``.magpy.json`` file is one project container with a shared project-scoped
 context and resource registry. Project Manager owns project lifetime and save
-state; Model Editor, Maps / Analysis, Exposure Editor, Waveform Editor, Dataset
-Manager, and Saved Results are project applications that operate on that context.
+state; Model Editor, Map Creator, Exposure Analysis, Exposure Editor, Waveform
+Editor, Dataset Manager, and Saved Results are project applications that operate on
+that context.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMenu,
@@ -75,6 +77,7 @@ _PROJECT_ICON_DIRECTORY = Path(__file__).with_name("assets") / "icons"
 _PROJECT_APPLICATION_ICONS = {
     "Model Editor": "model_editor.svg",
     "Map Creator": "map_creator.svg",
+    "Exposure Analysis": "exposure_analysis.svg",
     "Saved Results": "saved_results.svg",
     "Exposure Editor": "exposure_editor.svg",
     "Waveform Editor": "waveform_editor.svg",
@@ -320,6 +323,7 @@ class ProjectPage(QWidget):
         self.manager = manager
         self.record = record
         self._last_dashboard_signature: tuple | None = None
+        self._exposure_analysis_windows: dict[str, QWidget] = {}
         self._build_ui()
         self.refresh(force=True)
 
@@ -410,7 +414,7 @@ class ProjectPage(QWidget):
         self.dashboard_grid.setColumnStretch(0, 5)
         self.dashboard_grid.setColumnMinimumWidth(1, 42)
         self.dashboard_grid.setColumnStretch(2, 4)
-        for row in range(1, 7):
+        for row in range(1, 8):
             self.dashboard_grid.setRowMinimumHeight(row, 50)
             self.dashboard_grid.setRowStretch(row, 1)
 
@@ -437,8 +441,8 @@ class ProjectPage(QWidget):
         self.app_cards: list[QFrame] = []
 
         # Each logical project area is one sunken frame across all three
-        # dashboard columns.  Maps / Analysis and Exposures each span two
-        # application rows inside that same outer frame, so their paired
+        # dashboard columns.  Maps / Analysis, Exposures, and Data / Results
+        # each span two application rows inside that same outer frame, so their paired
         # launchers no longer introduce a border through the middle of the
         # grouping.
         self._add_dashboard_group(
@@ -466,10 +470,10 @@ class ProjectPage(QWidget):
                     QStyle.StandardPixmap.SP_FileDialogDetailedView,
                 ),
                 (
-                    "Saved Results",
-                    "Review saved maps and analysis snapshots.",
-                    self.open_snapshots,
-                    QStyle.StandardPixmap.SP_DialogSaveButton,
+                    "Exposure Analysis",
+                    "Analyze field exposure over time and across spatial regions.",
+                    self.open_exposure_analysis,
+                    QStyle.StandardPixmap.SP_FileDialogDetailedView,
                 ),
             ),
         )
@@ -495,15 +499,23 @@ class ProjectPage(QWidget):
         )
         self._add_dashboard_group(
             6,
-            1,
-            "Datasets",
-            "datasets",
-            ((
-                "Dataset Manager",
-                "Manage measurement datasets and calibrations.",
-                self.open_datasets,
-                QStyle.StandardPixmap.SP_FileDialogListView,
-            ),),
+            2,
+            "Data / Results",
+            "data_results",
+            (
+                (
+                    "Dataset Manager",
+                    "Manage measurement datasets and calibrations.",
+                    self.open_datasets,
+                    QStyle.StandardPixmap.SP_FileDialogListView,
+                ),
+                (
+                    "Saved Results",
+                    "Review saved maps, analyses, and snapshots.",
+                    self.open_snapshots,
+                    QStyle.StandardPixmap.SP_DialogSaveButton,
+                ),
+            ),
         )
 
     def _add_dashboard_group(
@@ -804,11 +816,11 @@ class ProjectPage(QWidget):
 
         saved_result_count = len(saved_maps) + len(exposure_analyses) + len(snapshots)
         map_lines = [
-            f"<b>{saved_result_count} saved result{'s' if saved_result_count != 1 else ''}</b>",
-            "No saved results yet." if saved_result_count == 0 else "Maps and analysis results",
+            f"<b>{len(saved_maps)} map{'s' if len(saved_maps) != 1 else ''}</b>",
+            f"<b>{len(exposure_analyses)} exposure analys{'es' if len(exposure_analyses) != 1 else 'is'}</b>",
         ]
         self._set_summary_text("maps", map_lines)
-        self._set_component_populated("maps", saved_result_count > 0)
+        self._set_component_populated("maps", bool(saved_maps or exposure_analyses))
 
         exposure_lines = [
             f"<b>{len(exposures)} exposure{'s' if len(exposures) != 1 else ''}</b>",
@@ -819,13 +831,16 @@ class ProjectPage(QWidget):
             "exposures", bool(exposures or waveform_resources)
         )
 
-        dataset_lines = [
-            f"<b>{len(datasets)} dataset{'s' if len(datasets) != 1 else ''}</b>",
-            f"<b>{len(calibrations)} calibration{'s' if len(calibrations) != 1 else ''}</b>",
+        data_result_lines = [
+            (
+                f"<b>{len(datasets)} dataset{'s' if len(datasets) != 1 else ''}</b> · "
+                f"<b>{len(calibrations)} calibration{'s' if len(calibrations) != 1 else ''}</b>"
+            ),
+            f"<b>{saved_result_count} saved result{'s' if saved_result_count != 1 else ''}</b>",
         ]
-        self._set_summary_text("datasets", dataset_lines)
+        self._set_summary_text("data_results", data_result_lines)
         self._set_component_populated(
-            "datasets", bool(datasets or calibrations)
+            "data_results", bool(datasets or calibrations or saved_result_count)
         )
 
     # --- existing applications ------------------------------------
@@ -847,6 +862,7 @@ class ProjectPage(QWidget):
     def _model_project_state_changed(self) -> None:
         """Refresh suite resource views after model/undo/redo changes."""
         self.refresh(force=True)
+        self._notify_saved_results_project_changed()
         exposure_window = self.record.exposure_window
         if exposure_window is not None:
             try:
@@ -945,6 +961,7 @@ class ProjectPage(QWidget):
     def _exposure_resources_changed(self) -> None:
         """Refresh project surfaces that summarize saved exposure resources."""
         self.refresh(force=True)
+        self._notify_saved_results_project_changed()
         window = self.record.exposure_window
         if window is not None:
             try:
@@ -966,6 +983,7 @@ class ProjectPage(QWidget):
         diagnostics when a waveform changes in the sibling application.
         """
         self.refresh(force=True)
+        self._notify_saved_results_project_changed()
         window = self.record.exposure_window
         if window is not None:
             try:
@@ -997,8 +1015,112 @@ class ProjectPage(QWidget):
         if exposure_id:
             window.open_exposure(exposure_id)
 
+    def _exposure_analysis_cache_changed(self, _analysis_id: str | None = None) -> None:
+        """Refresh dashboard/Saved Results after first-class Exposure Analysis work."""
+        self.refresh(force=True)
+        self._notify_saved_results_project_changed(immediate=True)
+
+    def _exposure_analysis_window_destroyed(self, exposure_id: str, window_id: int) -> None:
+        window = self._exposure_analysis_windows.get(str(exposure_id))
+        if window is not None and id(window) == window_id:
+            self._exposure_analysis_windows.pop(str(exposure_id), None)
+
+    def open_exposure_analysis(self, exposure_id: str | None = None) -> None:
+        """Open Exposure Analysis as a first-class suite application.
+
+        The analysis workspace itself is scoped to one saved exposure.  Project
+        Manager therefore opens the only exposure directly, or asks which saved
+        exposure to use when the project contains several.  Exposure Editor keeps
+        its existing contextual Analyze exposure shortcut.
+        """
+        summaries = list(self.record.adapter.list_exposures())
+        if not summaries:
+            QMessageBox.information(
+                self,
+                "Exposure Analysis",
+                "This project has no saved exposures yet. Create and save an exposure in Exposure Editor first.",
+            )
+            return
+
+        selected_id = str(exposure_id or "").strip()
+        if selected_id:
+            summary = next((row for row in summaries if str(row.get("id", "")) == selected_id), None)
+            if summary is None:
+                QMessageBox.warning(self, "Exposure Analysis", "The selected exposure no longer exists.")
+                return
+        elif len(summaries) == 1:
+            summary = summaries[0]
+            selected_id = str(summary.get("id", ""))
+        else:
+            labels: list[str] = []
+            rows_by_label: dict[str, dict] = {}
+            for index, row in enumerate(summaries, start=1):
+                name = str(row.get("name") or f"Exposure {index}")
+                duration = row.get("duration_s")
+                try:
+                    duration_text = f"{float(duration):g} s"
+                except (TypeError, ValueError):
+                    duration_text = "duration unavailable"
+                label = f"{name} — {duration_text}"
+                # Names are normally unique, but keep the chooser deterministic
+                # even for hand-edited project files that contain duplicates.
+                if label in rows_by_label:
+                    label = f"{label} [{index}]"
+                labels.append(label)
+                rows_by_label[label] = row
+            chosen, accepted = QInputDialog.getItem(
+                self,
+                "Exposure Analysis",
+                "Exposure to analyze:",
+                labels,
+                0,
+                False,
+            )
+            if not accepted or not chosen:
+                return
+            summary = rows_by_label[str(chosen)]
+            selected_id = str(summary.get("id", ""))
+
+        existing = self._exposure_analysis_windows.get(selected_id)
+        if existing is not None:
+            try:
+                if existing.isMinimized():
+                    existing.showNormal()
+                else:
+                    existing.show()
+                existing.raise_()
+                existing.activateWindow()
+                return
+            except RuntimeError:
+                self._exposure_analysis_windows.pop(selected_id, None)
+
+        try:
+            exposure = self.record.adapter.exposure(selected_id)
+        except Exception as error:  # noqa: BLE001 - project resource boundary
+            QMessageBox.warning(self, "Exposure Analysis", str(error))
+            return
+
+        from .exposure_workspace import ExposureAnalysisWorkspace
+
+        workspace = ExposureAnalysisWorkspace(
+            self.record.adapter,
+            exposure,
+            project_label=self.record.display_name(),
+            on_cache_changed=self._exposure_analysis_cache_changed,
+        )
+        self._exposure_analysis_windows[selected_id] = workspace
+        window_id = id(workspace)
+        workspace.destroyed.connect(
+            lambda _object=None, exposure_key=selected_id, key=window_id: self._exposure_analysis_window_destroyed(exposure_key, key)
+        )
+        self.record.context.register_window("exposure_analysis", workspace)
+        workspace.show()
+        workspace.raise_()
+        workspace.activateWindow()
+
     def _dataset_resources_changed(self) -> None:
         self.refresh(force=True)
+        self._notify_saved_results_project_changed()
         window = self.record.model_window
         if window is not None:
             try:
@@ -1030,6 +1152,24 @@ class ProjectPage(QWidget):
         elif calibration_id:
             window.open_calibration(calibration_id)
 
+    def _notify_saved_results_project_changed(self, *, immediate: bool = False) -> None:
+        """Refresh Saved Results from real project events, never idle polling.
+
+        Resource edits can arrive in bursts and remain debounced.  A saved-result
+        catalogue mutation (snapshot/map create/delete) is already a discrete user
+        action, so callers may request an immediate signature refresh; this keeps
+        the open manager visibly live without reintroducing periodic polling.
+        """
+        window = self.record.snapshot_window
+        if window is not None:
+            try:
+                if immediate:
+                    window.refresh_if_changed()
+                else:
+                    window.notify_project_changed()
+            except RuntimeError:
+                pass
+
     def _snapshots_changed(self) -> None:
         self.refresh(force=True)
         model = self.record.model_window
@@ -1038,12 +1178,7 @@ class ProjectPage(QWidget):
                 model._snapshots_changed(model.active_document.document_id)
             except (AttributeError, RuntimeError):
                 pass
-        window = self.record.snapshot_window
-        if window is not None:
-            try:
-                window.refresh_if_changed()
-            except RuntimeError:
-                pass
+        self._notify_saved_results_project_changed(immediate=True)
 
     def _snapshot_window_destroyed(self, window_id: int) -> None:
         window = self.record.snapshot_window
@@ -1118,6 +1253,7 @@ class ProjectManagerWindow(QMainWindow):
 
     RECENT_FILES_KEY = MainWindow.RECENT_FILES_KEY
     MAX_RECENT_FILES = MainWindow.MAX_RECENT_FILES
+    project_closed = Signal(str)
 
     def __init__(self, settings: QSettings | None = None) -> None:
         super().__init__()
@@ -1310,6 +1446,10 @@ class ProjectManagerWindow(QMainWindow):
         self.model_action.triggered.connect(lambda: self._with_current_page(lambda page: page.open_model_editor()))
         self.maps_action = QAction("Map Creator", self)
         self.maps_action.triggered.connect(lambda: self._with_current_page(lambda page: page.open_maps()))
+        self.exposure_analysis_action = QAction("Exposure Analysis", self)
+        self.exposure_analysis_action.triggered.connect(
+            lambda: self._with_current_page(lambda page: page.open_exposure_analysis())
+        )
 
         file_menu = self.menuBar().addMenu("&File")
         file_menu.addAction(self.new_action)
@@ -1336,14 +1476,15 @@ class ProjectManagerWindow(QMainWindow):
         project_menu = self.menuBar().addMenu("&Project")
         project_menu.addAction(self.model_action)
         project_menu.addAction(self.maps_action)
-        snapshot_action = project_menu.addAction("Saved Results")
-        snapshot_action.triggered.connect(lambda: self._with_current_page(lambda page: page.open_snapshots()))
+        project_menu.addAction(self.exposure_analysis_action)
         exposure_action = project_menu.addAction("Exposure Editor")
         exposure_action.triggered.connect(lambda: self._with_current_page(lambda page: page.open_exposures()))
         waveform_action = project_menu.addAction("Waveform Editor")
         waveform_action.triggered.connect(lambda: self._with_current_page(lambda page: page.open_waveforms()))
         dataset_action = project_menu.addAction("Dataset Manager")
         dataset_action.triggered.connect(lambda: self._with_current_page(lambda page: page.open_datasets()))
+        snapshot_action = project_menu.addAction("Saved Results")
+        snapshot_action.triggered.connect(lambda: self._with_current_page(lambda page: page.open_snapshots()))
         project_menu.addSeparator()
         refresh_action = project_menu.addAction("Refresh project dashboard")
         refresh_action.setShortcut(QKeySequence.StandardKey.Refresh)
@@ -1614,6 +1755,7 @@ class ProjectManagerWindow(QMainWindow):
         if not self._prepare_page_close(page):
             return False
         self.tabs.removeTab(index)
+        self.project_closed.emit(page.record.context.project_id)
         page.deleteLater()
         self._update_actions()
         if self.tabs.count() == 0 and not self._closing:
@@ -1744,10 +1886,25 @@ class ProjectManagerWindow(QMainWindow):
                 return False
         assert target is not None
         try:
-            page.record.adapter.save_file(target)
+            self.save_project_to_path(page, target)
         except Exception as error:  # noqa: BLE001 - filesystem boundary
             QMessageBox.critical(self, "Could not save project", str(error))
             return False
+        return True
+
+    def save_project_to_path(
+        self, page: ProjectPage, target: str | Path, *, overwrite: bool = True
+    ) -> None:
+        """Save an explicit project without dialogs, sharing the UI save baseline.
+
+        Errors propagate to the calling UI or automation boundary. Private editor
+        drafts retain their existing Save/Cancel ownership in the corresponding app.
+        """
+        target = Path(target).expanduser().resolve()
+        existing = self._page_for_path(target)
+        if existing is not None and existing is not page:
+            raise ValueError("That file is already open in another project tab.")
+        page.record.adapter.save_file(target, overwrite=overwrite)
         page.record.context.mark_saved(target)
         window = page.record.model_window
         if window is not None:
@@ -1761,7 +1918,6 @@ class ProjectManagerWindow(QMainWindow):
         self._record_recent_file(target)
         page.refresh(force=True)
         self.statusBar().showMessage(f"Saved {target.name}.", 3000)
-        return True
 
     # --- recent projects ---------------------------------------------
     @staticmethod
@@ -1837,6 +1993,7 @@ class ProjectManagerWindow(QMainWindow):
         self.save_action.setEnabled(enabled)
         self.model_action.setEnabled(enabled)
         self.maps_action.setEnabled(enabled)
+        self.exposure_analysis_action.setEnabled(enabled)
 
     def open_help_topics(self) -> None:
         # Help is suite-level and does not require a project or Model Editor.
@@ -1851,8 +2008,8 @@ class ProjectManagerWindow(QMainWindow):
             "About Field Workbench",
             f"<h2>{APP_NAME}</h2>"
             f"<p>Version {__version__}</p>"
-            "<p>Project Manager owns project lifetime and save state. Model Editor, Maps / Analysis, Exposure Editor, "
-            "Waveform Editor, Dataset Manager, and Saved Results operate directly on the shared project context.</p>"
+            "<p>Project Manager owns project lifetime and save state. Model Editor, Map Creator, Exposure Analysis, "
+            "Exposure Editor, Waveform Editor, Dataset Manager, and Saved Results operate directly on the shared project context.</p>"
             "<p>Free software licensed under GNU GPL version 3 or later (GPL-3.0-or-later).</p>",
         )
 
@@ -1869,5 +2026,6 @@ class ProjectManagerWindow(QMainWindow):
                 event.ignore()
                 return
             self.tabs.removeTab(index)
+            self.project_closed.emit(page.record.context.project_id)
             page.deleteLater()
         event.accept()

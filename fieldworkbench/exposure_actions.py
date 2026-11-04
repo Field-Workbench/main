@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import time
 import threading
 from datetime import datetime, timezone
@@ -13,7 +14,12 @@ from PySide6.QtWidgets import (
     QProgressBar, QScrollArea, QSpinBox, QSplitter, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QPlainTextEdit, QTreeWidget, QTreeWidgetItem, QWidget,
 )
-from .brain_analysis import BrainRegionNode, lpba40_region_hierarchy
+from .exposure_analysis_header import ExposureAnalysisHeaderPanel
+from .analysis_region_viewer import AnalysisRegionViewer
+from .brain_analysis import lpba40_region_hierarchy
+from .spatial_analysis import (
+    AnalysisRegionNode, RegionalAnalysisError, analysis_region_hierarchy_from_payload,
+)
 from .exposure_panel import ExposureRegionPanel, ExposureResultTab, REGION_KEY_ROLE
 from .region_analysis import (
     FFT_WINDOWS, FREQUENCY_WEIGHTING_PROFILES, MeasurementRegions,
@@ -780,9 +786,52 @@ def _set_analysis_failed(label, bar):
 def _make_analysis_region_tree(owner):
     tree = QTreeWidget(owner)
     tree.setHeaderLabels(["Region"])
-    tree.setMinimumWidth(150)
+    tree.setMinimumWidth(185)
     tree.setUniformRowHeights(True)
     items = {}
+    nodes = {}
+
+    def metadata_lines(node):
+        metadata = node.metadata if isinstance(getattr(node, "metadata", None), dict) else {}
+        lines = []
+        kind = str(getattr(node, "region_kind", "") or "")
+        if kind == "near_surface_volume":
+            lines.append("Near-surface volume")
+        elif kind == "near_surface_volume_set":
+            lines.append("Near-surface region set")
+        try:
+            depth = float(metadata.get("sampling_depth_mm"))
+        except (TypeError, ValueError):
+            depth = float("nan")
+        if math.isfinite(depth) and depth > 0.0:
+            lines.append(f"Sampling depth: {depth:,.6g} mm inward")
+        try:
+            volume = float(metadata.get("volume_cm3"))
+        except (TypeError, ValueError):
+            volume = float("nan")
+        if math.isfinite(volume) and volume > 0.0:
+            lines.append(f"Sampled volume: {volume:,.6g} cm³")
+        try:
+            area = float(metadata.get("surface_area_cm2"))
+        except (TypeError, ValueError):
+            area = float("nan")
+        if math.isfinite(area) and area > 0.0:
+            lines.append(f"Surface area: {area:,.6g} cm²")
+        source_count = metadata.get("source_voxel_count")
+        retained_count = metadata.get("retained_sample_count")
+        try:
+            source_count = int(source_count)
+        except (TypeError, ValueError):
+            source_count = 0
+        try:
+            retained_count = int(retained_count)
+        except (TypeError, ValueError):
+            retained_count = 0
+        if source_count > 0:
+            lines.append(f"Source voxels: {source_count:,}")
+        if retained_count > 0:
+            lines.append(f"Retained field samples: {retained_count:,}")
+        return lines
 
     def add_node(node, parent):
         children = [add_node(child, None) for child in node.children]
@@ -790,9 +839,13 @@ def _make_analysis_region_tree(owner):
         if node.key not in owner.payload["regions"] and not children:
             return None
         item = QTreeWidgetItem([node.name])
+        details = metadata_lines(node)
+        if details:
+            item.setToolTip(0, node.name + "\n" + "\n".join(details))
         if node.key in owner.payload["regions"]:
             item.setData(0, Qt.ItemDataRole.UserRole, node.key)
             items[node.key] = item
+            nodes[node.key] = node
         else:
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
         for child in children:
@@ -801,10 +854,16 @@ def _make_analysis_region_tree(owner):
             parent.addChild(item)
         return item
 
-    from .brain_analysis import BrainAnalysisError
+    context = owner.payload.get("exposure_analysis_context") if isinstance(owner.payload, dict) else None
+    context = context if isinstance(context, dict) else {}
+    hierarchy_payload = context.get("region_hierarchy")
     try:
-        root = add_node(lpba40_region_hierarchy(), None)
-    except (BrainAnalysisError, OSError, ValueError):
+        if isinstance(hierarchy_payload, dict):
+            hierarchy = analysis_region_hierarchy_from_payload(hierarchy_payload)
+        else:
+            hierarchy = lpba40_region_hierarchy()
+        root = add_node(hierarchy, None)
+    except (RegionalAnalysisError, OSError, ValueError):
         root = None
     if root is not None:
         tree.addTopLevelItem(root)
@@ -816,6 +875,7 @@ def _make_analysis_region_tree(owner):
             tree.addTopLevelItem(item)
             items[key] = item
     tree._region_items = items
+    tree._region_nodes = nodes
     tree.currentItemChanged.connect(owner._tree_region_changed)
     return tree
 
@@ -1535,7 +1595,7 @@ class ThresholdDurationPage(_CancellableAnalysisPage):
 
 
 class ExposureSummaryPage(_CancellableAnalysisPage):
-    """All-region exposure summary using the shared Brain/Measurement metric panel."""
+    """All-region exposure summary using the shared regional metric panel."""
 
     def __init__(
         self, payload, selected_key=None, parent=None, analysis_cache=None
@@ -1547,7 +1607,11 @@ class ExposureSummaryPage(_CancellableAnalysisPage):
         self._analysis_request_key = None
         context = payload.get("exposure_analysis_context") if isinstance(payload, dict) else None
         context = context if isinstance(context, dict) else {}
-        self._brain_target = str(context.get("atlas") or "").strip().upper() == "LPBA40"
+        self._target_kind = str(context.get("target_kind") or "regional")
+        self._brain_target = self._target_kind == "brain_lpba40" or (
+            str(context.get("atlas") or "").strip().upper() == "LPBA40"
+        )
+        self._surface_target = self._target_kind == "surface_region_volume"
 
         # Keep the common hidden selector API so selection in this all-region
         # table stays synchronized with the region-specific analysis pages.
@@ -1560,8 +1624,13 @@ class ExposureSummaryPage(_CancellableAnalysisPage):
         self.region.hide()
 
         hierarchy = self._summary_hierarchy()
+        region_mode = (
+            "brain" if self._brain_target
+            else "surface" if self._surface_target
+            else "measurement"
+        )
         self.region_panel = ExposureRegionPanel(
-            hierarchy, self, measurement=not self._brain_target
+            hierarchy, self, region_mode=region_mode
         )
         self.region_panel.configure_exposure_summary()
         self.table = self.region_panel.table
@@ -1578,12 +1647,23 @@ class ExposureSummaryPage(_CancellableAnalysisPage):
         self.refresh()
 
     def _summary_hierarchy(self):
+        context = (
+            self.payload.get("exposure_analysis_context")
+            if isinstance(self.payload, dict) else None
+        )
+        context = context if isinstance(context, dict) else {}
+        hierarchy_payload = context.get("region_hierarchy")
+        if isinstance(hierarchy_payload, dict):
+            try:
+                return analysis_region_hierarchy_from_payload(hierarchy_payload)
+            except (RegionalAnalysisError, TypeError, ValueError):
+                pass
         if self._brain_target:
             return lpba40_region_hierarchy()
         children = []
         for index, (key, entry) in enumerate(self.payload.get("regions", {}).items(), start=1):
             children.append(
-                BrainRegionNode(str(key), str(entry.get("name") or key), (index,), ())
+                AnalysisRegionNode(str(key), str(entry.get("name") or key), (index,), ())
             )
         return MeasurementRegions(tuple(children))
 
@@ -2502,10 +2582,24 @@ class ExposureAnalysisTargetView(QWidget):
         "threshold": "Threshold & duration",
         "weighted": "Frequency-weighted screening",
     }
+    PAGE_EXPLANATIONS = {
+        "home": (
+            "Choose an analysis below to characterize this prepared exposure. "
+            "Calculations are automatically cached so each configuration only needs to run once."
+        ),
+        "summary": "Review the descriptive field statistics calculated for the prepared target.",
+        "spectrum": "Review the regional frequency content of the prepared exposure.",
+        "fft": "Inspect the configurable full FFT spectrum for the prepared exposure.",
+        "timing": "Review field-change timing, transitions, pulse widths and gaps.",
+        "threshold": "Measure how long prepared regions remain above a selected field threshold.",
+        "weighted": "Compare the prepared exposure with a selected frequency-dependent reference framework.",
+    }
 
     def __init__(
         self, payload, selected_key=None, parent=None, *, adapter=None,
         analysis_cache: dict | None = None, saved_record=None, on_cache_changed=None,
+        on_back_to_targets=None, on_region_viewer_requested=None,
+        on_region_selection_changed=None,
     ):
         super().__init__(parent)
         payload_copy = copy.deepcopy(payload) if isinstance(payload, dict) else payload
@@ -2523,6 +2617,10 @@ class ExposureAnalysisTargetView(QWidget):
         self.window_title = self.workspace_title + (f" — {exposure_name}" if exposure_name else "")
         self.project_adapter = adapter
         self._on_cache_changed = on_cache_changed
+        self._on_back_to_targets = on_back_to_targets
+        self._on_region_viewer_requested = on_region_viewer_requested
+        self._on_region_selection_changed = on_region_selection_changed
+        self._owned_region_viewer: AnalysisRegionViewer | None = None
         self._saved_analysis_id = (
             str(saved_record.get("id") or "") if isinstance(saved_record, dict) else ""
         )
@@ -2536,42 +2634,39 @@ class ExposureAnalysisTargetView(QWidget):
         self._pages_cleaned = False
         self._analysis_job_queue = []
         self._analysis_active_page = None
+        self._analysis_preview_request_serial = 0
         self.current_page_key = "home"
 
         root = QVBoxLayout(self)
 
-        nav = QHBoxLayout()
-        self.back_button = QPushButton("← Analysis home")
-        self.back_button.setMinimumWidth(self.back_button.sizeHint().width())
-        self.back_button.setToolTip("Return to the guided analysis overview.")
-        self.back_button.clicked.connect(self.show_home)
-        self.back_button.hide()
-        nav.addWidget(self.back_button)
-        self.page_heading = QLabel(self.page_titles["home"])
-        self.page_heading.setObjectName("dialogHeading")
-        nav.addWidget(self.page_heading)
-        nav.addStretch(1)
-        root.addLayout(nav)
+        self.analysis_page_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.analysis_page_splitter.setObjectName("exposureAnalysisPreparedVerticalSplitter")
+        self.analysis_page_splitter.setChildrenCollapsible(False)
 
         self.analysis_overview_panel = self._build_preparation_overview()
-        root.addWidget(self.analysis_overview_panel)
+        self.analysis_header = self.analysis_overview_panel
+        self.analysis_page_splitter.addWidget(self.analysis_overview_panel)
 
-        self.cache_save_note = QLabel("", self)
+        lower_panel = QWidget(self.analysis_page_splitter)
+        lower_layout = QVBoxLayout(lower_panel)
+        lower_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.cache_save_note = QLabel("", lower_panel)
         self.cache_save_note.setObjectName("hint")
         self.cache_save_note.setWordWrap(True)
         self.cache_save_note.hide()
-        root.addWidget(self.cache_save_note)
+        lower_layout.addWidget(self.cache_save_note)
 
-        self.selection_note = QLabel(self)
+        self.selection_note = QLabel(lower_panel)
         self.selection_note.setObjectName("hint")
         self.selection_note.setWordWrap(True)
-        root.addWidget(self.selection_note)
+        lower_layout.addWidget(self.selection_note)
 
-        self.stack = QStackedWidget(self)
+        self.stack = QStackedWidget(lower_panel)
         self.home_page = self._build_home_page(selected_key)
         self.stack.addWidget(self.home_page)
         self._pages["home"] = self.home_page
-        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.workspace_splitter = QSplitter(Qt.Orientation.Horizontal, lower_panel)
         self.workspace_splitter.addWidget(self.region_tree)
         self.workspace_splitter.addWidget(self.stack)
         self.workspace_splitter.setStretchFactor(0, 1)
@@ -2584,7 +2679,13 @@ class ExposureAnalysisTargetView(QWidget):
         # the full width of the workspace.
         self.region_tree.hide()
         self.selection_note.hide()
-        root.addWidget(self.workspace_splitter, 1)
+        lower_layout.addWidget(self.workspace_splitter, 1)
+
+        self.analysis_page_splitter.addWidget(lower_panel)
+        self.analysis_page_splitter.setStretchFactor(0, 1)
+        self.analysis_page_splitter.setStretchFactor(1, 2)
+        self.analysis_page_splitter.setSizes([235, 465])
+        root.addWidget(self.analysis_page_splitter, 1)
 
         self._analysis_footer_states = {}
         self._analysis_progress_rows = {}
@@ -2595,6 +2696,7 @@ class ExposureAnalysisTargetView(QWidget):
         self.analysis_footer_status.hide()
         root.addWidget(self.analysis_footer_status)
 
+        self._queue_analysis_target_preview()
         self._refresh_home_cache_status()
 
     @staticmethod
@@ -2618,28 +2720,51 @@ class ExposureAnalysisTargetView(QWidget):
     def _build_preparation_overview(self):
         context = self.payload.get("exposure_analysis_context") if isinstance(self.payload, dict) else None
         context = context if isinstance(context, dict) else {}
-        panel = QFrame(self)
-        panel.setFrameShape(QFrame.Shape.StyledPanel)
+        panel = ExposureAnalysisHeaderPanel(
+            self,
+            title=self.page_titles["home"],
+            explanation=(
+                "Choose an analysis below to characterize this prepared exposure. "
+                "Calculations are automatically cached so each configuration only needs to run once."
+            ),
+            show_targets_button=callable(self._on_back_to_targets),
+            show_home_button=False,
+            preview_object_name="exposureAnalysisPreparedTargetPreview",
+        )
         panel.setObjectName("exposureAnalysisPreparationOverview")
-        layout = QGridLayout(panel)
-        layout.setContentsMargins(12, 9, 12, 9)
-        layout.setHorizontalSpacing(24)
-        layout.setVerticalSpacing(5)
 
-        # The analysis identity is the most useful information on the home page:
-        # make the target and exposure immediately visible, then keep preparation
-        # details compact underneath.
+        self.targets_button = panel.targets_button
+        if callable(self._on_back_to_targets):
+            self.targets_button.clicked.connect(self._on_back_to_targets)
+        self.back_button = panel.home_button
+        self.back_button.clicked.connect(self.show_home)
+        self.page_heading = panel.heading_label
+
         target_name = str(context.get("target_name") or "Prepared target")
-        self.preparation_target_label = QLabel(f"Target: {target_name}", panel)
-        self.preparation_target_label.setObjectName("sectionHeading")
-        self.preparation_target_label.setWordWrap(True)
-        layout.addWidget(self.preparation_target_label, 0, 0, 1, 3)
-
         exposure_name = str(context.get("exposure_name") or "Exposure")
-        self.preparation_exposure_label = QLabel(f"Exposure: {exposure_name}", panel)
-        self.preparation_exposure_label.setObjectName("sectionHeading")
-        self.preparation_exposure_label.setWordWrap(True)
-        layout.addWidget(self.preparation_exposure_label, 1, 0, 1, 3)
+        panel.set_identity(target_name, exposure_name)
+        self.preparation_target_label = panel.target_label
+        self.preparation_exposure_label = panel.exposure_label
+
+        target_kind = str(context.get("target_kind") or "")
+        target_summary = []
+        if target_kind == "brain_lpba40":
+            target_summary.append("Type: Brain Areas")
+        elif target_kind == "surface_region_volume":
+            target_summary.append("Type: Surface-region exposure")
+        elif target_kind == "measurement_volume":
+            target_summary.append("Type: Measurement volume")
+        atlas = str(context.get("atlas") or "").strip()
+        if atlas:
+            target_summary.append(f"Atlas: {atlas}")
+        target_summary.append(f"Full exposure: {self._format_exposure_duration(self.payload)}")
+        panel.set_stats_text(" • ".join(target_summary))
+
+        prep_stats = QWidget(panel.info_panel)
+        prep_layout = QGridLayout(prep_stats)
+        prep_layout.setContentsMargins(0, 0, 0, 0)
+        prep_layout.setHorizontalSpacing(24)
+        prep_layout.setVerticalSpacing(4)
 
         saved_status = str(context.get("saved_analysis_status") or "").strip().lower()
         if saved_status == "current":
@@ -2648,32 +2773,39 @@ class ExposureAnalysisTargetView(QWidget):
             preparation_state = "Stale — historical result"
         else:
             preparation_state = "In memory"
-        self.preparation_state_label = QLabel(f"Preparation: {preparation_state}", panel)
+        self.preparation_state_label = QLabel(f"Preparation: {preparation_state}", prep_stats)
 
-        atlas = str(context.get("atlas") or "").strip()
-        self.preparation_atlas_label = QLabel(f"Atlas: {atlas}" if atlas else "", panel)
-        self.preparation_atlas_label.setVisible(bool(atlas))
-
+        self.preparation_atlas_label = QLabel(f"Atlas: {atlas}" if atlas else "", prep_stats)
+        self.preparation_atlas_label.hide()
         self.preparation_duration_label = QLabel(
-            f"Full exposure: {self._format_exposure_duration(self.payload)}", panel
+            f"Full exposure: {self._format_exposure_duration(self.payload)}", prep_stats
         )
+        self.preparation_duration_label.hide()
+        self.preparation_depth_label = None
+        if target_kind == "surface_region_volume":
+            try:
+                depth_mm = float(context.get("sampling_depth_mm"))
+            except (TypeError, ValueError):
+                depth_mm = float("nan")
+            if np.isfinite(depth_mm) and depth_mm > 0.0:
+                self.preparation_depth_label = QLabel(
+                    f"Surface depth: {depth_mm:,.6g} mm inward", prep_stats
+                )
+
         region_count = len(self.payload.get("regions", {})) if isinstance(self.payload, dict) else 0
-        self.preparation_regions_label = QLabel(f"Prepared regions: {region_count:,}", panel)
+        self.preparation_regions_label = QLabel(f"Prepared regions: {region_count:,}", prep_stats)
         try:
             sample_count = int(context.get("sample_count", 0) or 0)
         except (TypeError, ValueError):
             sample_count = 0
         sample_text = f"{sample_count:,}" if sample_count > 0 else "—"
-        self.preparation_samples_label = QLabel(f"Sample points: {sample_text}", panel)
+        self.preparation_samples_label = QLabel(f"Sample points: {sample_text}", prep_stats)
 
-        layout.addWidget(self.preparation_state_label, 2, 0)
-        if atlas:
-            layout.addWidget(self.preparation_atlas_label, 2, 1)
-            layout.addWidget(self.preparation_duration_label, 2, 2)
-        else:
-            layout.addWidget(self.preparation_duration_label, 2, 1)
-        layout.addWidget(self.preparation_regions_label, 3, 0)
-        layout.addWidget(self.preparation_samples_label, 3, 1)
+        prep_layout.addWidget(self.preparation_state_label, 0, 0)
+        prep_layout.addWidget(self.preparation_regions_label, 0, 1)
+        prep_layout.addWidget(self.preparation_samples_label, 0, 2)
+        if self.preparation_depth_label is not None:
+            prep_layout.addWidget(self.preparation_depth_label, 1, 0)
 
         try:
             preparation_time = float(context.get("preparation_processing_time_s", 0.0) or 0.0)
@@ -2681,15 +2813,163 @@ class ExposureAnalysisTargetView(QWidget):
             preparation_time = 0.0
         if np.isfinite(preparation_time) and preparation_time > 0.0:
             self.preparation_time_label = QLabel(
-                f"Preparation time: {_format_analysis_elapsed(preparation_time)}", panel
+                f"Preparation time: {_format_analysis_elapsed(preparation_time)}", prep_stats
             )
             self.preparation_time_label.setObjectName("hint")
-            layout.addWidget(self.preparation_time_label, 3, 2)
+            prep_layout.addWidget(self.preparation_time_label, 1, 1)
         else:
             self.preparation_time_label = None
-        for column in range(3):
-            layout.setColumnStretch(column, 1)
+        panel.extra_layout.addWidget(prep_stats)
+
+        self.analysis_target_preview = panel.preview
+        self.analysis_target_preview.region_viewer_requested.connect(self._request_region_viewer)
+        panel.region_viewer_button.clicked.connect(
+            lambda: self._request_region_viewer(self._analysis_target_id())
+        )
+
+        if saved_status and saved_status != "current":
+            panel.set_preview_note(
+                "Live model geometry. This saved preparation is stale, so the display may "
+                "differ from the geometry used for its numerical results."
+            )
+        self.analysis_target_preview_note = panel.preview_note
         return panel
+
+    def set_visual_active(
+        self,
+        active: bool,
+        *,
+        inactive_detail: str | None = None,
+    ) -> None:
+        """Keep only the currently visible embedded target preview active."""
+        panel = getattr(self, "analysis_overview_panel", None)
+        if panel is not None:
+            panel.set_preview_rendering_active(
+                bool(active),
+                inactive_detail=inactive_detail,
+            )
+
+    def _queue_analysis_target_preview(self):
+        """Resolve the prepared target's display scene after the header can paint."""
+        self._analysis_preview_request_serial += 1
+        serial = self._analysis_preview_request_serial
+        preview = getattr(self, "analysis_target_preview", None)
+        if preview is None:
+            return
+        context = self.payload.get("exposure_analysis_context") if isinstance(self.payload, dict) else None
+        context = context if isinstance(context, dict) else {}
+        target_id = str(context.get("target_id") or "").strip()
+        target_name = str(context.get("target_name") or "Prepared target").strip()
+        if self.project_adapter is None or not target_id:
+            self.analysis_overview_panel.region_viewer_button.setEnabled(False)
+            preview.show_empty(
+                "3D target preview unavailable",
+                "The saved preparation does not have a live model target available in this workspace.",
+            )
+            return
+        preview.show_loading(f"Loading {target_name}…")
+        QTimer.singleShot(0, lambda: self._resolve_analysis_target_preview(target_id, serial))
+
+    def _resolve_analysis_target_preview(self, target_id, serial):
+        if serial != self._analysis_preview_request_serial:
+            return
+        preview = getattr(self, "analysis_target_preview", None)
+        if preview is None:
+            return
+        try:
+            scene = self.project_adapter.analysis_region_scene(str(target_id))
+            object_figure = self.project_adapter.analysis_target_preview_figure(str(target_id))
+        except Exception as error:  # noqa: BLE001 - visualization must not block saved analysis
+            if serial == self._analysis_preview_request_serial:
+                self.analysis_overview_panel.region_viewer_button.setEnabled(False)
+                preview.show_empty("3D target preview unavailable", str(error))
+            return
+        if serial == self._analysis_preview_request_serial:
+            preview.set_scene(scene, object_figure=object_figure)
+            self.analysis_overview_panel.region_viewer_button.setEnabled(True)
+            self._sync_analysis_region_visuals()
+
+    def _analysis_target_id(self):
+        context = self.payload.get("exposure_analysis_context") if isinstance(self.payload, dict) else None
+        context = context if isinstance(context, dict) else {}
+        return str(context.get("target_id") or "").strip()
+
+    def _visual_region_key(self):
+        """Return the region that auxiliary 3D views should emphasize.
+
+        Exposure Analysis home deliberately shows the whole object. Method pages
+        follow the shared regional result selection. This is display state only.
+        """
+        if self.current_page_key == "home":
+            return None
+        key = self._selected_key()
+        return str(key) if key else None
+
+    def _sync_analysis_region_visuals(self):
+        """One-way sync: analysis selection -> compact preview / Region Viewer."""
+        target_id = self._analysis_target_id()
+        selected_key = self._visual_region_key()
+        preview = getattr(self, "analysis_target_preview", None)
+        if preview is not None and preview.scene is not None and preview.scene.target_id == target_id:
+            try:
+                preview.set_selected_region(selected_key)
+            except Exception:
+                pass
+        viewer = self._owned_region_viewer
+        if viewer is not None and viewer.target_id == target_id:
+            viewer.set_selected_region(selected_key)
+        if callable(self._on_region_selection_changed):
+            self._on_region_selection_changed(target_id, selected_key)
+
+    def _region_viewer_context_note(self):
+        context = self.payload.get("exposure_analysis_context") if isinstance(self.payload, dict) else None
+        context = context if isinstance(context, dict) else {}
+        status = str(context.get("saved_analysis_status") or "").strip().lower()
+        if status == "current":
+            return "Live model geometry for this current saved preparation."
+        if status:
+            return (
+                "Live model geometry. This saved preparation is stale, so this display may "
+                "differ from the geometry used for its frozen numerical results."
+            )
+        return "Live model geometry; prepared numerical samples are frozen separately."
+
+    def _request_region_viewer(self, target_id):
+        """Forward to the owner or open one live standalone Region Viewer."""
+        target_id = str(target_id or "").strip()
+        if not target_id:
+            return
+        selected_key = self._visual_region_key()
+        context_note = self._region_viewer_context_note()
+        if callable(self._on_region_viewer_requested):
+            self._on_region_viewer_requested(target_id, selected_key, context_note)
+            return
+        if self.project_adapter is None:
+            return
+        try:
+            # Resolve explicitly on open so deleted/edited model targets cannot
+            # be masked by a compact preview scene captured earlier.
+            scene = self.project_adapter.analysis_region_scene(target_id)
+        except Exception as error:  # noqa: BLE001 - auxiliary visualization boundary
+            if self._owned_region_viewer is not None and self._owned_region_viewer.target_id == target_id:
+                self._owned_region_viewer.show_unavailable("Prepared target", str(error))
+            QMessageBox.warning(self, "Region viewer", str(error))
+            return
+        if self._owned_region_viewer is None:
+            self._owned_region_viewer = AnalysisRegionViewer()
+            self._owned_region_viewer.viewer_hidden.connect(
+                lambda: self.set_visual_active(True)
+            )
+        self.set_visual_active(
+            False,
+            inactive_detail="Preview is disabled while the Region Viewer is active.",
+        )
+        if context_note:
+            self._owned_region_viewer.present(
+                scene, selected_region_key=selected_key, context_note=context_note
+            )
+        else:
+            self._owned_region_viewer.present(scene, selected_region_key=selected_key)
 
     def _build_home_page(self, selected_key):
         page = QWidget(self.stack)
@@ -2856,7 +3136,38 @@ class ExposureAnalysisTargetView(QWidget):
             parent = parent.parent()
         self.region_tree.scrollToItem(item)
         self.region_tree.blockSignals(False)
-        self.selection_note.setText("Results for: " + " / ".join(reversed(names)))
+        selection_text = "Results for: " + " / ".join(reversed(names))
+        node = getattr(self.region_tree, "_region_nodes", {}).get(str(self._selected_key()))
+        metadata = node.metadata if node is not None and isinstance(node.metadata, dict) else {}
+        if str(getattr(node, "region_kind", "") or "") == "near_surface_volume":
+            details = []
+            try:
+                details.append(f"{float(metadata.get('sampling_depth_mm')):,.6g} mm inward")
+            except (TypeError, ValueError):
+                pass
+            try:
+                details.append(f"{float(metadata.get('volume_cm3')):,.6g} cm³ sampled volume")
+            except (TypeError, ValueError):
+                pass
+            try:
+                details.append(f"{float(metadata.get('surface_area_cm2')):,.6g} cm² surface")
+            except (TypeError, ValueError):
+                pass
+            try:
+                retained = int(metadata.get("retained_sample_count", 0) or 0)
+            except (TypeError, ValueError):
+                retained = 0
+            try:
+                source = int(metadata.get("source_voxel_count", 0) or 0)
+            except (TypeError, ValueError):
+                source = 0
+            if retained:
+                details.append(f"{retained:,} retained samples")
+            if source:
+                details.append(f"{source:,} source voxels")
+            if details:
+                selection_text += " • " + " • ".join(details)
+        self.selection_note.setText(selection_text)
 
     def _selected_key(self):
         return self.region.currentData()
@@ -2934,6 +3245,8 @@ class ExposureAnalysisTargetView(QWidget):
         )
         if hasattr(self, "region_tree"):
             self.region_tree.setEnabled(not busy)
+        if hasattr(self, "targets_button"):
+            self.targets_button.setEnabled(not busy)
         for page in self._pages.values():
             tree = getattr(page, "result_region_tree", None)
             if isinstance(tree, QTreeWidget):
@@ -2957,6 +3270,7 @@ class ExposureAnalysisTargetView(QWidget):
             if index >= 0 and index != combo.currentIndex():
                 combo.setCurrentIndex(index)
         self._refresh_home_cache_status()
+        self._sync_analysis_region_visuals()
 
     def _page_region_changed(self, page):
         """Carry a region changed within an analysis page back to the target view and sibling pages."""
@@ -2967,6 +3281,8 @@ class ExposureAnalysisTargetView(QWidget):
         index = self.region.findData(key)
         if index >= 0 and index != self.region.currentIndex():
             self.region.setCurrentIndex(index)
+        else:
+            self._sync_analysis_region_visuals()
 
     def _schedule_analysis_job(self, page, function):
         """Run at most one derived Exposure Analysis calculation at a time."""
@@ -3216,25 +3532,39 @@ class ExposureAnalysisTargetView(QWidget):
             if callable(refresh):
                 refresh()
         self.current_page_key = page_key
-        self.page_heading.setText(self.page_titles[page_key])
         on_home = page_key == "home"
-        self.back_button.setVisible(not on_home)
+        self.analysis_overview_panel.set_page(
+            self.page_titles[page_key],
+            self.PAGE_EXPLANATIONS.get(page_key, "Review this prepared exposure analysis."),
+        )
+        self.analysis_overview_panel.set_navigation(
+            targets=callable(self._on_back_to_targets),
+            home=not on_home,
+        )
         self.stack.setCurrentWidget(page)
         owns_region_browser = bool(getattr(page, "_owns_region_browser", False))
         self.region_tree.setVisible(
             self._show_region_browser and not on_home and not owns_region_browser
         )
         self.selection_note.setVisible(not on_home and not owns_region_browser)
+        self._sync_analysis_region_visuals()
         return page
 
     def show_home(self, *_args):
         self._refresh_home_cache_status()
         self.current_page_key = "home"
-        self.page_heading.setText(self.page_titles["home"])
-        self.back_button.hide()
+        self.analysis_overview_panel.set_page(
+            self.page_titles["home"],
+            self.PAGE_EXPLANATIONS["home"],
+        )
+        self.analysis_overview_panel.set_navigation(
+            targets=callable(self._on_back_to_targets),
+            home=False,
+        )
         self.region_tree.hide()
         self.selection_note.hide()
         self.stack.setCurrentWidget(self.home_page)
+        self._sync_analysis_region_visuals()
 
     def _cancel_running_analyses(self):
         for page in self._pages.values():
@@ -3279,6 +3609,15 @@ class ExposureAnalysisTargetView(QWidget):
 
     def cleanup(self):
         self.cancel_running_analyses()
+        self._analysis_preview_request_serial += 1
+        preview = getattr(self, "analysis_target_preview", None)
+        if preview is not None:
+            preview.cleanup()
+        viewer = self._owned_region_viewer
+        self._owned_region_viewer = None
+        if viewer is not None:
+            viewer.cleanup()
+            viewer.close()
         self._cleanup_pages()
 
 
@@ -3330,17 +3669,18 @@ class ExposureAnalysisWindow(QDialog):
 
 class ExposureActionsMixin:
     def _wrap_render_result_view(self, viewer, job, isolated_result):
-        if str(getattr(self, "workspace_mode", "") or "").strip().lower() == "playback":
-            # Measurement volumes are a Static snapshot workflow. Scripted
-            # 2D/3D playback stays viewer-only; cumulative exposure analysis is
-            # being moved out of playback into the Exposure workflow.
-            return viewer
         payload = isolated_result.get("payload", {})
         data = payload.get("measurement_regions")
         if not isinstance(data, dict):
             return viewer
         hierarchy = MeasurementRegions(tuple(
-            BrainRegionNode(obj["key"], obj["name"], (obj["label_id"],), ())
+            AnalysisRegionNode(
+                obj["key"], obj["name"], (obj["label_id"],),
+                tuple(
+                    AnalysisRegionNode(child["key"], child["name"], (child["label_id"],))
+                    for child in obj.get("children", [])
+                ),
+            )
             for obj in data["objects"]
         ))
         panel = ExposureRegionPanel(hierarchy, measurement=True)
@@ -3348,7 +3688,7 @@ class ExposureActionsMixin:
         if isinstance(data.get("metrics"), dict):
             panel.set_frame_metric_data(data["metrics"])
         else:
-            panel.mode_controls.show()
+            panel.mode_controls.setVisible(bool(data["objects"]))
         viewer.frameChanged.connect(panel.request_frame)
         panel.region_selected.connect(viewer.set_brain_region_highlight)
         return ExposureResultTab(viewer, panel)

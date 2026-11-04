@@ -110,6 +110,12 @@ from .optimizer import (
     normalize_optimizer_worker_count,
     reported_logical_cpu_count,
 )
+from .optimizer_capabilities import optimizer_freedom_coverage
+from .optimizer_effort_policy import optimizer_effort_physical_scope
+from .optimizer_model_policy import optimizer_resolve_model_policy
+from .optimizer_search_plan import (
+    optimizer_search_stage_plan, optimizer_stage_budget, optimizer_stage_budget_component,
+)
 from .camera_timeline import (
     default_2d_camera,
     normalize_camera_timeline,
@@ -6856,10 +6862,10 @@ class OptimizerDialog(QDialog):
         effort_layout.addWidget(self.search_effort_label)
         convergence_form.addRow("Search effort", effort_widget)
         convergence_note = QLabel(
-            "All effort levels keep broad exploration in the physics-informed simplified map. Higher effort spends "
-            "more work on cheap relation/alignment/symmetry/Sobol coverage. Expensive segmented windings can receive a "
-            "reduced-target physical promotion screen before only the strongest survivors reach the authoritative coil model; "
-            "it does not buy a larger exploratory full-model search. Pause and Cancel remain available."
+            "The coil field model selected in Preferences remains the final authority. Centreline reconnaissance is used as "
+            "a search accelerator where useful, but higher effort now changes what must be explored with capable physical "
+            "physics: Balanced closes any Centreline capability gaps, while Full reopens every selected structural freedom. "
+            "Pause and Cancel remain available."
         )
         convergence_note.setWordWrap(True)
         convergence_note.setObjectName("hint")
@@ -6871,12 +6877,24 @@ class OptimizerDialog(QDialog):
         self._limits_toggled()
 
     def _search_effort_changed(self, value: int) -> None:
+        model_key = str(getattr(self, "coil_modeling_method", "auto") or "auto")
+        model_label = COIL_MODELING_LABELS.get(model_key, model_key.replace("_", " ").title())
         descriptions = {
-            0: "Fast — compact cheap map, optional reduced-target physical promotion, then the smallest progressive authoritative vet.",
-            1: "Balanced — broader cheap map, physical promotion where useful, then a moderate progressive finalist vet.",
-            2: "Full — densest cheap map and skeptic coverage, then the broadest promotion/final vet; expensive physics still stays at the end.",
+            0: (
+                "Fast — rapid Centreline reconnaissance plus requested-model verification. "
+                "Physical-only freedoms may receive limited checks and are reported as limited rather than fully optimized."
+            ),
+            1: (
+                "Balanced — Centreline global reconnaissance, then capable-physics refinement of every freedom Centreline "
+                "cannot fully represent, together with relevant coupled coordinates, before authoritative validation."
+            ),
+            2: (
+                "Full — Centreline is only a basin finder. Every selected structural freedom is reopened across its bounds "
+                "under capable physical physics before authoritative validation; incomplete freedom coverage cannot be called converged."
+            ),
         }
-        self.search_effort_label.setText(descriptions.get(int(value), descriptions[1]))
+        detail = descriptions.get(int(value), descriptions[1])
+        self.search_effort_label.setText(f"{detail}  Preferences authority: {model_label}.")
 
     def _build_review_page(self) -> None:
         scroll, layout = self._scroll_page(
@@ -8555,6 +8573,23 @@ class OptimizerDialog(QDialog):
             limit_lines.append("- Electrical hard limits are not enabled.")
         effort = ("Fast", "Balanced", "Full")[self.search_effort.value()]
         limit_lines.append(f"- Search effort: {effort}.")
+        model_key = str(self.coil_modeling_method or "auto")
+        model_label = COIL_MODELING_LABELS.get(model_key, model_key.replace("_", " ").title())
+        if effort == "Fast":
+            limit_lines.append(
+                f"- Fidelity route: Centreline reconnaissance → {model_label} authoritative verification; "
+                "physical-only freedoms may remain explicitly limited."
+            )
+        elif effort == "Balanced":
+            limit_lines.append(
+                f"- Fidelity route: Centreline reconnaissance → capable physical refinement where Centreline is incomplete "
+                f"→ {model_label} authoritative validation."
+            )
+        else:
+            limit_lines.append(
+                f"- Fidelity route: Centreline multi-basin reconnaissance → capable full-dimensional physical refinement "
+                f"→ {model_label} authoritative validation."
+            )
 
         has_current_variable = any(str(item.get("kind")) == "current" for item in variables)
         structural_variable_count = sum(str(item.get("kind")) != "current" for item in variables)
@@ -8899,33 +8934,105 @@ class OptimizerDialog(QDialog):
                 ),
             ]
         else:
-            # Every structural search now uses the same cheap-first policy. Physical-only
-            # winding width and amplitude-redundant turns may be omitted from the magnetic
-            # reconnaissance and reintroduced in the geometry/finalist reality checks.
-            scout_structural_count = sum(
-                1
-                for item in structural
-                if str(item.get("kind", "")) != "axial_winding_length"
-                and not (currents and str(item.get("kind", "")) == "turns")
+            # Build the same staged fidelity contract the worker will use.  Search
+            # Trace is user-facing evidence of the optimizer plan, so it must not
+            # keep describing the old Optimizer 2.2 map→final-vet architecture.
+            coverage = optimizer_freedom_coverage(
+                variables,
+                requested_model=str(self.coil_modeling_method),
+                scout_model="centreline",
             )
-            if scout_structural_count <= 1:
-                scout_budget = {"fast": 96, "balanced": 128, "full": 192}[effort]
-            elif scout_structural_count == 2:
-                scout_budget = {"fast": 320, "balanced": 640, "full": 1280}[effort]
-            elif effort == "fast":
-                scout_budget = min(896, max(704, 48 * max(4, scout_structural_count)))
-            elif effort == "balanced":
-                scout_budget = min(3072, max(2048, 160 * max(4, scout_structural_count)))
-            else:
-                scout_budget = min(12288, max(4096, 768 * max(4, scout_structural_count)))
+            coverage_by_id = {
+                str(item.get("id", "")): item
+                for item in coverage
+                if str(item.get("id", ""))
+            }
+            scout_structural_count = 0
+            for item in structural:
+                entry = coverage_by_id.get(str(item.get("id", "")), {})
+                visibility = str((entry.get("scout") or {}).get("visibility", "full"))
+                if visibility == "none":
+                    continue
+                # Match the live scout's existing turns/current shortcut closely
+                # enough for its pre-run budget display.  The worker records the
+                # final dynamic omission decision in the completed report.
+                if currents and str(item.get("kind", "")) == "turns":
+                    continue
+                scout_structural_count += 1
+
+            participant_ids = list(dict.fromkeys(
+                [str(value) for value in list(settings.get("coil_ids", []) or []) if str(value)]
+                + [
+                    str(object_id)
+                    for variable in variables
+                    for object_id in list(variable.get("coil_ids", []) or [])
+                    if str(object_id)
+                ]
+            ))
+            try:
+                support = self.preview_adapter._optimizer_model_source_support(participant_ids)
+                model_policy = optimizer_resolve_model_policy(
+                    requested_model=str(self.coil_modeling_method),
+                    search_effort=effort,
+                    variables=variables,
+                    structural_variables=structural,
+                    freedom_coverage=coverage,
+                    source_support=support,
+                    participant_coil_ids=participant_ids,
+                )
+            except Exception:
+                # The worker performs the authoritative preflight. Search Trace must
+                # remain display-safe even if a source is being edited concurrently.
+                model_policy = {
+                    "physical_search_model": None,
+                    "physical_search_reason": "pre-run capability preview unavailable",
+                    "authoritative_model": str(self.coil_modeling_method),
+                    "authoritative_mode": "dynamic_auto" if str(self.coil_modeling_method) == "auto" else "fixed_requested_model",
+                }
+
+            stage_plan = optimizer_search_stage_plan(
+                search_effort=effort,
+                finalist_count=requested_finalists,
+                requested_model=str(self.coil_modeling_method),
+                structural_variable_ids=[str(item.get("id", "")) for item in structural],
+                freedom_coverage=coverage,
+                scout_coordinate_count=scout_structural_count,
+                explicit_evaluation_budget=(exact_budget if settings.get("max_evaluations") is not None or settings.get("evaluation_budget") is not None else None),
+                model_policy=model_policy,
+            )
+            scout_budget = optimizer_stage_budget(stage_plan, "reconnaissance", 0)
+            scout_correctness = optimizer_stage_budget_component(
+                stage_plan, "reconnaissance", "correctness_reserve", 0
+            )
+            scout_discretionary = optimizer_stage_budget_component(
+                stage_plan, "reconnaissance", "discretionary_allowance", 0
+            )
+            physical_budget = optimizer_stage_budget(stage_plan, "physical_refinement", 0)
+            physical_correctness = optimizer_stage_budget_component(
+                stage_plan, "physical_refinement", "correctness_reserve", 0
+            )
+            physical_discretionary = optimizer_stage_budget_component(
+                stage_plan, "physical_refinement", "discretionary_allowance", 0
+            )
+            validation_cap = optimizer_stage_budget(stage_plan, "authoritative_validation", exact_budget)
+            physical_scope = optimizer_effort_physical_scope(
+                search_effort=effort,
+                structural_variables=structural,
+                freedom_coverage=coverage,
+            )
+            physical_active_ids = list(physical_scope.get("active_variable_ids", []) or [])
+            physical_model_key = model_policy.get("physical_search_model")
+            physical_model_label = (
+                COIL_MODELING_LABELS.get(str(physical_model_key), str(physical_model_key).replace("_", " ").title())
+                if physical_model_key
+                else "capable physical model"
+            )
+            authority_model_key = str(model_policy.get("authoritative_model", self.coil_modeling_method))
+            authority_model_label = COIL_MODELING_LABELS.get(
+                authority_model_key, authority_model_key.replace("_", " ").title()
+            )
 
             landmark_limit = {"fast": 6, "balanced": 10, "full": 24}[effort]
-            validation_cap = {
-                "fast": max(4, requested_finalists),
-                "balanced": max(8, requested_finalists + 2),
-                "full": max(12, requested_finalists + 4),
-            }[effort]
-            validation_cap = min(exact_budget, validation_cap)
 
             if scout_structural_count <= 1:
                 map_children = [
@@ -8944,45 +9051,103 @@ class OptimizerDialog(QDialog):
                         else "Target alignment / plane straightening",
                         scope="scout",
                     ),
-                    node("map.relations", "Known relations + boundary insurance", scope="scout"),
-                    node("map.polish", "Fast-funnel coordinate polish", scope="scout", total_text="if recognized pair"),
-                    node("map.symmetry", "Symmetry + collective-bound insurance", scope="scout"),
-                    node("map.sobol", "Global Sobol skeptic map", scope="scout"),
+                    node(
+                        "map.relations",
+                        "Mandatory bounds + directional closure",
+                        scope="scout",
+                        total_text=f"correctness reserve {scout_correctness}",
+                    ),
+                    node(
+                        "map.polish",
+                        "Coupled directional revisits + feasibility-boundary recovery",
+                        scope="scout",
+                        total_text="until stable / reserve exhausted",
+                    ),
+                    node(
+                        "map.symmetry",
+                        "Discretionary relation / symmetry insurance",
+                        scope="scout",
+                        total_text=f"shares discretionary allowance {scout_discretionary}",
+                    ),
+                    node(
+                        "map.sobol",
+                        "Discretionary global Sobol skeptic",
+                        scope="scout",
+                        total_text=f"discretionary allowance {scout_discretionary}",
+                    ),
                     node(
                         "map.fine", "Fine-cache landmark recheck", scope="scout",
                         total_text="if coarse ambiguous" if effort in {"fast", "balanced"} else None,
                     ),
-                    node("map.adaptive", "Adaptive Sobol basin subdivision", scope="scout"),
+                    node("map.adaptive", "Discretionary adaptive basin challenge", scope="scout"),
                     node("map.fallback", "Plain Centreline fallback map", scope="scout", total_text="only if cache/map fails"),
                 ]
 
             mapping = node(
                 "map",
                 (
-                    "Stage 2 — Cheap physics map + inner exposure registration"
+                    "Stage 2 — Centreline reconnaissance + inner exposure registration"
                     if exposure_registration
-                    else "Stage 2 — Cheap physics map — Centreline/vector cache"
+                    else "Stage 2 — Centreline design-space reconnaissance"
                 ),
-                # ``scout_budget`` is a safety ceiling, not an exact amount of work.
-                # Fast funnels commonly converge after only a small fraction of it, so
-                # present it as a cap while the stage is active and collapse to the
-                # observed count when the stage completes.
                 total=scout_budget,
                 total_is_cap=True,
                 scope="scout",
                 children=map_children,
             )
-            reality = node(
-                "reality",
-                "Stage 3 — Geometry reality + finalist promotion",
-                total_text=f"optional middle fidelity + ≤{exact_budget} full-model settings",
+            drc_stage = node(
+                "drc",
+                "Stage 3 — Geometry / DRC feasibility",
+                total_text=f"progressive map; nominal landmark target {landmark_limit}",
                 children=[
-                    node("reality.drc", "Geometry-only DRC feasibility map", total=landmark_limit),
-                    node("reality.promote", "Reduced-target physical promotion", total_text="if source cost warrants"),
-                    node("reality.validate", "Progressive authoritative full-model validation", total=validation_cap),
+                    node("drc.map", "Geometry-only DRC feasibility map", total=landmark_limit),
+                    node("drc.repair", "Boundary / rescue / coordinate repair", total_text="as needed"),
                 ],
             )
-            plan = [prepare, mapping, reality]
+
+            plan = [prepare, mapping, drc_stage]
+            next_stage_number = 4
+            if physical_budget > 0 and physical_active_ids:
+                physical_stage = node(
+                    "physical",
+                    f"Stage {next_stage_number} — Capable-physics refinement — {physical_model_label}",
+                    total=physical_budget,
+                    total_is_cap=True,
+                    children=[
+                        node(
+                            "physical.anchors",
+                            "Mandatory physical anchor + alternate basin insurance",
+                            scope="outer",
+                            total_text=f"correctness {physical_correctness}; discretionary {physical_discretionary}",
+                        ),
+                        node(
+                            "physical.local",
+                            "Bounded + coupled directional closure",
+                            scope="outer",
+                            total_text=f"protected correctness reserve {physical_correctness}",
+                        ),
+                        node(
+                            "physical.global",
+                            "Discretionary global skeptic",
+                            scope="outer",
+                            total_text=f"discretionary allowance {physical_discretionary}",
+                        ),
+                    ],
+                )
+                plan.append(physical_stage)
+                next_stage_number += 1
+
+            authority = node(
+                "authority",
+                f"Stage {next_stage_number} — Authoritative validation — {authority_model_label}",
+                total=validation_cap,
+                total_is_cap=True,
+                children=[
+                    node("authority.promote", "Reduced-target fixed-coordinate promotion", total_text="fallback / cost screen only"),
+                    node("authority.validate", "Progressive authoritative finalist validation", total=validation_cap),
+                ],
+            )
+            plan.append(authority)
 
         self._optimizer_trace_plan = plan
         self._optimizer_trace_nodes = {}
@@ -9007,21 +9172,22 @@ class OptimizerDialog(QDialog):
         # completed/total telemetry.  Skipped branches resolve their reserved
         # share when the optimizer moves past them.
         if "map" in self._optimizer_trace_nodes:
-            # Cheap stamp-native reconnaissance is now genuinely cheap, while the
-            # geometry/DRC and authoritative reality stage can dominate wall time by
-            # an order of magnitude.  Weight progress by expected computational work,
-            # not raw candidate count, so a one-minute map no longer reports ~88% just
-            # before several minutes of DRC boundary work.
+            has_physical = "physical" in self._optimizer_trace_nodes
+            # Weight by expected wall-clock cost rather than raw candidate count.
+            # Physical refinement has its own lane now; otherwise Fast would appear
+            # almost complete before requested-model verification begins.
             if effort == "fast":
-                stage_weights = {"prepare": 0.03, "map": 0.27, "reality": 0.70}
-            elif effort == "full":
-                stage_weights = {"prepare": 0.02, "map": 0.43, "reality": 0.55}
+                stage_weights = {"prepare": 0.03, "map": 0.30, "drc": 0.25, "authority": 0.42}
+            elif effort == "full" and has_physical:
+                stage_weights = {"prepare": 0.02, "map": 0.20, "drc": 0.15, "physical": 0.45, "authority": 0.18}
+            elif effort == "balanced" and has_physical:
+                stage_weights = {"prepare": 0.03, "map": 0.24, "drc": 0.18, "physical": 0.35, "authority": 0.20}
             else:
-                stage_weights = {"prepare": 0.03, "map": 0.35, "reality": 0.62}
+                stage_weights = {"prepare": 0.03, "map": 0.34, "drc": 0.23, "authority": 0.40}
         elif "current" in self._optimizer_trace_nodes:
             stage_weights = {"prepare": 0.10, "current": 0.90}
         else:
-            stage_weights = {"prepare": 0.10, "reality": 0.90}
+            stage_weights = {"prepare": 0.10, "authority": 0.90}
 
         child_weights = {
             "prepare.freeze": 0.35,
@@ -9030,15 +9196,20 @@ class OptimizerDialog(QDialog):
             "map.sweep": 0.95,
             "map.canonical": 0.02,
             "map.align": 0.01,
-            "map.relations": 0.08,
-            "map.symmetry": 0.18,
-            "map.sobol": 0.44,
-            "map.fine": 0.18,
-            "map.adaptive": 0.04,
+            "map.relations": 0.18,
+            "map.polish": 0.20,
+            "map.symmetry": 0.10,
+            "map.sobol": 0.28,
+            "map.fine": 0.08,
+            "map.adaptive": 0.06,
             "map.fallback": 0.03,
-            "reality.drc": 0.60,
-            "reality.promote": 0.15,
-            "reality.validate": 0.25,
+            "drc.map": 0.72,
+            "drc.repair": 0.28,
+            "physical.anchors": 0.16,
+            "physical.local": 0.58,
+            "physical.global": 0.26,
+            "authority.promote": 0.18,
+            "authority.validate": 0.82,
             "current.solve": 0.80,
             "current.verify": 0.20,
         }
@@ -9047,22 +9218,24 @@ class OptimizerDialog(QDialog):
                 "map.cache": 0.08,
                 "map.canonical": 0.04,
                 "map.align": 0.02,
-                "map.relations": 0.16,
-                "map.symmetry": 0.22,
-                "map.sobol": 0.34,
-                "map.fine": 0.05,
-                "map.adaptive": 0.09,
+                "map.relations": 0.24,
+                "map.polish": 0.26,
+                "map.symmetry": 0.10,
+                "map.sobol": 0.18,
+                "map.fine": 0.04,
+                "map.adaptive": 0.08,
             })
         elif effort == "balanced" and "map" in self._optimizer_trace_nodes:
             child_weights.update({
                 "map.cache": 0.07,
                 "map.canonical": 0.03,
                 "map.align": 0.01,
-                "map.relations": 0.10,
-                "map.symmetry": 0.18,
-                "map.sobol": 0.34,
-                "map.fine": 0.12,
-                "map.adaptive": 0.15,
+                "map.relations": 0.20,
+                "map.polish": 0.20,
+                "map.symmetry": 0.10,
+                "map.sobol": 0.23,
+                "map.fine": 0.10,
+                "map.adaptive": 0.10,
             })
         for node_id, weight in stage_weights.items():
             trace_node = self._optimizer_trace_nodes.get(node_id)
@@ -9087,6 +9260,8 @@ class OptimizerDialog(QDialog):
             if "fast funnel" in text:
                 if "target orientation" in text or "target placement" in text:
                     return "map.align"
+                if "directional closure" in text:
+                    return "map.polish" if "map.polish" in self._optimizer_trace_nodes else "map.relations"
                 if "known relationships" in text or "relation refinement" in text:
                     return "map.relations"
                 if "final coordinate polish" in text:
@@ -9108,14 +9283,28 @@ class OptimizerDialog(QDialog):
             return "map.cache"
         if "preparing centreline scout" in text:
             return "map.cache"
-        if "locating physical drc boundaries" in text or "drc-clear rescue anchor" in text:
-            return "reality.drc"
+        if "locating physical drc boundaries" in text:
+            return "drc.map" if "drc.map" in self._optimizer_trace_nodes else None
+        if "reality map" in text:
+            if "boundary" in text or "repair" in text or "rescue" in text:
+                return "drc.repair" if "drc.repair" in self._optimizer_trace_nodes else "drc.map"
+            return "drc.map" if "drc.map" in self._optimizer_trace_nodes else None
+        if "drc-clear rescue anchor" in text or "drc boundary" in text or "coordinate repair" in text:
+            return "drc.repair" if "drc.repair" in self._optimizer_trace_nodes else "drc.map"
+        if "physical refinement" in text or "physical directional refinement" in text:
+            if "anchor" in text or "bound insurance" in text:
+                return "physical.anchors" if "physical.anchors" in self._optimizer_trace_nodes else "physical.local"
+            if "global skeptic" in text:
+                return "physical.global" if "physical.global" in self._optimizer_trace_nodes else "physical.local"
+            if "directional" in text or "coupled" in text or "feasibility" in text or "local" in text or "adaptation" in text or "convergence" in text:
+                return "physical.local" if "physical.local" in self._optimizer_trace_nodes else "physical.global"
+            return "physical.local" if "physical.local" in self._optimizer_trace_nodes else None
         if "finalist promotion" in text or "reduced-target screen" in text:
-            return "reality.promote" if "reality.promote" in self._optimizer_trace_nodes else "reality.validate"
+            return "authority.promote" if "authority.promote" in self._optimizer_trace_nodes else "authority.validate"
         if "local full-model basin adaptation" in text:
-            return "reality.validate" if "reality.validate" in self._optimizer_trace_nodes else None
-        if "full-model validation" in text or "finalist vet" in text:
-            return "reality.validate"
+            return "authority.validate" if "authority.validate" in self._optimizer_trace_nodes else None
+        if "full-model validation" in text or "finalist vet" in text or "authoritative validation" in text:
+            return "authority.validate" if "authority.validate" in self._optimizer_trace_nodes else None
         if "preparing frozen scene and target samples" in text:
             return "prepare.freeze"
         if "checking source-scene starting point" in text:
@@ -9131,8 +9320,8 @@ class OptimizerDialog(QDialog):
         if "challenging frozen freedoms" in text or "perfect-coverage" in text or "global verification" in text:
             return "exact.challenge"
         if "verifying explicit search boundaries" in text or "conditionally re-polishing promising bounds" in text or "converging search boundaries" in text or ("refining" in text and "boundary" in text):
-            if "reality.validate" in self._optimizer_trace_nodes:
-                return "reality.validate"
+            if "authority.validate" in self._optimizer_trace_nodes:
+                return "authority.validate"
             return "exact.bounds" if "exact.bounds" in self._optimizer_trace_nodes else None
         if "normalizing frozen freedoms for finalists" in text or "canonical simplification" in text:
             return "exact.curate"
@@ -9252,6 +9441,18 @@ class OptimizerDialog(QDialog):
                 if scout_count:
                     mapping["absolute_count"] = scout_count
                     mapping["status"] = "complete"
+                physical_total = int(fidelity.get("physical_refinement_evaluations", 0) or 0)
+                physical_local = int(fidelity.get("physical_refinement_local_evaluations", 0) or 0)
+                physical_anchor = min(
+                    physical_total, int(fidelity.get("physical_refinement_seed_count", 0) or 0)
+                )
+                physical_global = max(0, physical_total - physical_local - physical_anchor)
+                drc_repair = (
+                    int(fidelity.get("drc_boundary_refinement_count", 0) or 0)
+                    + int(fidelity.get("drc_rescue_probe_count", 0) or 0)
+                    + int(fidelity.get("drc_coordinate_repair_probe_count", 0) or 0)
+                    + int(fidelity.get("post_drc_local_drc_tested_count", 0) or 0)
+                )
                 completed_counts = {
                     "map.canonical": int(fidelity.get("scout_map_canonical_evaluations", 0) or 0),
                     "map.align": (
@@ -9264,10 +9465,13 @@ class OptimizerDialog(QDialog):
                     "map.sobol": int(fidelity.get("scout_map_global_evaluations", 0) or 0),
                     "map.fine": int(fidelity.get("scout_map_fine_recheck_evaluations", 0) or 0),
                     "map.adaptive": int(fidelity.get("scout_map_adaptive_evaluations", 0) or 0),
-                    "reality.drc": int(fidelity.get("drc_probe_count", 0) or 0),
-                    "reality.promote": int(fidelity.get("intermediate_candidate_count", 0) or 0),
-                    "reality.validate": int(fidelity.get("physical_validation_evaluations", 0) or 0),
-                    "reality.adapt": int(fidelity.get("physical_refinement_evaluations", 0) or 0),
+                    "drc.map": int(fidelity.get("drc_probe_count", 0) or 0),
+                    "drc.repair": drc_repair,
+                    "physical.anchors": physical_anchor,
+                    "physical.global": physical_global,
+                    "physical.local": physical_local,
+                    "authority.promote": int(fidelity.get("intermediate_candidate_count", 0) or 0),
+                    "authority.validate": int(fidelity.get("physical_validation_evaluations", 0) or 0),
                 }
                 for node_id, completed_count in completed_counts.items():
                     trace_node = self._optimizer_trace_nodes.get(node_id)
@@ -9286,6 +9490,18 @@ class OptimizerDialog(QDialog):
                     if trace_node.get("total") is None or completed_count > int(trace_node.get("total") or 0):
                         trace_node["total"] = completed_count
                         trace_node["total_text"] = None
+                # Roll completed child evidence up to the new staged top-level
+                # nodes even if the live phase stream skipped a very short stage.
+                for parent_id in ("drc", "physical", "authority"):
+                    parent_node = self._optimizer_trace_nodes.get(parent_id)
+                    if parent_node is None:
+                        continue
+                    child_nodes = list(parent_node.get("children", []) or [])
+                    if any(child.get("status") == "complete" for child in child_nodes):
+                        parent_node["status"] = "complete"
+                        observed = sum(self._optimizer_trace_node_count(child) for child in child_nodes)
+                        if observed:
+                            parent_node["absolute_count"] = int(observed)
 
         for node in self._optimizer_trace_nodes.values():
             if node.get("status") == "pending":
@@ -12234,6 +12450,14 @@ from .exposure_actions import ExposureActionsMixin, result_view
 class _BackgroundFieldRenderMixin(ExposureActionsMixin):
     """Shared concurrent render-job controller for 2D and 3D map windows."""
 
+    def _add_live_measurement_analysis(self, layout) -> None:
+        self.live_measurement_analysis = QCheckBox("Live measurement analysis")
+        self.live_measurement_analysis.setVisible(self.workspace_mode == "playback")
+        self.live_measurement_analysis.setToolTip(
+            "Show per-frame B-field statistics for Measurement objects, including well-plate points"
+        )
+        layout.addWidget(self.live_measurement_analysis)
+
     def _create_fluxline_options_section(self) -> CollapsibleSection:
         """Build viewer-local fluxline cleanup controls.
 
@@ -12897,6 +13121,14 @@ class FieldMapDialog(_BackgroundFieldRenderMixin, _CameraTimelineMixin, _Playbac
         self.object_outlines.setToolTip(
             "Overlay cross-section outlines of visible solid scene objects where the selected map plane cuts them"
         )
+        self.sensor_placements = QCheckBox("Show sensor placements")
+        self.sensor_placements.setToolTip(
+            "Project visible sensor pixels, probe channels and defined measurement points onto the map plane"
+        )
+        self.well_outlines = QCheckBox("Show well rims")
+        self.well_outlines.setToolTip(
+            "Project the openings of selected built-in well plates onto the map plane"
+        )
         self._outline_selected_object_ids: set[str] = set()
         self._outline_known_object_ids: set[str] = set()
         self._outline_selection_initialized = False
@@ -12909,7 +13141,16 @@ class FieldMapDialog(_BackgroundFieldRenderMixin, _CameraTimelineMixin, _Playbac
             "cross-section outlines in this map. Clicking an object in the preview legend "
             "updates this checklist. A new map window starts from the scene's current visibility."
         )
-        self.object_outlines.toggled.connect(self.object_outline_objects_button.setEnabled)
+        self.object_outlines.toggled.connect(
+            lambda checked: self.object_outline_objects_button.setEnabled(
+                checked or self.well_outlines.isChecked()
+            )
+        )
+        self.well_outlines.toggled.connect(
+            lambda checked: self.object_outline_objects_button.setEnabled(
+                checked or self.object_outlines.isChecked()
+            )
+        )
         self._refresh_object_outline_menu()
         self._init_playback_coil_selector()
 
@@ -12970,8 +13211,11 @@ class FieldMapDialog(_BackgroundFieldRenderMixin, _CameraTimelineMixin, _Playbac
         scene_options_layout.setContentsMargins(0, 0, 0, 0)
         scene_options_layout.setSpacing(3)
         scene_options_layout.addWidget(self.show_grid)
+        self._add_live_measurement_analysis(scene_options_layout)
         scene_options_layout.addWidget(self.object_outlines)
         scene_options_layout.addWidget(self.object_outline_objects_button)
+        scene_options_layout.addWidget(self.sensor_placements)
+        scene_options_layout.addWidget(self.well_outlines)
         active_coils_label = QLabel("Active coils")
         active_coils_label.setStyleSheet("font-weight: 600; margin-top: 6px;")
         scene_options_layout.addWidget(active_coils_label)
@@ -13352,6 +13596,8 @@ class FieldMapDialog(_BackgroundFieldRenderMixin, _CameraTimelineMixin, _Playbac
             "contour_count": self.contour_count.value(),
             "contour_labels": self.contour_labels.isChecked(),
             "show_object_outlines": self.object_outlines.isChecked(),
+            "show_sensor_placements": self.sensor_placements.isChecked(),
+            "show_well_rims": self.well_outlines.isChecked(),
             "outline_object_ids": self.selected_object_outline_ids(),
         }
 
@@ -13438,6 +13684,7 @@ class FieldMapDialog(_BackgroundFieldRenderMixin, _CameraTimelineMixin, _Playbac
         """Snapshot the current 2D selector/display settings for waveform playback."""
         heatmap_visible = self.display_mode.currentData() in {"heatmap", "both"}
         return {
+            "live_measurement_analysis": self.live_measurement_analysis.isChecked(),
             "plane": self.plane.currentText(),
             "offset_mm": self.offset.value(),
             "span_mm": self.span.value(),
@@ -13450,6 +13697,8 @@ class FieldMapDialog(_BackgroundFieldRenderMixin, _CameraTimelineMixin, _Playbac
             "contour_count": self.contour_count.value(),
             "contour_labels": self.contour_labels.isChecked(),
             "show_object_outlines": self.object_outlines.isChecked(),
+            "show_sensor_placements": self.sensor_placements.isChecked(),
+            "show_well_rims": self.well_outlines.isChecked(),
             "outline_object_ids": self.selected_object_outline_ids(),
             "drive_coil_ids": self.selected_active_coil_ids(),
             "colour_minimum": (
@@ -13810,6 +14059,7 @@ class FieldVolumeMapDialog(_BackgroundFieldRenderMixin, _CameraTimelineMixin, _P
         scene_options_layout.setContentsMargins(0, 0, 0, 0)
         scene_options_layout.setSpacing(3)
         scene_options_layout.addWidget(self.show_grid)
+        self._add_live_measurement_analysis(scene_options_layout)
         scene_options_layout.addWidget(self.include_scene)
         scene_options_layout.addWidget(self.scene_objects_button)
         active_coils_label = QLabel("Active coils")
@@ -14532,6 +14782,7 @@ class FieldVolumeMapDialog(_BackgroundFieldRenderMixin, _CameraTimelineMixin, _P
         """Snapshot the current 3D selector/display settings for waveform playback."""
         field_visible = self.display_mode.currentData() in {"slices", "both"}
         return {
+            "live_measurement_analysis": self.live_measurement_analysis.isChecked(),
             "centre_mm": [spin.value() for spin in self.coordinates],
             "span_mm": self.span.value(),
             "slice_axis": self.slice_axis.currentData(),
@@ -17257,11 +17508,19 @@ class SnapshotManagerDialog(QDialog):
         root.addLayout(footer)
 
         self._last_catalog_signature: tuple | None = None
+        # Saved Results used to poll every two seconds.  Live Exposure Analysis
+        # freshness checks are intentionally expensive (they fingerprint the
+        # exposure/model/target dependency graph), so periodic GUI-thread polling
+        # caused measurable idle CPU use and rhythmic UI stalls.  Project-owned
+        # windows now notify this manager when relevant resources change; coalesce
+        # those events into one deferred refresh instead of polling.
+        self._deferred_refresh_timer = QTimer(self)
+        self._deferred_refresh_timer.setSingleShot(True)
+        self._deferred_refresh_timer.setInterval(150)
+        self._deferred_refresh_timer.timeout.connect(
+            lambda: self.refresh(preserve_selection=True)
+        )
         self.refresh()
-        self.refresh_timer = QTimer(self)
-        self.refresh_timer.setInterval(2000)
-        self.refresh_timer.timeout.connect(self.refresh_if_changed)
-        self.refresh_timer.start()
 
     def _build_saved_map_page(self, kind: str) -> tuple[QWidget, QTreeWidget]:
         page = QWidget()
@@ -17601,6 +17860,18 @@ class SnapshotManagerDialog(QDialog):
         tools = len(parts)
         return f"{tools:,} tool{'s' if tools != 1 else ''} • {total:,} config{'s' if total != 1 else ''}"
 
+    def notify_project_changed(self) -> None:
+        """Coalesce an event-driven project/resource change into one refresh.
+
+        Freshness evaluation can traverse waveform, coil, exposure and regional
+        geometry dependencies, so it must not run from a periodic idle timer.
+        Restarting this single-shot timer also keeps rapid editor operations from
+        repeatedly rebuilding the Saved Results trees on the GUI thread.
+        """
+        timer = getattr(self, "_deferred_refresh_timer", None)
+        if isinstance(timer, QTimer):
+            timer.start()
+
     def refresh_if_changed(self) -> bool:
         """Refresh without disturbing selection when any stored result changed."""
         snapshots = self.adapter.list_snapshots()
@@ -17626,6 +17897,9 @@ class SnapshotManagerDialog(QDialog):
         select_map_id: str | None = None,
         select_analysis_id: str | None = None,
     ) -> None:
+        timer = getattr(self, "_deferred_refresh_timer", None)
+        if isinstance(timer, QTimer) and timer.isActive():
+            timer.stop()
         snapshots = self.adapter.list_snapshots() if snapshots is None else snapshots
         maps = self.adapter.list_saved_maps() if maps is None else maps
         exposure_analyses = (
@@ -17882,7 +18156,12 @@ class SnapshotManagerDialog(QDialog):
             samples = max(0, int(record.get("sample_count", 0) or 0))
         except (TypeError, ValueError):
             samples = 0
-        sample_label = "LPBA40 samples" if record.get("target_kind", "brain_lpba40") == "brain_lpba40" else "sample points"
+        target_kind = str(record.get("target_kind") or "brain_lpba40")
+        sample_label = {
+            "brain_lpba40": "LPBA40 samples",
+            "surface_region_volume": "retained surface-region samples",
+            "measurement_volume": "sample points",
+        }.get(target_kind, "sample points")
         sample_text = f"{samples:,} {sample_label}" if samples else "sample count unavailable"
         physical_duration = self._format_analysis_duration(record.get("physical_duration_s"))
         storage = self._format_bytes(record.get("compressed_bytes"))
@@ -18402,7 +18681,9 @@ class SnapshotManagerDialog(QDialog):
             except RuntimeError:
                 pass
         self._result_windows.clear()
-        self.refresh_timer.stop()
+        timer = getattr(self, "_deferred_refresh_timer", None)
+        if isinstance(timer, QTimer):
+            timer.stop()
         super().closeEvent(event)
 
 

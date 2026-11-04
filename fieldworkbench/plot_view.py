@@ -157,6 +157,16 @@ class PlotView(QStackedWidget):
         "resetCameraDefault3d",
         "resetCameraLastSave3d",
     )
+    MODEBAR_PROFILES = {
+        # Existing Workbench behavior: normal Plotly controls minus the reset
+        # buttons above.  This remains the default for backwards compatibility.
+        "standard": (),
+        # Compact anatomy previews need only the two native 3-D rotation modes.
+        # The profile is defined here in Phase 1; callers opt into it in Phase 2.
+        "rotation": ("zoom3d", "pan3d", "hoverClosest3d", "toImage"),
+        # Explicit name for full 3-D viewers that want the normal native modebar.
+        "full_3d": (),
+    }
 
     load_finished = Signal(bool)
     selection_requested = Signal(str, bool)
@@ -175,12 +185,44 @@ class PlotView(QStackedWidget):
         synchronize_legend_visibility: bool = False,
         allow_fullscreen: bool = True,
         image_filename: str = "field-workbench-plot",
+        display_modebar: bool | None = None,
+        modebar_profile: str = "standard",
+        default_3d_dragmode: str | None = None,
+        native_image_save: bool = True,
+        enable_selection_events: bool = True,
+        publish_live_view: bool = True,
+        plot_gl_pixel_ratio: float | None = None,
     ):
         super().__init__(parent)
         self._workbench_theme = current_theme()
         self._include_3d_return_axes = bool(include_3d_return_axes)
         self._synchronize_legend_visibility = bool(synchronize_legend_visibility)
         self._allow_fullscreen = bool(allow_fullscreen)
+        self._display_modebar = None if display_modebar is None else bool(display_modebar)
+        normalized_modebar_profile = str(modebar_profile or "standard").strip().lower()
+        if normalized_modebar_profile not in self.MODEBAR_PROFILES:
+            raise ValueError(
+                f"Unknown PlotView modebar profile {modebar_profile!r}; "
+                f"expected one of {', '.join(sorted(self.MODEBAR_PROFILES))}."
+            )
+        self._modebar_profile = normalized_modebar_profile
+        normalized_dragmode = str(default_3d_dragmode or "").strip().lower() or None
+        if normalized_dragmode not in {None, "orbit", "turntable"}:
+            raise ValueError(
+                f"Unknown PlotView 3-D drag mode {default_3d_dragmode!r}; "
+                "expected 'orbit', 'turntable', or None."
+            )
+        self._default_3d_dragmode = normalized_dragmode
+        self._native_image_save = bool(native_image_save)
+        self._enable_selection_events = bool(enable_selection_events)
+        self._publish_live_view = bool(publish_live_view)
+        try:
+            pixel_ratio = None if plot_gl_pixel_ratio is None else float(plot_gl_pixel_ratio)
+        except (TypeError, ValueError):
+            pixel_ratio = None
+        self._plot_gl_pixel_ratio = (
+            pixel_ratio if pixel_ratio is not None and pixel_ratio > 0.0 else None
+        )
         self._image_filename = self._sanitized_image_filename(image_filename)
         self._pending_modebar_export_path: Path | None = None
         self._temporary_directory = Path(tempfile.mkdtemp(prefix="field-workbench-plot-"))
@@ -429,6 +471,10 @@ class PlotView(QStackedWidget):
                 axis.setdefault("linecolor", colours["reference"])
                 axis.setdefault("tickcolor", colours["reference"])
         return json.dumps(figure, separators=(",", ":"), ensure_ascii=False)
+
+    def save_png_with_dialog(self) -> None:
+        """Open the shared native PNG Save As workflow for the current plot."""
+        self._modebar_image_save_requested(self.width(), self.height())
 
     def _modebar_image_save_requested(self, width: int, height: int) -> None:
         """Open a native Save As dialog for Plotly's camera-modebar action."""
@@ -1080,10 +1126,28 @@ class PlotView(QStackedWidget):
       }};
     }};
 
+    window.fieldWorkbenchApply3dAxisPolicy = function(updates, layout) {{
+      const next = updates || {{}};
+      const meta = layout && layout.meta ? layout.meta : {{}};
+      if (meta.field_workbench_hide_3d_axes) {{
+        for (const axis of ['x', 'y', 'z']) {{
+          next['scene.' + axis + 'axis.visible'] = false;
+          next['scene.' + axis + 'axis.showgrid'] = false;
+          next['scene.' + axis + 'axis.showbackground'] = false;
+          next['scene.' + axis + 'axis.showspikes'] = false;
+          next['scene.' + axis + 'axis.showticklabels'] = false;
+          next['scene.' + axis + 'axis.zeroline'] = false;
+          next['scene.' + axis + 'axis.ticks'] = '';
+        }}
+      }}
+      return next;
+    }};
+
     window.fieldWorkbenchFitScene = function(plot, camera, hiddenAxis) {{
+      const fitted = window.fieldWorkbenchFittedView(plot.data || [], camera, hiddenAxis);
       return Plotly.relayout(
         plot,
-        window.fieldWorkbenchFittedView(plot.data || [], camera, hiddenAxis)
+        window.fieldWorkbenchApply3dAxisPolicy(fitted, plot && plot.layout)
       );
     }};
 
@@ -1316,6 +1380,49 @@ class PlotView(QStackedWidget):
         )
         self.setCurrentWidget(self.message)
 
+    def release_rendered_figure(
+        self,
+        heading: str = "3D preview paused",
+        detail: str = "The WebGL scene will be restored when this preview is active again.",
+    ) -> None:
+        """Release browser/WebGL resources without destroying this PlotView.
+
+        Exposure Analysis can keep several pages alive in a stacked workspace.
+        Hidden anatomy previews do not need to retain Plotly Mesh3d GPU buffers;
+        purging them prevents inactive pages from competing with the modeless
+        Region Viewer for Chromium/WebGL resources.
+        """
+        self._render_request_serial += 1
+        self._pending_render_request_id = self._render_request_serial
+        self._pending_figure_json = None
+        self._pending_figure_is_3d = False
+        self._pending_figure_coalesce = False
+        self._incremental_trace_state.clear()
+        self._incremental_layout_state.clear()
+        self._last_figure_json = None
+        self._last_figure_is_3d = False
+        self._home_on_next_figure = True
+        self._clean_rebuild_on_next_figure = True
+        if self.web is not None and self._ready:
+            script = """
+(() => {
+  window.fieldWorkbenchRenderQueue = (window.fieldWorkbenchRenderQueue || Promise.resolve())
+    .catch(() => undefined)
+    .then(() => {
+      const plot = document.getElementById('plot');
+      if (plot && plot.data && window.Plotly) {
+        try { Plotly.purge(plot); } catch (error) { console.warn(error); }
+      }
+      return undefined;
+    });
+})();
+"""
+            try:
+                self.web.page().runJavaScript(script)
+            except RuntimeError:
+                pass
+        self.show_message(str(heading), str(detail))
+
     def set_figure(
         self,
         figure: dict,
@@ -1346,11 +1453,22 @@ class PlotView(QStackedWidget):
         self._render_request_serial += 1
         self._pending_render_request_id = self._render_request_serial
         self._pending_figure_coalesce = bool(coalesce)
+        render_figure = figure
+        if self._pending_figure_is_3d and self._default_3d_dragmode is not None:
+            # Keep the caller's figure immutable while allowing compact viewers
+            # to choose the native Plotly interaction mode they should start in.
+            render_figure = dict(figure)
+            layout = dict(figure.get("layout", {}))
+            scene = dict(layout.get("scene", {}))
+            scene["dragmode"] = self._default_3d_dragmode
+            layout["scene"] = scene
+            render_figure["layout"] = layout
+
         # Plotly.py removes trace uid values by default.  Field Workbench uses
         # those identities to stop Plotly.react from reusing per-face Mesh3d
         # colours when structural edits move traces to different indices.
         source_json = pio.to_json(
-            figure,
+            render_figure,
             validate=False,
             pretty=False,
             remove_uids=False,
@@ -1390,20 +1508,34 @@ class PlotView(QStackedWidget):
         coalesce_render = bool(self._pending_figure_coalesce)
         render_request_id = int(self._pending_render_request_id)
         modebar_buttons_to_remove = list(self.MODEBAR_BUTTONS_TO_REMOVE)
-        native_image_save = self._bridge is not None
+        if self._modebar_profile == "rotation":
+            # Compact previews keep Plotly's native Home/reset-camera control
+            # alongside Orbit and Turntable.  Other Workbench viewers retain
+            # the historical custom Home semantics from SceneViewControls.
+            try:
+                modebar_buttons_to_remove.remove("resetCameraDefault3d")
+            except ValueError:
+                pass
+        for button_name in self.MODEBAR_PROFILES[self._modebar_profile]:
+            if button_name not in modebar_buttons_to_remove:
+                modebar_buttons_to_remove.append(button_name)
+        native_image_save = self._bridge is not None and self._native_image_save
         if native_image_save:
             # Replace Plotly's direct browser download with a Workbench-owned
             # native Save As dialog.  This prevents anonymous newplot.png files
             # and gives every embedded PlotView the same predictable behavior.
             modebar_buttons_to_remove.append("toImage")
-        config = json.dumps(
-            {
-                "responsive": True,
-                "displaylogo": False,
-                "scrollZoom": True,
-                "modeBarButtonsToRemove": modebar_buttons_to_remove,
-            }
-        )
+        plot_config = {
+            "responsive": True,
+            "displaylogo": False,
+            "scrollZoom": True,
+            "modeBarButtonsToRemove": modebar_buttons_to_remove,
+        }
+        if self._display_modebar is not None:
+            plot_config["displayModeBar"] = bool(self._display_modebar)
+        if self._plot_gl_pixel_ratio is not None:
+            plot_config["plotGlPixelRatio"] = float(self._plot_gl_pixel_ratio)
+        config = json.dumps(plot_config)
         apply_home = "true" if self._home_on_next_figure and is_three_dimensional else "false"
         apply_bounds_fit = (
             "true"
@@ -1423,6 +1555,8 @@ class PlotView(QStackedWidget):
         synchronize_legend_visibility = (
             "true" if self._synchronize_legend_visibility else "false"
         )
+        enable_selection_events = "true" if self._enable_selection_events else "false"
+        publish_live_view = "true" if self._publish_live_view else "false"
         clean_rebuild = "true" if self._clean_rebuild_on_next_figure else "false"
         native_image_save_js = "true" if native_image_save else "false"
         coalesce_render_js = "true" if coalesce_render else "false"
@@ -1455,6 +1589,8 @@ class PlotView(QStackedWidget):
   const reset2dView = {reset_2d_view};
   const includeReturnAxes = {include_return_axes};
   const synchronizeLegendVisibility = {synchronize_legend_visibility};
+  const enableSelectionEvents = {enable_selection_events};
+  const publishLiveView = {publish_live_view};
   const nativeImageSave = {native_image_save_js};
   const loading = document.getElementById('loading');
   window.fieldWorkbenchBeginLoading(renderRequestId);
@@ -1556,6 +1692,10 @@ class PlotView(QStackedWidget):
       );
     }}
     if (finalView) {{
+      finalView = window.fieldWorkbenchApply3dAxisPolicy(
+        finalView,
+        figure && figure.layout ? figure.layout : null
+      );
       // Put the final camera and ranges into the incoming layout before Plotly
       // paints.  A post-render relayout exposes Plotly's default camera for one
       // frame, which looks like a brief jump to an almost-Home view.
@@ -1631,7 +1771,7 @@ class PlotView(QStackedWidget):
       // Nothing here prevents/defaults the DOM events, so Plotly still receives
       // the complete drag stream and can orbit from either geometry or empty
       // space.
-      if (!plot.__fieldWorkbenchSelectionGestureBound) {{
+      if (enableSelectionEvents && !plot.__fieldWorkbenchSelectionGestureBound) {{
         plot.__fieldWorkbenchSelectionGestureBound = true;
         const movementThresholdPx = 5;
         let gesture = null;
@@ -1786,7 +1926,7 @@ class PlotView(QStackedWidget):
         }}, true);
       }}
 
-      if (!plot.__fieldWorkbenchPickingBound) {{
+      if (enableSelectionEvents && !plot.__fieldWorkbenchPickingBound) {{
         plot.__fieldWorkbenchPickingBound = true;
         plot.on('plotly_click', eventData => {{
           const point = eventData && eventData.points && eventData.points[0];
@@ -1804,7 +1944,7 @@ class PlotView(QStackedWidget):
           }}
         }});
       }}
-      if (!plot.__fieldWorkbenchCameraSyncBound) {{
+      if (publishLiveView && !plot.__fieldWorkbenchCameraSyncBound) {{
         plot.__fieldWorkbenchCameraSyncBound = true;
         let cameraPublishTimer = null;
         const cameraUpdate = eventData => {{
@@ -1983,6 +2123,13 @@ class PlotView(QStackedWidget):
             synchronize_legend_visibility=self._synchronize_legend_visibility,
             allow_fullscreen=False,
             image_filename=self._image_filename,
+            display_modebar=self._display_modebar,
+            modebar_profile=self._modebar_profile,
+            default_3d_dragmode=self._default_3d_dragmode,
+            native_image_save=self._native_image_save,
+            enable_selection_events=self._enable_selection_events,
+            publish_live_view=self._publish_live_view,
+            plot_gl_pixel_ratio=self._plot_gl_pixel_ratio,
         )
         clone.selection_requested.connect(self.selection_requested.emit)
         clone.visibility_requested.connect(self.visibility_requested.emit)

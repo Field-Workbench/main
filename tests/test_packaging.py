@@ -248,7 +248,11 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("delta_trace_updates", plot_view)
         self.assertIn("_incremental_trace_groups", plot_view)
         self.assertNotIn("fieldWorkbenchLatestIncrementalUpdate", plot_view)
-        self.assertIn('"type": "mesh3d"', brain_view)
+        lpba40_display = (
+            PROJECT_ROOT / "fieldworkbench" / "lpba40_display.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("build_lpba40_region_trace", brain_view)
+        self.assertIn('"type": "mesh3d"', lpba40_display)
         self.assertIn('f"brain-region:{int(label_id)}"', brain_view)
         self.assertIn("self.plot.selection_requested.connect", brain_view)
         self.assertIn("_brain_view_scene_object_choices", brain_view)
@@ -597,8 +601,8 @@ class PackagingTests(unittest.TestCase):
         help_topics = (PROJECT_ROOT / "fieldworkbench" / "help_topics.py").read_text(encoding="utf-8")
 
         for app_name in (
-            "Model Editor", "Map Creator", "Saved Results", "Exposure Editor",
-            "Waveform Editor", "Dataset Manager",
+            "Model Editor", "Map Creator", "Exposure Analysis", "Saved Results",
+            "Exposure Editor", "Waveform Editor", "Dataset Manager",
         ):
             self.assertIn(app_name, readme)
         self.assertNotIn("[windows zip file]()", readme)
@@ -608,7 +612,7 @@ class PackagingTests(unittest.TestCase):
         self.assertNotIn("**Recalculate**", testing)
         self.assertIn("taskbar-visible", building)
         self.assertIn("single-worker queue", building)
-        self.assertIn("Filters / highlights</b> panel sits to the left", help_topics)
+        self.assertIn("Show/hide filters</b>", help_topics)
         self.assertNotIn("highlighting grid above the table", help_topics)
 
     def test_light_dark_theme_contract_uses_wavebuilder_palette_and_persists(self) -> None:
@@ -804,6 +808,12 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('self.record.context.register_window("maps_analysis", window)', project_manager)
         self.assertIn("window = SnapshotManagerDialog(", project_manager)
         self.assertIn('self.record.context.register_window("snapshot_manager", window)', project_manager)
+        self.assertIn("window.notify_project_changed()", project_manager)
+        self.assertIn("self._notify_saved_results_project_changed(immediate=True)", project_manager)
+        snapshot_manager_source = dialogs.split("class SnapshotManagerDialog", 1)[1].split("class SceneNotesDialog", 1)[0]
+        self.assertNotIn("setInterval(2000)", snapshot_manager_source)
+        self.assertNotIn("timeout.connect(self.refresh_if_changed)", snapshot_manager_source)
+        self.assertIn("self._deferred_refresh_timer.setSingleShot(True)", snapshot_manager_source)
         self.assertNotIn("self.ensure_model_window().open_maps_workspace()", project_manager)
         self.assertNotIn("self.ensure_model_window().open_snapshots()", project_manager)
         self.assertNotIn("suite_maps_analysis_requested", main)
@@ -911,6 +921,9 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('self._add_dashboard_group(', project_manager)
         self.assertIn('"Maps / Analysis",\n            "maps",', project_manager)
         self.assertIn('"Exposures",\n            "exposures",', project_manager)
+        self.assertIn('"Data / Results",\n            "data_results",', project_manager)
+        self.assertIn('"Exposure Analysis",\n                    "Analyze field exposure over time and across spatial regions."', project_manager)
+        self.assertIn('"Saved Results",\n                    "Review saved maps, analyses, and snapshots."', project_manager)
         exposure_index = project_manager.index('"Exposure Editor"')
         waveform_index = project_manager.index('"Waveform Editor"', exposure_index)
         dataset_index = project_manager.index('"Dataset Manager"', waveform_index)
@@ -941,9 +954,9 @@ class PackagingTests(unittest.TestCase):
         for obsolete in ('project_component_highlight.svg', 'project_component_highlight_left.svg', 'project_component_highlight_center.svg', 'project_component_highlight_right.svg'):
             self.assertFalse((PROJECT_ROOT / 'fieldworkbench' / 'assets' / 'icons' / obsolete).exists())
         self.assertIn('self._set_component_populated("model", bool(objects))', project_manager)
-        self.assertIn('self._set_component_populated("maps", saved_result_count > 0)', project_manager)
+        self.assertIn('self._set_component_populated("maps", bool(saved_maps or exposure_analyses))', project_manager)
         self.assertIn('"exposures", bool(exposures or waveform_resources)', project_manager)
-        self.assertIn('"datasets", bool(datasets or calibrations)', project_manager)
+        self.assertIn('"data_results", bool(datasets or calibrations or saved_result_count)', project_manager)
         self.assertIn('button.setProperty("applicationName", button_text)', project_manager)
         self.assertIn('self.setMinimumSize(900, 820)', project_manager)
         self.assertIn('info_label.setMaximumWidth(320)', project_manager)
@@ -965,6 +978,11 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(project_manager.count('toolbar.addAction('), 3)
         self.assertIn('project_menu.addAction(self.model_action)', project_manager)
         self.assertIn('project_menu.addAction(self.maps_action)', project_manager)
+        self.assertIn('project_menu.addAction(self.exposure_analysis_action)', project_manager)
+        self.assertIn('def open_exposure_analysis(self, exposure_id: str | None = None) -> None:', project_manager)
+        self.assertIn('QInputDialog.getItem(', project_manager)
+        self.assertIn('self.record.context.register_window("exposure_analysis", workspace)', project_manager)
+        self.assertIn('"Data / Results",', project_manager)
         self.assertNotIn('self._refresh_timer = QTimer(self)', project_manager)
         self.assertNotIn('timeout.connect(self.refresh_projects)', project_manager)
         self.assertIn('project_state_changed.connect(self._model_project_state_changed)', project_manager)
@@ -975,6 +993,7 @@ class PackagingTests(unittest.TestCase):
         expected_custom_icons = {
             "Model Editor": "model_editor.svg",
             "Map Creator": "map_creator.svg",
+            "Exposure Analysis": "exposure_analysis.svg",
             "Saved Results": "saved_results.svg",
             "Exposure Editor": "exposure_editor.svg",
             "Waveform Editor": "waveform_editor.svg",
@@ -2106,6 +2125,8 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('register_window("exposure_analysis", workspace)', exposure_ui)
         self.assertIn('self.preparation_page = self._build_preparation_page()', workspace)
         self.assertIn('self._start_preparation(target_id)', workspace)
+        self.assertIn('A cached analysis already exists, are you sure you want to create a new analysis?', workspace)
+        self.assertIn('QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No', workspace)
         self.assertIn('exposureWorkspaceSavedAnalysisTree', workspace)
         self.assertIn('self.open_analysis_button = QPushButton("Open selected analysis"', workspace)
         self.assertIn('self.adapter.save_exposure_analysis_resource(result, analysis_cache={})', workspace)
@@ -2118,6 +2139,11 @@ class PackagingTests(unittest.TestCase):
         region_analysis = (PROJECT_ROOT / "fieldworkbench" / "region_analysis.py").read_text(encoding="utf-8")
         self.assertIn('def _hierarchy_weighted_rms_moments(', region_analysis)
         self.assertIn('def waveform_regions_payload(', region_analysis)
+        spatial_analysis = (PROJECT_ROOT / "fieldworkbench" / "spatial_analysis.py").read_text(encoding="utf-8")
+        self.assertIn('class AnalysisRegionSet:', spatial_analysis)
+        self.assertIn('class AnalysisSampleSet:', spatial_analysis)
+        self.assertIn('def frame_region_metrics(', spatial_analysis)
+        self.assertIn('analysis_engine": "regional_analysis_v2', adapter)
         self.assertIn('def _region_spatial_rms_values_direct(', region_analysis)
         shared_actions = (PROJECT_ROOT / "fieldworkbench" / "exposure_actions.py").read_text(encoding="utf-8")
         project_context = (PROJECT_ROOT / "fieldworkbench" / "project_context.py").read_text(encoding="utf-8")
@@ -2126,7 +2152,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('def save_exposure_analysis_resource(', adapter)
         self.assertIn('def exposure_analysis(self, analysis_id: str)', adapter)
         self.assertIn('def exposure_analysis_dependency_signature(', adapter)
-        self.assertIn('EXPOSURE_ANALYSIS_DEPENDENCY_VERSION = 3', adapter)
+        self.assertIn('EXPOSURE_ANALYSIS_DEPENDENCY_VERSION = 5', adapter)
         self.assertIn('def exposure_analysis_dependency_components(', adapter)
         self.assertIn('def _exposure_analysis_protocol_dependency(', adapter)
         self.assertIn('def _exposure_analysis_source_scene_dependency(', adapter)
@@ -2153,12 +2179,25 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('def delete_exposure_analysis_cached_results(', adapter)
         self.assertIn('def _exposure_analysis_cache_summary(', adapter)
         self.assertIn('"cached_tool_counts"', adapter)
-        self.assertIn('EXPOSURE_ANALYSIS_FORMAT_VERSION = 3', adapter)
+        self.assertIn('EXPOSURE_ANALYSIS_FORMAT_VERSION = 5', adapter)
         self.assertIn('EXPOSURE_ANALYSIS_BLOB_CODEC = "zlib-json-binary-v1"', adapter)
-        self.assertIn('_EXPOSURE_ANALYSIS_BLOB_MAGIC = b"FWBEA3\\0"', adapter)
+        self.assertIn('_EXPOSURE_ANALYSIS_BLOB_MAGIC = b"FWBEA5\\0"', adapter)
         self.assertIn('def _exposure_analysis_value_blob(', adapter)
         self.assertIn('def _exposure_analysis_cache_blob(', adapter)
         self.assertIn('def update_exposure_analysis_cache(', adapter)
+        self.assertIn('def cache_analysis_region_set(', adapter)
+        self.assertIn('def cached_analysis_region_set(', adapter)
+        self.assertIn('def list_regional_geometry_caches(', adapter)
+        self.assertIn('def delete_regional_geometry_caches(', adapter)
+        surface_volume_method = adapter.split('    def surface_region_volume_set(', 1)[1].split('\n    def ', 1)[0]
+        self.assertLess(
+            surface_volume_method.index('self.cached_analysis_region_set('),
+            surface_volume_method.index('build_surface_region_volume_set('),
+        )
+        self.assertIn('def exposure_analysis_cache_identities(', adapter)
+        self.assertIn('"preparation_identity"', adapter)
+        self.assertIn('"exposure_data_identity"', adapter)
+        self.assertIn('"geometry_cache_identity"', adapter)
         self.assertIn('"preparation_compressed_bytes"', adapter)
         self.assertIn('"cache_compressed_bytes"', adapter)
         self.assertNotIn('Save analysis…', shared_actions)
@@ -2260,7 +2299,10 @@ class PackagingTests(unittest.TestCase):
         help_topics = (PROJECT_ROOT / "fieldworkbench" / "help_topics.py").read_text(encoding="utf-8")
 
         self.assertIn("QStackedWidget", source)
-        self.assertIn('QPushButton("← Analysis home")', source)
+        header_source = (PROJECT_ROOT / "fieldworkbench" / "exposure_analysis_header.py").read_text(encoding="utf-8")
+        self.assertIn('QPushButton("← Analysis home"', header_source)
+        self.assertIn('QPushButton("← Analysis targets"', header_source)
+        self.assertIn("ExposureAnalysisHeaderPanel", source)
         self.assertNotIn('self.footer_back_button = QPushButton("Back")', source)
         self.assertNotIn('footer_close_button', source)
         self.assertIn('class ExposureAnalysisTargetView(QWidget)', source)
@@ -2306,9 +2348,15 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('("Mean RMS |B|", 1)', panel_source)
         self.assertIn('("Exposure RMS |B|", 2)', panel_source)
         self.assertIn('("B²-time", 6)', panel_source)
-        self.assertIn('Filter and Highlight rules use the same controls as Brain Areas', panel_source)
-        self.assertIn('self.region_sections_splitter.setOrientation(Qt.Orientation.Horizontal)', panel_source)
+        self.assertIn('"widths": [250, 128, 142, 128, 112, 124, 132, 72]', panel_source)
+        self.assertNotIn('Filter and Highlight rules use the same controls as Brain Areas', panel_source)
+        self.assertIn('self.metrics_note.hide()', panel_source)
+        self.assertIn('class _WrappedToolTipHeaderView(QHeaderView):', panel_source)
+        self.assertIn('QToolTip.showText(event.globalPos(), wrapped, self)', panel_source)
+        self.assertIn('self.toggle_filters_button = QPushButton("Show/hide filters")', panel_source)
         self.assertIn('self.filter_heading.setText("Filters / highlights")', panel_source)
+        self.assertIn('self.region_sections_splitter.insertWidget(0, self.table_section)', panel_source)
+        self.assertIn('self._set_exposure_summary_filters_visible(False)', panel_source)
         self.assertIn('all_regions=True', source)
         self.assertIn('self._show_region_browser and not on_home and not owns_region_browser', source)
         self.assertIn('self.region_tree.hide()\n        self.selection_note.hide()', source)
@@ -2706,7 +2754,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("WaveformEditorWindow", manager)
         self.assertIn("def open_waveforms", manager)
         self.assertIn('register_window("waveform_editor", window)', manager)
-        self.assertIn("WORKBENCH_METADATA_VERSION = 25", adapter)
+        self.assertIn("WORKBENCH_METADATA_VERSION = 26", adapter)
         self.assertIn('metadata["waveforms"]', adapter)
         self.assertIn("def list_waveforms", adapter)
         self.assertIn("def save_waveform_document", adapter)

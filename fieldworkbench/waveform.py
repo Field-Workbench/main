@@ -19,6 +19,7 @@ from typing import Any, TYPE_CHECKING
 
 import numpy as np
 
+from .region_analysis import measurement_playback_payload
 from .brain_analysis import (
     BrainSampleSet,
     lpba40_frame_region_metrics,
@@ -3216,15 +3217,17 @@ def build_2d_animation(
         "uid": "waveform-field-map",
     }
     data: list[dict[str, Any]] = [heatmap]
-    if bool(map_settings.get("show_object_outlines", True)):
-        data.extend(
-            adapter._scene_cross_section_traces_2d(
-                plane=plane,
-                offset_mm=offset_mm,
-                span_mm=span_mm,
-                object_ids=map_settings.get("outline_object_ids"),
-            )
+    data.extend(
+        adapter._field_map_scene_traces_2d(
+            plane=plane,
+            offset_mm=offset_mm,
+            span_mm=span_mm,
+            object_ids=map_settings.get("outline_object_ids"),
+            show_object_outlines=bool(map_settings.get("show_object_outlines", True)),
+            show_sensor_placements=bool(map_settings.get("show_sensor_placements", False)),
+            show_well_rims=bool(map_settings.get("show_well_rims", False)),
         )
+    )
 
     observation_values = None
     observation_label = None
@@ -3787,68 +3790,30 @@ def _gpu_2d_outline_scene(
     offset_mm: float,
     span_mm: float,
     object_ids: Any,
+    show_object_outlines: bool = True,
+    show_sensor_placements: bool = False,
+    show_well_rims: bool = False,
 ) -> dict[str, Any]:
-    """Convert the existing 2D cross-section overlays into lightweight GPU lines."""
-    axes = {"xy": (0, 1, 2), "xz": (0, 2, 1), "yz": (1, 2, 0)}[plane]
-    lines: list[dict[str, Any]] = []
-    bounds: list[np.ndarray] = []
-    for trace in adapter._scene_cross_section_traces_2d(
+    """Lift map overlays onto the GPU viewer's slice in world millimetres."""
+    horizontal, vertical, normal = {"xy": (0, 1, 2), "xz": (0, 2, 1), "yz": (1, 2, 0)}[plane]
+    data = []
+    for trace in adapter._field_map_scene_traces_2d(
         plane=plane,
         offset_mm=offset_mm,
         span_mm=span_mm,
         object_ids=object_ids,
+        show_object_outlines=show_object_outlines,
+        show_sensor_placements=show_sensor_placements,
+        show_well_rims=show_well_rims,
     ):
-        if not isinstance(trace, dict) or str(trace.get("type", "scatter")).lower() != "scatter":
-            continue
-        if "lines" not in str(trace.get("mode", "lines")):
-            continue
-        xs, ys = trace.get("x", []), trace.get("y", [])
-        try:
-            count = min(len(xs), len(ys))
-        except TypeError:
-            continue
-        segments: list[list[float]] = []
-        valid: list[np.ndarray] = []
-        previous: np.ndarray | None = None
-        for index in range(count):
-            if xs[index] is None or ys[index] is None:
-                previous = None
-                continue
-            try:
-                point = np.zeros(3, dtype=float)
-                point[axes[0]] = float(xs[index])
-                point[axes[1]] = float(ys[index])
-                point[axes[2]] = float(offset_mm)
-            except (TypeError, ValueError):
-                previous = None
-                continue
-            if not np.isfinite(point).all():
-                previous = None
-                continue
-            valid.append(point)
-            if previous is not None:
-                segments.extend([previous.tolist(), point.tolist()])
-            previous = point
-        if not segments:
-            continue
-        line = trace.get("line") if isinstance(trace.get("line"), dict) else {}
-        array = np.asarray(segments, dtype=np.float32)
-        lines.append(
-            {
-                "positions": _array_b64(array, np.float32),
-                "count": int(len(array)),
-                "colour": _css_rgba(line.get("color", "#334155"), opacity=float(trace.get("opacity", 1.0) or 1.0)),
-                "width": max(1.0, float(line.get("width", 1.5) or 1.5)),
-            }
-        )
-        bounds.append(np.asarray(valid, dtype=float))
-    if bounds:
-        joined = np.vstack(bounds)
-        minimum = np.min(joined, axis=0).tolist()
-        maximum = np.max(joined, axis=0).tolist()
-    else:
-        minimum = maximum = None
-    return {"meshes": [], "lines": lines, "points": [], "bounds_min": minimum, "bounds_max": maximum}
+        coords = ["x", "y", "z"]
+        world = {
+            coords[horizontal]: trace["x"],
+            coords[vertical]: trace["y"],
+            coords[normal]: [offset_mm] * len(trace["x"]),
+        }
+        data.append({**trace, **world, "type": "scatter3d"})
+    return _gpu_scene_payload({"data": data})
 
 
 def _resolve_gpu_drive_ids(coil_id: str | None, coil_ids: Any | None) -> list[str]:
@@ -4028,16 +3993,15 @@ def build_2d_gpu_playback(
         span,
         enabled=bool(map_settings.get("show_grid", True)),
     )
-    scene_payload = (
-        _gpu_2d_outline_scene(
-            adapter,
-            plane=plane,
-            offset_mm=offset_mm,
-            span_mm=span,
-            object_ids=map_settings.get("outline_object_ids"),
-        )
-        if bool(map_settings.get("show_object_outlines", True))
-        else {"meshes": [], "lines": [], "points": [], "bounds_min": None, "bounds_max": None}
+    scene_payload = _gpu_2d_outline_scene(
+        adapter,
+        plane=plane,
+        offset_mm=offset_mm,
+        span_mm=span,
+        object_ids=map_settings.get("outline_object_ids"),
+        show_object_outlines=bool(map_settings.get("show_object_outlines", True)),
+        show_sensor_placements=bool(map_settings.get("show_sensor_placements", False)),
+        show_well_rims=bool(map_settings.get("show_well_rims", False)),
     )
     _emit_render_task_progress(
         progress_callback,
@@ -4091,9 +4055,14 @@ def build_2d_gpu_playback(
                 timeline, coil_ids=drive_ids, coil_labels=coil_labels
             )
 
-    # Measurement-volume snapshots are a Static Maps workflow. Scripted
-    # playback intentionally carries no Measurement-volumes region payload.
-    measurement_regions = None
+    measurement_regions = (
+        measurement_playback_payload(
+            adapter, timeline, drive_ids, controlled_coil_ids,
+            progress_callback=progress_callback, frame_only=True,
+        )
+        if map_settings.get("live_measurement_analysis")
+        else None
+    )
     return {
         "measurement_regions": measurement_regions,
         "renderer": "field-workbench-webgl2-waveform-v4",
@@ -5079,10 +5048,14 @@ def build_3d_gpu_playback(
             "sampled_frame_indices_b64": _array_b64(metric_indices, np.int32),
         }
 
-    # Measurement-volume snapshots and cumulative exposure analysis are not
-    # playback products. Static Maps owns Measurement volumes; a dedicated
-    # Exposure Analysis workflow will own authoritative time-domain summaries.
-    measurement_regions = None
+    measurement_regions = (
+        measurement_playback_payload(
+            adapter, timeline, drive_ids, controlled_coil_ids,
+            progress_callback=progress_callback, frame_only=True,
+        )
+        if map_settings.get("live_measurement_analysis")
+        else None
+    )
 
     drive_trace_payloads = (
         _exposure_drive_trace_payloads(timeline)

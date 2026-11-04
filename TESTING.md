@@ -1,5 +1,46 @@
 # Field Workbench verification
 
+## Agent-access integration
+
+The shared CLI/MCP command system is covered by `test_automation_commands.py`,
+`test_automation_transport.py`, and `test_automation_mcp.py`. Run these with
+`python -m unittest discover -s tests -p 'test_automation_*.py' -v`.
+The MCP stdio round trip requires the optional `requirements-agent.txt` dependency;
+without it, only that test is skipped. Local transport tests require loopback
+socket access. They use temporary projects and offscreen Qt windows.
+See [Agent access](docs/AGENT_ACCESS.md) for architecture, command semantics, and
+extension points. Manual user testing and packaged CLI/MCP acceptance are deferred.
+
+## Packaged release acceptance (pending)
+
+Record the tested source commit, application version, Windows/Python versions,
+ZIP checksums, and pass/fail evidence. Use the extracted onedir release from a clean
+folder outside the development checkout. The GUI must run without the development
+Python environment; the separate agent client deliberately has its own Python setup.
+
+- Launch normally and confirm no new automation instance is discoverable. Launch
+  with `--automation`, discover it, and read the same project through CLI and a real
+  MCP client using matching source. With multiple instances, select an explicit ID.
+- On a disposable project, add/edit an object, verify the GUI updates and Undo,
+  reject a stale revision, and save/reopen. Verify ordinary launches remain opt-in.
+- Exercise field, measurement and DRC jobs; inspect/export results, cancel work,
+  and verify stale measurement/optimizer application is rejected after model edits.
+  Verify shutdown cleanup and reconnect after restart with the new instance ID.
+- Open `examples/4D-box.magpy.json`. Generate static and scripted 2D maps with sensor
+  placements and well rims; test plate transforms, clipping and overlays independently.
+- Generate Scripted 2D and 3D maps with Live measurement analysis. Check playback,
+  scrubbing, whole-object aggregates, labelled well child rows, selection highlights,
+  and metric-column order across updates. Generated volume grids remain aggregate rows.
+  Static Measurement snapshots and Brain Areas remain separate workflows.
+- Check saved-result reopening, built-in Help, 3D worker processes, video export,
+  and normal project/application shutdown. Run the broader Windows checklist in
+  [BUILDING_WINDOWS.md](BUILDING_WINDOWS.md).
+
+Do not mark these checks passed until performed on the actual candidate. Automated
+source coverage and the 2.5-second startup smoke test are insufficient substitutes.
+
+## Test layers
+
 Field Workbench uses four deliberately separate test layers. A direct parity
 test and an independent physics test answer different questions and should not
 be treated as substitutes for one another.
@@ -136,7 +177,7 @@ publishing a release candidate:
 3. Check Static 2D/3D maps, a Measurement-volume snapshot, Scripted 2D/3D/Brain playback,
    Brain Areas interaction, trace export, audio start/stop/source switching, and one short
    video export. Scripted 2D/3D must not expose the Static snapshot panel.
-4. Run **Exposure Editor → Analyze exposure…** on a representative long/repeating exposure.
+4. Run **Project Manager → Maps / Analysis → Exposure Analysis** on a representative long/repeating exposure (the **Analyze exposure…** shortcut in Exposure Editor should open the same workflow).
    Confirm the chooser lists eligible targets plus saved analyses for the selected exposure/target,
    **Create new analysis** writes a fresh preparation, and **Calculate all uncached analyses** uses
    the single-worker queue (one Running row at a time, later jobs Queued, Pause/Run and Cancel work).
@@ -159,10 +200,22 @@ publishing a release candidate:
 9. On the intended Windows release machine, build the frozen executable with
    `build_windows.bat`, inspect `BUILD_REPORT.txt`, run the packaged startup smoke test, and
    repeat the key WebEngine/analysis/save-reopen paths described in `BUILDING_WINDOWS.md`.
-10. If solver/export code changed, run the external Gmsh/GetDP acceptance below. If dependency
+10. Run one representative **Optimizer 2.4 racetrack directional-closure acceptance** on the 48-well
+    plate scene that motivated the refactor. Keep current, axial winding length, pair spacing, racetrack
+    end diameter, and racetrack straight length free. First run Fast with Current Sheet authority and
+    confirm **Directional Closure — Centreline Reconnaissance** shows both legal bounds tested for end
+    diameter, straight length, and spacing. If the best result is at 85 mm (or another user bound), the
+    report must say upper/lower-bound limited; an interior answer is acceptable only with turnover/bracket
+    evidence or a measured DRC/electrical feasibility boundary. Then run Balanced and Full and confirm the
+    capable-physics Directional Closure section closes the required coupled family. Full must show every
+    structural freedom physically directionally closed (or analytically solved/proven redundant), and the
+    Full effort contract must be SATISFIED. Search / Fidelity Contract must also show protected correctness
+    and discretionary consumption separately. A run that exhausts correctness reserve with an open required
+    direction must return INCOMPLETE rather than converged.
+11. If solver/export code changed, run the external Gmsh/GetDP acceptance below. If dependency
     pins changed, run the optional upstream dependency suites. Hardware-output paths should be
     checked on the actual target device when they are part of the release claim.
-11. Create the matching source archive with `python tools/build_source_release.py`, inspect its
+12. Create the matching source archive with `python tools/build_source_release.py`, inspect its
     contents, and confirm development-only review notes/build artifacts are absent.
 
 ## Focused layers
@@ -184,6 +237,25 @@ python -m unittest discover -s tests -p "test_sri24_atlas.py" -v
 python -m unittest discover -s tests -p "test_brain_analysis.py" -v
 python -m unittest discover -s tests -p "test_brain_mesh.py" -v
 ```
+
+Run the dependency-light **Optimizer 2.4 contract gate** after changes to optimizer
+capabilities, effort modes, model selection, staged budgets, physical refinement,
+or candidate-registry fidelity:
+
+```bash
+python -m unittest \
+  tests.test_optimizer \
+  tests.test_candidate_registry \
+  tests.test_optimizer_23_policy \
+  tests.test_optimizer_24_directional -v
+```
+
+This gate includes both optimizer failures that motivated Optimizer 2.3/2.4: axial winding length is
+invisible to Centreline, and a scout-visible bounded geometry freedom may not stop at an arbitrary
+interior sample while its observed trend still improves toward an untested bound. The 2.4 tests cover
+monotonic lower/upper-bound closure, interior turnover, source-anchored increment lattices, measured DRC
+feasibility boundaries, solver-failure rejection, racetrack shape/spacing coupling, protected correctness
+budgets, and reporting/Search Trace integration.
 
 Run the focused long-exposure regional-analysis release gate after changes to exposure clocks, Exposure Analysis payloads/caches, regional statistics, FFT, or frequency weighting:
 
