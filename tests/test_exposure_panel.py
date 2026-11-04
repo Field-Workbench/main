@@ -139,6 +139,36 @@ class ExposurePanelTests(unittest.TestCase):
         self.assertFalse(result.isError(), result.toString())
         self.assertEqual(result.toString(), "selection")
 
+    def test_volume_selection_overlays_equal_depth_sensor_but_not_nearer_geometry(self):
+        render = next(line for line in WaveformGLView._html({}).splitlines()
+                      if line.startswith("function render(){"))
+        for scene_depth, expected in ((0.5, "selection"), (0.2, "scene")):
+            with self.subTest(scene_depth=scene_depth):
+                engine = QJSEngine()
+                result = engine.evaluate("""
+                    var pixel = '', depth = 1, depthTest = false, depthMode = 'less';
+                    var is2d = false, isVolume = true, showField = true;
+                    var workbenchDark = false, fpsCount = 0, fpsStamp = 0, dirty = true;
+                    var performance = {now: function() { return 0; }};
+                    var gl = {DEPTH_TEST: 'depth', LESS: 'less', LEQUAL: 'lequal',
+                        clearColor: function(){}, clear: function(){depth = 1;},
+                        enable: function(v){if(v === 'depth') depthTest = true;},
+                        disable: function(v){if(v === 'depth') depthTest = false;},
+                        blendFunc: function(){}, depthFunc: function(v){depthMode = v;}};
+                    function resize() {} function mvp() { return []; }
+                    function drawVolume() {pixel = 'field';}
+                    function drawOverlayFieldPoints() {} function drawGrid() {}
+                    function drawGridOverlay() {}
+                    function drawScene() {pixel = 'scene'; depth = SCENE_DEPTH;}
+                    function drawBrainHighlight() {
+                        if (!depthTest || (depthMode === 'lequal' ? 0.5 <= depth : 0.5 < depth))
+                            pixel = 'selection';
+                    }
+                """.replace("SCENE_DEPTH", str(scene_depth)) + render +
+                    ";render(); JSON.stringify([pixel,depthTest,depthMode]);")
+                self.assertFalse(result.isError(), result.toString())
+                self.assertEqual(result.toString(), f'["{expected}",true,"less"]')
+
     def wait_for_analysis(self, page, timeout=15.0):
         """Wait for a directly-instantiated analysis page to finish its async first run."""
         import time
