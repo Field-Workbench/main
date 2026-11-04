@@ -8,6 +8,7 @@ os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox --disable-gpu"
 
 import numpy as np
 from PySide6.QtCore import Signal, Qt
+from PySide6.QtQml import QJSEngine
 from PySide6.QtWidgets import QApplication, QLabel, QDialog, QPushButton, QTabWidget, QVBoxLayout
 
 from fieldworkbench.brain_analysis import BrainRegionNode
@@ -116,6 +117,27 @@ class ExposurePanelTests(unittest.TestCase):
         finally:
             viewer.cleanup()
             viewer.deleteLater()
+
+    def test_2d_selection_is_drawn_over_sensor_markers(self):
+        # Execute the shipped render branch with drawing probes: the opaque
+        # sensor marker used to overwrite the smaller yellow selection point.
+        render = next(line for line in WaveformGLView._html({}).splitlines()
+                      if line.startswith("function render(){"))
+        engine = QJSEngine()
+        result = engine.evaluate("""
+            var pixel = '', is2d = true, isVolume = false, showField = true;
+            var workbenchDark = false, fpsCount = 0, fpsStamp = 0, dirty = true;
+            var performance = {now: function() { return 0; }};
+            var gl = {clearColor: function(){}, clear: function(){},
+                      enable: function(){}, disable: function(){}, blendFunc: function(){}};
+            function resize() {} function mvp() { return []; }
+            function drawField() {} function drawOverlayFieldPoints() {}
+            function drawGrid() {} function drawGridOverlay() {}
+            function drawScene() { pixel = 'sensor'; }
+            function drawBrainHighlight() { pixel = 'selection'; }
+        """ + render + ";render();pixel;")
+        self.assertFalse(result.isError(), result.toString())
+        self.assertEqual(result.toString(), "selection")
 
     def wait_for_analysis(self, page, timeout=15.0):
         """Wait for a directly-instantiated analysis page to finish its async first run."""
