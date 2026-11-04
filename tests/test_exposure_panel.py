@@ -22,6 +22,7 @@ from fieldworkbench.exposure_actions import (
 )
 from fieldworkbench.exposure_panel import ExposureRegionPanel, ExposureResultTab
 from fieldworkbench.region_analysis import MeasurementRegions, encode
+from fieldworkbench.waveform_gl_view import WaveformGLView
 
 
 def metric_data():
@@ -94,6 +95,28 @@ class ExposurePanelTests(unittest.TestCase):
     def tearDown(self):
         self.app.processEvents()
 
+    def test_region_selection_refreshes_visible_view_without_waking_hidden_view(self):
+        viewer = WaveformGLView({}, start_hibernated=True, _source_html_path="unused.html")
+        try:
+            with patch.object(viewer, "isVisible", return_value=True), \
+                    patch.object(viewer, "refresh_viewport") as refresh:
+                viewer.set_brain_region_highlight([182, 181, 181])
+                self.assertEqual(viewer._brain_highlight_label_ids, (181, 182))
+                refresh.assert_called_once_with()
+                refresh.reset_mock()
+                viewer.set_brain_region_highlight(())
+                self.assertEqual(viewer._brain_highlight_label_ids, ())
+                refresh.assert_called_once_with()
+            with patch.object(viewer, "isVisible", return_value=False), \
+                    patch.object(viewer, "refresh_viewport") as refresh:
+                viewer.set_brain_region_highlight([181])
+                refresh.assert_not_called()
+                self.assertIsNone(viewer.web)
+                self.assertEqual(viewer._requested_lifecycle, "discarded")
+        finally:
+            viewer.cleanup()
+            viewer.deleteLater()
+
     def wait_for_analysis(self, page, timeout=15.0):
         """Wait for a directly-instantiated analysis page to finish its async first run."""
         import time
@@ -141,6 +164,7 @@ class ExposurePanelTests(unittest.TestCase):
         panel.region_selected.connect(selected.append)
         panel.table.setCurrentItem(panel._items_by_key["b"])
         self.assertEqual(selected[-1], (2,))
+        self.assertEqual(panel.selection_note.text(), "Highlighted samples: B [samples].")
         panel.request_frame(2, 1)
         self.app.processEvents()
         self.assertFalse(panel._items_by_key["a"].isHidden())

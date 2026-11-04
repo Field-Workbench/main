@@ -558,6 +558,11 @@ class WaveformGLView(QStackedWidget):
             values = ()
         self._brain_highlight_label_ids = values
         self._apply_brain_highlight()
+        # A region-table selection can relayout its neighbouring WebEngine
+        # surface. On Windows an idle static canvas can stay black until a
+        # pointer event; redraw after Qt has finished that layout as well.
+        if self.isVisible():
+            self.refresh_viewport()
 
     def _gpu_validation_ready_from_web(self, report_json: str) -> None:
         callback = self._gpu_validation_callback

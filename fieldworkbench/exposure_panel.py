@@ -2014,7 +2014,7 @@ class ExposureRegionPanel(QWidget):
         else:
             if self.measurement:
                 self.selection_note.setText(
-                    f"Highlighted samples: {item.text(0)} (projected in 2D)."
+                    f"Highlighted samples: {item.text(0)}."
                 )
             elif self.surface_regions:
                 self.selection_note.setText(f"Selected surface region: {item.text(0)}.")
