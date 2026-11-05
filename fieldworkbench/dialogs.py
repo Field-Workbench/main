@@ -18,6 +18,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .map_controls import attach_controls, capture_page_controls
+
 import numpy as np
 
 from .geomagnetism import (
@@ -12683,6 +12685,9 @@ class _BackgroundFieldRenderMixin(ExposureActionsMixin):
     ) -> None:
         """Create a progress tab immediately and run its frozen request off-thread."""
 
+        if not self._validate_render_colour_settings(request.get("map_settings", {})):
+            return
+
         if render_kind in {"static", "2d_static", "brain_static", "waveform"}:
             try:
                 scene_objects = self.adapter.list_objects()
@@ -12704,6 +12709,8 @@ class _BackgroundFieldRenderMixin(ExposureActionsMixin):
             QMessageBox.warning(self, f"Unable to start {job_label}", str(error))
             return
 
+        controls_snapshot = capture_page_controls(self)
+        controls_snapshot["render_context"] = copy.deepcopy(preferences)
         self._render_job_serial += 1
         job_id = self._render_job_serial
         page = _FieldRenderJobPage(
@@ -12736,6 +12743,7 @@ class _BackgroundFieldRenderMixin(ExposureActionsMixin):
             "label": job_label,
             "tooltip": tooltip,
             "render_kind": render_kind,
+            "map_controls": controls_snapshot,
             "terminal": False,
             "discard": False,
             "cancel_requested": False,
@@ -12771,6 +12779,29 @@ class _BackgroundFieldRenderMixin(ExposureActionsMixin):
             f"{job_label} submitted • {active} render job"
             f"{'s' if active != 1 else ''} running or queued"
         )
+
+    def _validate_render_colour_settings(self, settings: dict[str, Any]) -> bool:
+        """Reject invalid explicit colour bounds before allocating solver work."""
+
+        try:
+            StudioAdapter._manual_colour_limits(
+                settings.get("colour_minimum"),
+                settings.get("colour_maximum"),
+                logarithmic=bool(settings.get("logarithmic", False)),
+            )
+        except StudioOperationError as error:
+            advice = (
+                "For logarithmic colour, set each enabled limit above zero, "
+                "with the lower limit below the upper limit. Uncheck a limit to use Auto, "
+                "or turn off Log scale to allow zero or negative limits."
+                if settings.get("logarithmic", False)
+                else "Set the lower limit below the upper limit, or uncheck a limit to use Auto."
+            )
+            QMessageBox.warning(
+                self, "Check heatmap colour limits", f"{error}\n\n{advice}\n\nNo calculation was started."
+            )
+            return False
+        return True
 
     def _render_job_page_action(
         self, job_id: int, page: _FieldRenderJobPage
@@ -12867,6 +12898,7 @@ class _BackgroundFieldRenderMixin(ExposureActionsMixin):
                     image_filename=f"2d-field-map-{job_id}"
                 )
                 self._tag_workspace_result_widget(plot)
+                attach_controls(plot, job.get("map_controls"))
                 plot.set_figure(figure)
                 connector = getattr(self, "_connect_result_camera_viewer", None)
                 if callable(connector):
@@ -12904,6 +12936,8 @@ class _BackgroundFieldRenderMixin(ExposureActionsMixin):
                     tab_widget = wrapped
             self._tag_workspace_result_widget(plot)
             self._tag_workspace_result_widget(tab_widget)
+            attach_controls(plot, job.get("map_controls"))
+            attach_controls(tab_widget, job.get("map_controls"))
             plot.ready.connect(
                 lambda ok, plot=plot, tab_widget=tab_widget, title=title, report=report, elapsed=elapsed: (
                     self._render_gpu_view_ready(plot, title, report, elapsed, ok, tab_widget)
@@ -13756,6 +13790,9 @@ class FieldMapDialog(_BackgroundFieldRenderMixin, _CameraTimelineMixin, _Playbac
                 )
                 self._tag_workspace_result_widget(plot)
                 self._tag_workspace_result_widget(tab_widget)
+                snapshot = capture_page_controls(self)
+                attach_controls(plot, snapshot)
+                attach_controls(tab_widget, snapshot)
                 tab_label = self._workspace_result_tab_label(
                     self._waveform_tab_counter, f"Waveform {self._waveform_tab_counter}"
                 )
@@ -15115,6 +15152,9 @@ class FieldVolumeMapDialog(_BackgroundFieldRenderMixin, _CameraTimelineMixin, _P
                 )
                 self._tag_workspace_result_widget(plot)
                 self._tag_workspace_result_widget(tab_widget)
+                snapshot = capture_page_controls(self)
+                attach_controls(plot, snapshot)
+                attach_controls(tab_widget, snapshot)
                 tab_label = self._workspace_result_tab_label(
                     self._waveform_tab_counter, f"Waveform {self._waveform_tab_counter}"
                 )

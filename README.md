@@ -25,7 +25,7 @@ The modeling layer is built around Magpylib / Magpylib Studio and includes tools
 Each open project has one shared project context. The Project Manager owns project lifetime and save state; the suite applications can be opened and used independently for that project:
 
 - **Model Editor** — build and inspect field sources, sensors, geometry, measurement volumes, coil construction, design-rule checks, and optimization.
-- **Map Creator** — create Static or Scripted 2D, 3D, and Brain visualizations, including saved-exposure playback.
+- **Map Creator** — create Static or Scripted 2D, 3D, and Brain visualizations, including saved-exposure playback. Restore calculation controls from result tabs or saved maps; newly saved tabs use their saved resource names.
 - **Exposure Analysis** — analyze field exposure over time and across spatial regions; saved exposures can also launch the same workspace from Exposure Editor.
 - **Exposure Editor** — author physical-duration source/routing protocols.
 - **Waveform Editor** — create, import, edit, and export reusable Current/Voltage waveforms and encoded waveform formats.

@@ -2255,6 +2255,10 @@ class BrainViewDialog(
                 )
                 self._tag_workspace_result_widget(viewer)
                 self._tag_workspace_result_widget(tab_widget)
+                from .map_controls import attach_controls, capture_page_controls
+                snapshot = capture_page_controls(self)
+                attach_controls(viewer, snapshot)
+                attach_controls(tab_widget, snapshot)
                 tab_label = self._workspace_result_tab_label(
                     self._waveform_tab_counter, f"Waveform {self._waveform_tab_counter}"
                 )

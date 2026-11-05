@@ -62,6 +62,8 @@ from PySide6.QtWidgets import (
 from scipy.spatial.transform import Rotation
 
 from . import __version__
+from .map_controls import (AUX_KEY, MapControlsError, attach_controls, capture_controls,
+                           legacy_controls, recorded_controls, restore_controls)
 from .dialogs import (
     AiHelpDialog,
     BackgroundFieldDialog,
@@ -904,6 +906,15 @@ class UnifiedFieldWorkspaceDialog(QDialog):
         )
         self.workspace_save_map_button.clicked.connect(self._save_current_map)
         viewer_footer_layout.addWidget(self.workspace_save_map_button)
+        self.workspace_restore_controls_button = QPushButton("Restore controls from map")
+        self.workspace_restore_controls_button.setObjectName("mapsRestoreControlsButton")
+        self.workspace_restore_controls_button.setToolTip(
+            "Copy recorded calculation controls from this tab without recalculating or changing the scene"
+        )
+        self.workspace_restore_controls_button.setVisible(False)
+        self.workspace_restore_controls_button.setEnabled(False)
+        self.workspace_restore_controls_button.clicked.connect(self._restore_current_map_controls)
+        viewer_footer_layout.addWidget(self.workspace_restore_controls_button)
         self.workspace_fullscreen_button = QPushButton("Fullscreen viewer")
         self.workspace_fullscreen_button.setObjectName("mapsFullscreenViewerButton")
         self.workspace_fullscreen_button.setToolTip(
@@ -1253,9 +1264,23 @@ class UnifiedFieldWorkspaceDialog(QDialog):
         )
 
     def _project_resources_changed(self) -> None:
+        self._refresh_saved_map_tab_titles()
         callback = self.on_project_resources_changed
         if callable(callback):
             callback()
+
+    def _refresh_saved_map_tab_titles(self) -> None:
+        """Use committed resource names for tabs linked to saved maps."""
+
+        records = {str(record["id"]): record for record in self.project_adapter.list_saved_maps()}
+        for index in range(self.shared_tabs.count()):
+            widget = self.shared_tabs.widget(index)
+            record = records.get(str(getattr(widget, "_saved_map_resource_id", "")))
+            if record is None:
+                continue
+            view_label = self.VIEW_LABELS.get(str(record.get("view", "")))
+            if view_label:
+                self.shared_tabs.setTabText(index, f"{view_label}\\{record['name']}")
 
     def _static_snapshot_saved(self, snapshot_id: str) -> None:
         self._project_resources_changed()
@@ -1286,6 +1311,55 @@ class UnifiedFieldWorkspaceDialog(QDialog):
         if isinstance(button, QPushButton):
             button.setVisible(can_save)
             button.setEnabled(can_save)
+        restore_button = getattr(self, "workspace_restore_controls_button", None)
+        if isinstance(restore_button, QPushButton):
+            restore_button.setVisible(can_save)
+            restore_button.setEnabled(can_save)
+
+    def _restore_current_map_controls(self, *_args) -> None:
+        widget = self.shared_tabs.currentWidget()
+        viewer = getattr(widget, "viewer", widget)
+        if widget is None or self.shared_tabs.currentIndex() == self._shared_selector_tab_index:
+            return
+        mode, view = self._result_tab_owner(widget)
+        page = self._pages.get(self._page_key(mode, view))
+        if page is None or not isinstance(viewer, (PlotView, WaveformGLView)):
+            return
+        try:
+            snapshot = recorded_controls(widget)
+            if snapshot is None:
+                snapshot = recorded_controls(viewer)
+            if snapshot is None:
+                content = (viewer.export_figure() if isinstance(viewer, PlotView)
+                           else viewer.export_render_payload())
+                snapshot = legacy_controls(content, getattr(widget, "_saved_map_aux", {}),
+                                           mode=mode, view=view)
+            result = restore_controls(page, snapshot, mode=mode, view=view, workspace=self)
+        except (MapControlsError, RuntimeError, ValueError, TypeError) as error:
+            QMessageBox.information(self, "Restore controls from map", str(error))
+            return
+        count = result["restored"]
+        message = (f"Restored {count} control settings from this map. " if count else
+                   "No usable original control settings were recorded; controls were left unchanged. ")
+        message += "No map was recalculated. Scene, currents, calibration, solver method/worker policy, camera/timeline and Brain table filters were not restored."
+        if result["partial"]:
+            message += ("\nThis older map has no full controls record. Only explicit recoverable values "
+                        "were used; original source settings, custom opacity curves and other missing settings remain unchanged. Recovered colour bounds are explicit manual limits; old Auto/manual flags are unknown.")
+        important = {
+            "active_coil_ids": "Active coils", "scene_object_ids": "Scene objects",
+            "outline_object_ids": "Objects", "scene_object_opacities": "Object opacity",
+            "plane": "Plane", "offset": "Slice offset", "view_type": "3D render mode",
+            "intensity_opacity_enabled": "Opacity settings", "scripted_source_type": "Scripted source",
+        }
+        missing = [label for key, label in important.items() if key in result["missing"]]
+        if missing:
+            message += "\nNot recorded: " + ", ".join(missing) + "."
+        if result["skipped"]:
+            message += "\nSkipped: " + "; ".join(result["skipped"])
+        self.workspace_restore_controls_button.setToolTip(message)
+        page.calculation_status.showMessage(message, 15000)
+        if result["partial"] or result["skipped"] or not count:
+            QMessageBox.information(self, "Restore controls from map", message)
 
     def _install_saved_map_button(self, page: QDialog) -> None:
         """Route one view's save-map affordance through the shared Maps footer."""
@@ -1293,6 +1367,9 @@ class UnifiedFieldWorkspaceDialog(QDialog):
         if isinstance(button, QPushButton):
             page.save_map_button = button
             page._saved_map_actions_changed = self._refresh_saved_map_actions
+            page._map_controls_capture = lambda target=page: capture_controls(
+                target, mode=str(target._unified_workspace_mode_key),
+                view=str(target._unified_workspace_view_key), workspace=self)
 
     def _toggle_workspace_fullscreen(self, *_args) -> None:
         """Open the active selector/result using its established fullscreen action."""
@@ -1325,6 +1402,12 @@ class UnifiedFieldWorkspaceDialog(QDialog):
             return
 
         default_name = self.shared_tabs.tabText(index).replace("\\", " - ").strip() or "Saved map"
+        resource_id = str(getattr(widget, "_saved_map_resource_id", ""))
+        if resource_id:
+            default_name = next(
+                (record["name"] for record in self.project_adapter.list_saved_maps()
+                 if str(record["id"]) == resource_id), default_name
+            )
         name, accepted = QInputDialog.getText(
             self,
             "Save calculated map",
@@ -1337,6 +1420,11 @@ class UnifiedFieldWorkspaceDialog(QDialog):
             QMessageBox.warning(self, "Save map", "Map name cannot be blank.")
             return
         aux = copy.deepcopy(getattr(widget, "_saved_map_aux", {}))
+        snapshot = recorded_controls(widget)
+        if snapshot is None:
+            snapshot = recorded_controls(viewer)
+        if snapshot is not None:
+            aux[AUX_KEY] = snapshot
         try:
             source_signature = hashlib.sha256(
                 self.snapshot_adapter.signature().encode("utf-8")
@@ -1355,6 +1443,7 @@ class UnifiedFieldWorkspaceDialog(QDialog):
         except Exception as error:  # noqa: BLE001 - project resource boundary
             QMessageBox.warning(self, "Save map", str(error))
             return
+        widget._saved_map_resource_id = str(map_id)
         self._project_resources_changed()
         self._refresh_saved_map_actions()
         page = self._pages.get(self.current_page_key)
@@ -1456,6 +1545,12 @@ class UnifiedFieldWorkspaceDialog(QDialog):
             if callable(tagger):
                 tagger(viewer)
                 tagger(tab_widget)
+            # Aux belongs to both renderers, including legacy Plotly maps.
+            aux = record.get("aux", {})
+            tab_widget._saved_map_aux = copy.deepcopy(aux) if isinstance(aux, dict) else {}
+            if isinstance(aux, dict) and AUX_KEY in aux:
+                attach_controls(viewer, aux[AUX_KEY])
+                attach_controls(tab_widget, aux[AUX_KEY])
             tab_widget._saved_map_resource_id = str(map_id)
             label = f"{self.VIEW_LABELS[view_key]}\\{record.get('name', 'Saved map')}"
             index = self.shared_tabs.addTab(tab_widget, label)

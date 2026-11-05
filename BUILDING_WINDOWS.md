@@ -52,6 +52,7 @@ When the build succeeds, exercise the release-candidate paths in the frozen exec
   electrical diagnostics.
 - **Maps → Static:** render at least one 2D and one 3D map and create/reopen a Measurement-volume
   snapshot.
+- **Map workflow:** restore controls from an open map and a saved/reopened map, checking partial recovery for older maps; confirm restored controls do not recalculate or change the scene. Verify Save updates the tab to the saved resource name, duplicate names get a suffix, resource renames update linked tabs, and cancelled/failed saves retain the title. With Log scale enabled, an enabled zero lower limit must show an actionable warning before a job starts. Cancel both a running 2D calculation and a running full-volume 3D calculation, then calculate again.
 - **Maps → Scripted:** render a saved exposure in 2D, 3D, and Brain View. Confirm Scripted 2D/3D
   can show the optional Live measurement analysis panel when enabled before generation,
   exposes no Static Measurement snapshot action, Brain shows its Brain Areas panel, audio starts off,

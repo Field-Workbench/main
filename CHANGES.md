@@ -1,9 +1,18 @@
 # Field Workbench changes
 
-## Unreleased — Measurement playback and local agent access
+## 0.14.0.314 — Map controls and saved-map workflow
 
-The source version remains 0.14.0.313. The following changes are not a claim of
-Windows packaged or manual release acceptance.
+- Added **Restore controls from map** beside Save map. New results retain versioned submission-time calculation controls through open tabs and saved/reopened resources. Older results support cautious partial recovery from explicit payload data, with missing/invalid settings reported. Restoring controls does not recalculate maps or rewind the scene/source data.
+- Maps reject invalid manual colour limits before starting background field calculations, with guidance for logarithmic scales and Auto limits.
+- Saving a map updates its tab to the actual saved name, including duplicate-name suffixes; renaming a saved resource updates its linked open tabs.
+- Updated the existing 4D-box example with five user-selected saved maps, including Thomas scripted playback.
+
+Source validation is recorded separately from Windows packaged acceptance, which remains pending.
+
+## Earlier source additions — Measurement playback and local agent access
+
+The following additions were introduced with source version 0.14.0.313.
+Windows packaged and manual acceptance must be verified for each release.
 
 - Added optional projected sensor placements and well rims to newly generated static and scripted 2D maps. Well rims use built-in plate geometry and follow the plate transform; they are independent of object outlines.
 - Added optional Live measurement analysis to Scripted 2D/3D maps. The panel follows playback and scrubbing, using defined well points or configured measurement sampling.
